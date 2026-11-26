@@ -53,6 +53,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - [Benchmarks & Baseline Methodology](docs/BENCHMARKS.md)
 - [Security Review Record & Audit Map](docs/SECURITY_AUDIT_PREP.md)
 - [Example Configuration](examples/miraserve.kdl)
+- [Setup guide for AI assistants](skills/miraserve-setup/SKILL.md) (also at <https://miraserve.org/ai-setup.txt>; see [AGENTS.md](AGENTS.md))
 
 ## Quickstart
 
