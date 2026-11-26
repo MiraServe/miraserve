@@ -8,12 +8,16 @@ set -eu
 if [ "${1:-}" = "purge" ]; then
     rm -f /etc/miraserve/certs/starter.crt /etc/miraserve/certs/starter.key
     rm -f /etc/miraserve/conf/miraserve.kdl
-    for d in /etc/miraserve/conf /etc/miraserve/certs /etc/miraserve/auth /etc/miraserve/keys /etc/miraserve; do
-        rmdir "$d" 2>/dev/null || true
-    done
+    if [ ! -L /etc/miraserve ]; then
+        for d in /etc/miraserve/conf /etc/miraserve/certs /etc/miraserve/auth /etc/miraserve/keys /etc/miraserve; do
+            if [ ! -L "$d" ] && [ -d "$d" ]; then
+                rmdir "$d" 2>/dev/null || true
+            fi
+        done
+    fi
     kept=""
-    if [ -d /etc/miraserve ]; then
-        kept="non-empty configuration folders under /etc/miraserve"
+    if [ -d /etc/miraserve ] || [ -L /etc/miraserve ]; then
+        kept="/etc/miraserve (kept)"
     fi
     if [ -d /var/lib/miraserve ]; then
         kept="${kept:+$kept, }/var/lib/miraserve (certificates and ACME account)"
@@ -34,7 +38,7 @@ if [ "${1:-}" = "purge" ]; then
         esac
     fi
     if [ -n "$kept" ]; then
-        printf 'miraserve: left on purpose: %s\n' "$kept" >&2
+        printf 'miraserve: left on purpose: %s\n' "$kept" >&2 || true
     fi
 elif [ "${1:-}" = "0" ]; then
     rm -f /etc/miraserve/certs/starter.crt /etc/miraserve/certs/starter.key

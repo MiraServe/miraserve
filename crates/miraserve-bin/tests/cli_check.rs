@@ -10056,14 +10056,15 @@ fn cli_help_and_packaging_descriptions_replace_zero_trust_wording() -> TestResul
 }
 
 /// Oracle for 0.1.6 Item 5: Debian `postremove.sh purge` removes empty `/etc/miraserve/*` and
-/// `/etc/miraserve` via `rmdir` (never `rm -r`), leaves non-empty folders/state/logs/accounts
-/// untouched, prints one stderr line naming what was kept when present, keeps the RPM `0` branch
+/// `/etc/miraserve` via `rmdir` (never `rm -r`, never acting through symlinks), leaves non-empty
+/// folders/mount points/symlinks/state/logs/accounts untouched, prints one stderr line naming
+/// what was kept when present (without failing if stderr writes fail), keeps the RPM `0` branch
 /// unchanged, and stays POSIX `sh` + `set -eu` safe.
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> TestResult {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -10086,25 +10087,76 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    // Include a space in the temp root name so the test proves robustness to a TMPDIR with spaces.
     let base =
-        std::env::temp_dir().join(format!("miraserve-postrm-{}-{nanos}", std::process::id()));
+        std::env::temp_dir().join(format!("miraserve postrm-{}-{nanos}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base)?;
 
-    let make_sandboxed_script = |case_root: &std::path::Path| -> Result<PathBuf, std::io::Error> {
-        let p = case_root.display().to_string();
-        let rewritten = script_text
-            .replace("/etc/miraserve", &format!("{p}/etc/miraserve"))
-            .replace("/var/lib/miraserve", &format!("{p}/var/lib/miraserve"))
-            .replace("/var/log/miraserve", &format!("{p}/var/log/miraserve"))
-            .replace("/run/systemd/system", &format!("{p}/run/systemd/system"));
-        let out_script = case_root.join("postremove-test.sh");
-        std::fs::write(&out_script, rewritten)?;
-        Ok(out_script)
+    // Rewrite absolute system paths in `postremove.sh` to reference `"${TEST_ROOT}"` (when
+    // unquoted) or `${TEST_ROOT}` (when already inside double quotes), passing the actual temp
+    // root via the `TEST_ROOT` environment variable so spaces or shell metacharacters in `TMPDIR`
+    // can never split arguments or alter shell syntax.
+    let rewrite_script_for_test_root = |src: &str| -> String {
+        const TARGETS: [&str; 4] = [
+            "/etc/miraserve",
+            "/var/lib/miraserve",
+            "/var/log/miraserve",
+            "/run/systemd/system",
+        ];
+        let mut out = String::with_capacity(src.len() + 256);
+        for line in src.split_inclusive('\n') {
+            if line.trim_start().starts_with('#') {
+                out.push_str(line);
+                continue;
+            }
+            let mut in_double = false;
+            let mut in_single = false;
+            let mut i = 0;
+            while i < line.len() {
+                let rest = &line[i..];
+                if !in_single && let Some(&target) = TARGETS.iter().find(|&&t| rest.starts_with(t))
+                {
+                    if in_double {
+                        out.push_str("${TEST_ROOT}");
+                    } else {
+                        out.push_str("\"${TEST_ROOT}\"");
+                    }
+                    out.push_str(target);
+                    i += target.len();
+                    continue;
+                }
+                let Some(ch) = rest.chars().next() else {
+                    break;
+                };
+                match ch {
+                    '"' if !in_single => in_double = !in_double,
+                    '\'' if !in_double => in_single = !in_single,
+                    _ => {}
+                }
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
     };
+    let rewritten_script = base.join("postremove-test.sh");
+    std::fs::write(
+        &rewritten_script,
+        rewrite_script_for_test_root(&script_text),
+    )?;
+    let rewritten_syntax = Command::new("sh")
+        .arg("-n")
+        .arg(&rewritten_script)
+        .output()?;
+    assert!(
+        rewritten_syntax.status.success(),
+        "rewritten postremove test script failed sh -n: {}",
+        String::from_utf8_lossy(&rewritten_syntax.stderr)
+    );
 
     // Stub `id` binary reporting both `miraserve` and `miraserve-keyd` as present.
-    let fake_bin = base.join("fake-bin");
+    let fake_bin = base.join("fake bin");
     std::fs::create_dir_all(&fake_bin)?;
     let fake_id = fake_bin.join("id");
     std::fs::write(
@@ -10118,9 +10170,9 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // Case 1: Clean Debian `purge` (only starter files + empty dirs under /etc/miraserve; state,
-    // logs, and accounts present).
-    let case1 = base.join("case1-clean");
+    // Case 1: Clean Debian `purge` under a root containing a space (only starter files + empty
+    // dirs under /etc/miraserve; state, logs, and accounts present).
+    let case1 = base.join("case1 clean");
     for rel in [
         "etc/miraserve/conf",
         "etc/miraserve/certs",
@@ -10136,10 +10188,10 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     std::fs::write(case1.join("etc/miraserve/conf/miraserve.kdl"), b"kdl")?;
     std::fs::write(case1.join("var/lib/miraserve/acme/account.json"), b"{}")?;
     std::fs::write(case1.join("var/log/miraserve/access.log"), b"log")?;
-    let s1 = make_sandboxed_script(&case1)?;
     let out1 = Command::new("sh")
-        .arg(&s1)
+        .arg(&rewritten_script)
         .arg("purge")
+        .env("TEST_ROOT", &case1)
         .env("PATH", &path_with_fake_id)
         .output()?;
     assert!(
@@ -10161,7 +10213,8 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
         "expected exactly one stderr line on purge, got:\n{err1}"
     );
     assert!(
-        !err1.contains("non-empty")
+        !err1.contains("etc/miraserve")
+            && !err1.contains("non-empty")
             && err1.contains("var/lib/miraserve (certificates and ACME account)")
             && err1.contains("var/log/miraserve")
             && err1.contains("miraserve")
@@ -10170,8 +10223,8 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     );
 
     // Case 2: Non-empty Debian `purge` (custom site config in /etc/miraserve/conf survives; empty
-    // sibling dirs are removed; stderr mentions non-empty configuration folders).
-    let case2 = base.join("case2-nonempty");
+    // sibling dirs are removed; stderr reports /etc/miraserve as kept, not non-empty).
+    let case2 = base.join("case2 nonempty");
     for rel in [
         "etc/miraserve/conf",
         "etc/miraserve/certs",
@@ -10183,10 +10236,10 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     }
     std::fs::write(case2.join("etc/miraserve/conf/miraserve.kdl"), b"starter")?;
     std::fs::write(case2.join("etc/miraserve/conf/custom.kdl"), b"operator")?;
-    let s2 = make_sandboxed_script(&case2)?;
     let out2 = Command::new("sh")
-        .arg(&s2)
+        .arg(&rewritten_script)
         .arg("purge")
+        .env("TEST_ROOT", &case2)
         .env("PATH", &path_with_fake_id)
         .output()?;
     assert!(out2.status.success());
@@ -10200,41 +10253,158 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     let err2 = String::from_utf8_lossy(&out2.stderr);
     assert_eq!(err2.lines().count(), 1, "expected 1 stderr line:\n{err2}");
     assert!(
-        err2.contains("non-empty configuration folders")
+        err2.contains("etc/miraserve (kept)")
+            && !err2.contains("non-empty")
             && err2.contains("var/lib/miraserve (certificates and ACME account)")
             && !err2.contains("var/log/miraserve"),
         "unexpected non-empty purge stderr line:\n{err2}"
     );
 
-    // Case 3: RPM full uninstall (`0`): removes only starter cert/key, keeps dirs and emits nothing.
-    let case3 = base.join("case3-rpm");
-    for rel in ["etc/miraserve/conf", "etc/miraserve/certs"] {
-        std::fs::create_dir_all(case3.join(rel))?;
-    }
-    std::fs::write(case3.join("etc/miraserve/certs/starter.crt"), b"crt")?;
-    std::fs::write(case3.join("etc/miraserve/certs/starter.key"), b"key")?;
-    std::fs::write(case3.join("etc/miraserve/conf/miraserve.kdl"), b"kdl")?;
-    let s3 = make_sandboxed_script(&case3)?;
-    let out3 = Command::new("sh")
-        .arg(&s3)
-        .arg("0")
+    // Case 3 (Codex P1 #1): Top-level `/etc/miraserve` is a symlink to an operator directory
+    // containing an empty `auth` directory -> NOTHING behind the link is removed!
+    let case3_sym = base.join("case3 symlink top");
+    let external_top = case3_sym.join("operator-etc");
+    std::fs::create_dir_all(external_top.join("auth"))?;
+    std::fs::create_dir_all(external_top.join("conf"))?;
+    std::fs::create_dir_all(case3_sym.join("etc"))?;
+    symlink(&external_top, case3_sym.join("etc/miraserve"))?;
+    let out3_sym = Command::new("sh")
+        .arg(&rewritten_script)
+        .arg("purge")
+        .env("TEST_ROOT", &case3_sym)
         .env("PATH", &path_with_fake_id)
         .output()?;
-    assert!(out3.status.success());
-    assert!(!case3.join("etc/miraserve/certs/starter.crt").exists());
-    assert!(!case3.join("etc/miraserve/certs/starter.key").exists());
-    assert!(case3.join("etc/miraserve/conf/miraserve.kdl").exists());
-    assert!(case3.join("etc/miraserve/certs").exists());
     assert!(
-        out3.stderr.is_empty(),
-        "RPM branch must stay untouched with no Debian purge message: {}",
-        String::from_utf8_lossy(&out3.stderr)
+        out3_sym.status.success(),
+        "symlink top-dir purge failed: stderr={}",
+        String::from_utf8_lossy(&out3_sym.stderr)
+    );
+    assert!(
+        std::fs::symlink_metadata(case3_sym.join("etc/miraserve"))?
+            .file_type()
+            .is_symlink(),
+        "/etc/miraserve symlink itself must remain"
+    );
+    assert!(
+        external_top.join("auth").is_dir(),
+        "empty auth directory behind /etc/miraserve symlink must NOT be removed"
+    );
+    assert!(
+        external_top.join("conf").is_dir(),
+        "empty conf directory behind /etc/miraserve symlink must NOT be removed"
+    );
+    let err3_sym = String::from_utf8_lossy(&out3_sym.stderr);
+    assert!(
+        err3_sym.contains("etc/miraserve (kept)") && !err3_sym.contains("non-empty"),
+        "symlinked /etc/miraserve must be reported as kept: {err3_sym}"
     );
 
-    // Case 4: `purge` when nothing exists at all (`set -eu` safety, zero stderr when nothing kept).
-    let case4 = base.join("case4-missing");
-    std::fs::create_dir_all(&case4)?;
-    let fake_id_none = case4.join("bin");
+    // Case 4 (Codex P1 #1): Child `/etc/miraserve/auth` is a symlink to an external empty
+    // directory -> external directory and child symlink survive; other real empty siblings go.
+    let case4_child_sym = base.join("case4 symlink child");
+    let external_auth = case4_child_sym.join("external-auth");
+    std::fs::create_dir_all(&external_auth)?;
+    for rel in [
+        "etc/miraserve/conf",
+        "etc/miraserve/certs",
+        "etc/miraserve/keys",
+    ] {
+        std::fs::create_dir_all(case4_child_sym.join(rel))?;
+    }
+    symlink(&external_auth, case4_child_sym.join("etc/miraserve/auth"))?;
+    let out4_sym = Command::new("sh")
+        .arg(&rewritten_script)
+        .arg("purge")
+        .env("TEST_ROOT", &case4_child_sym)
+        .env("PATH", &path_with_fake_id)
+        .output()?;
+    assert!(out4_sym.status.success());
+    assert!(
+        external_auth.is_dir(),
+        "external directory behind child symlink must NOT be removed"
+    );
+    assert!(
+        std::fs::symlink_metadata(case4_child_sym.join("etc/miraserve/auth"))?
+            .file_type()
+            .is_symlink(),
+        "child auth symlink must NOT be removed"
+    );
+    assert!(!case4_child_sym.join("etc/miraserve/conf").exists());
+    assert!(!case4_child_sym.join("etc/miraserve/certs").exists());
+    assert!(!case4_child_sym.join("etc/miraserve/keys").exists());
+    assert!(case4_child_sym.join("etc/miraserve").is_dir());
+
+    // Case 5 (Codex P2 #7): Empty `/etc/miraserve` that cannot be removed by `rmdir` (simulating a
+    // mount point via read-only parent `etc` for non-root): reported as "kept", NOT "non-empty".
+    if !rustix::process::geteuid().is_root() {
+        let case5_ro = base.join("case5 unremovable empty");
+        std::fs::create_dir_all(case5_ro.join("etc/miraserve"))?;
+        std::fs::set_permissions(case5_ro.join("etc"), std::fs::Permissions::from_mode(0o555))?;
+        let out5_ro = Command::new("sh")
+            .arg(&rewritten_script)
+            .arg("purge")
+            .env("TEST_ROOT", &case5_ro)
+            .env("PATH", &path_with_fake_id)
+            .output()?;
+        let _ =
+            std::fs::set_permissions(case5_ro.join("etc"), std::fs::Permissions::from_mode(0o755));
+        assert!(out5_ro.status.success());
+        assert!(case5_ro.join("etc/miraserve").is_dir());
+        let err5 = String::from_utf8_lossy(&out5_ro.stderr);
+        assert!(
+            err5.contains("etc/miraserve (kept)") && !err5.contains("non-empty"),
+            "empty surviving directory must be reported as kept, not non-empty: {err5}"
+        );
+    }
+
+    // Case 6 (Codex P2 #7): Final informational `printf` failing on stderr (e.g. `/dev/full`)
+    // must NOT fail the purge under `set -eu`.
+    #[cfg(target_os = "linux")]
+    if let Ok(dev_full) = std::fs::OpenOptions::new().write(true).open("/dev/full") {
+        let case6_full = base.join("case6 devfull");
+        std::fs::create_dir_all(case6_full.join("etc/miraserve"))?;
+        let status_full = Command::new("sh")
+            .arg(&rewritten_script)
+            .arg("purge")
+            .env("TEST_ROOT", &case6_full)
+            .env("PATH", &path_with_fake_id)
+            .stderr(Stdio::from(dev_full))
+            .status()?;
+        assert!(
+            status_full.success(),
+            "purge must not fail when stderr writes fail (/dev/full)"
+        );
+    }
+
+    // Case 7: RPM full uninstall (`0`): removes only starter cert/key, keeps dirs and emits nothing.
+    let case7_rpm = base.join("case7 rpm");
+    for rel in ["etc/miraserve/conf", "etc/miraserve/certs"] {
+        std::fs::create_dir_all(case7_rpm.join(rel))?;
+    }
+    std::fs::write(case7_rpm.join("etc/miraserve/certs/starter.crt"), b"crt")?;
+    std::fs::write(case7_rpm.join("etc/miraserve/certs/starter.key"), b"key")?;
+    std::fs::write(case7_rpm.join("etc/miraserve/conf/miraserve.kdl"), b"kdl")?;
+    let out7 = Command::new("sh")
+        .arg(&rewritten_script)
+        .arg("0")
+        .env("TEST_ROOT", &case7_rpm)
+        .env("PATH", &path_with_fake_id)
+        .output()?;
+    assert!(out7.status.success());
+    assert!(!case7_rpm.join("etc/miraserve/certs/starter.crt").exists());
+    assert!(!case7_rpm.join("etc/miraserve/certs/starter.key").exists());
+    assert!(case7_rpm.join("etc/miraserve/conf/miraserve.kdl").exists());
+    assert!(case7_rpm.join("etc/miraserve/certs").exists());
+    assert!(
+        out7.stderr.is_empty(),
+        "RPM branch must stay untouched with no Debian purge message: {}",
+        String::from_utf8_lossy(&out7.stderr)
+    );
+
+    // Case 8: `purge` when nothing exists at all (`set -eu` safety, zero stderr when nothing kept).
+    let case8_missing = base.join("case8 missing");
+    std::fs::create_dir_all(&case8_missing)?;
+    let fake_id_none = case8_missing.join("bin");
     std::fs::create_dir_all(&fake_id_none)?;
     std::fs::write(fake_id_none.join("id"), "#!/bin/sh\nexit 1\n")?;
     std::fs::set_permissions(
@@ -10246,21 +10416,21 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
         fake_id_none.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let s4 = make_sandboxed_script(&case4)?;
-    let out4 = Command::new("sh")
-        .arg(&s4)
+    let out8 = Command::new("sh")
+        .arg(&rewritten_script)
         .arg("purge")
+        .env("TEST_ROOT", &case8_missing)
         .env("PATH", &path_no_accts)
         .output()?;
     assert!(
-        out4.status.success(),
+        out8.status.success(),
         "purge with absent paths must succeed under set -eu: {}",
-        String::from_utf8_lossy(&out4.stderr)
+        String::from_utf8_lossy(&out8.stderr)
     );
     assert!(
-        out4.stderr.is_empty(),
+        out8.stderr.is_empty(),
         "purge with nothing kept must emit no stderr, got: {}",
-        String::from_utf8_lossy(&out4.stderr)
+        String::from_utf8_lossy(&out8.stderr)
     );
 
     let _ = std::fs::remove_dir_all(&base);
