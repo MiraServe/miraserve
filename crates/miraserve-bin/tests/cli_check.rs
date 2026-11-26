@@ -9572,7 +9572,9 @@ site "php-b.example" {{
     assert!(!String::from_utf8_lossy(&no_fs.stderr).contains("W033"));
     assert!(!String::from_utf8_lossy(&no_fs.stdout).contains("root"));
 
-    // Absent socket, non-socket regular file, and TCP target produce zero warnings and zero notes.
+    // Absent socket, non-socket regular file, and TCP target produce zero warnings and no
+    // FastCGI socket access notes (without demanding an empty `notes` array, since an independent
+    // note such as the Linux openat2 advisory may exist).
     let no_existing = Command::new(miraserve_bin())
         .args(["check", "--fs", "--strict", "--dev-tls", "--format", "json"])
         .arg(&no_existing_sock_cfg)
@@ -9595,12 +9597,15 @@ site "php-b.example" {{
         no_existing_json
             .get("notes")
             .and_then(serde_json::Value::as_array)
-            .is_none_or(Vec::is_empty),
-        "absent/non-socket/tcp must emit no root note: {no_existing_json}"
+            .is_none_or(|arr| arr.iter().all(|n| !n
+                .as_str()
+                .is_some_and(|s| s.contains("FastCGI Unix socket access")))),
+        "absent/non-socket/tcp must emit no FastCGI socket access note: {no_existing_json}"
     );
 
     // On Linux (`socket-typing`), an existing regular file at `fastcgi-pass "unix:..."` on a
-    // non-tenant site is refused with `E301` (typed reason), NEVER `W033` and NEVER the root note.
+    // non-tenant site is refused with `E301` (typed reason), NEVER `W033` and NEVER a FastCGI
+    // socket access note.
     #[cfg(target_os = "linux")]
     {
         let reg_out = Command::new(miraserve_bin())
@@ -9634,8 +9639,10 @@ site "php-b.example" {{
             reg_json
                 .get("notes")
                 .and_then(serde_json::Value::as_array)
-                .is_none_or(Vec::is_empty),
-            "non-socket must not emit root note: {reg_json}"
+                .is_none_or(|arr| arr.iter().all(|n| !n
+                    .as_str()
+                    .is_some_and(|s| s.contains("FastCGI Unix socket access")))),
+            "non-socket must not emit FastCGI socket access note: {reg_json}"
         );
     }
     #[cfg(not(target_os = "linux"))]
@@ -9701,6 +9708,57 @@ site "php-b.example" {{
             1,
             "expected exactly ONE root note in JSON output: {root_json}"
         );
+
+        // P2 #6: On a FAILED text run as root (e.g., `--strict` failing on an unallowed W003),
+        // the root note MUST still be printed once after the warnings.
+        let root_fail_cfg = conf_dir.join("root-fail.kdl");
+        std::fs::write(
+            &root_fail_cfg,
+            format!(
+                r#"
+server {{
+    listen ":443"
+    sandbox {{ seccomp "off" }}
+}}
+site "php-root-fail.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+"#,
+                www_dir.display(),
+                ok_sock.display()
+            ),
+        )?;
+        let root_fail = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&root_fail_cfg)
+            .output()?;
+        assert!(
+            !root_fail.status.success(),
+            "root check --fs --strict with seccomp off must fail"
+        );
+        let fail_stderr = String::from_utf8_lossy(&root_fail.stderr);
+        let fail_notes: Vec<&str> = fail_stderr
+            .lines()
+            .filter(|l| l.starts_with("note:") && l.contains("root"))
+            .collect();
+        assert_eq!(
+            fail_notes.len(),
+            1,
+            "expected root note once on failed text run stderr:\n{fail_stderr}"
+        );
+        let warn_pos = fail_stderr
+            .find("W003")
+            .ok_or("missing W003 warning on failed root run")?;
+        let note_pos = fail_stderr
+            .find("note: FastCGI Unix socket access")
+            .ok_or("missing FastCGI socket note on failed root run")?;
+        assert!(
+            note_pos > warn_pos,
+            "root note must appear after warnings on failed text run:\n{fail_stderr}"
+        );
     } else {
         let effective_uid = rustix::process::geteuid().as_raw();
         let effective_group = rustix::process::getegid().as_raw();
@@ -9735,15 +9793,80 @@ site "php-b.example" {{
             String::from_utf8_lossy(&bad_text.stderr)
         );
         let bad_stderr = String::from_utf8_lossy(&bad_text.stderr);
+        let expected_uid_gid = format!("(uid/gid {effective_uid}/{effective_group})");
         assert!(
             bad_stderr.contains("warning[W033]:")
                 && bad_stderr.contains("php-denied.example")
                 && bad_stderr.contains(&bad_sock.display().to_string())
                 && bad_stderr.contains("0000")
-                && bad_stderr.contains(&effective_uid.to_string())
-                && bad_stderr.contains(&effective_group.to_string())
+                && bad_stderr.contains(
+                    "requires read and write permission on the socket for the account running the check"
+                )
+                && bad_stderr.contains(&expected_uid_gid)
+                && !bad_stderr.contains("cannot be opened")
                 && bad_stderr.contains("listen.group"),
             "unexpected W033 text diagnostic:\n{bad_stderr}"
+        );
+
+        // 2b (P2 #4): Unsearchable parent directory (`metadata` fails with EACCES): emits W033
+        // reporting that the path could not be reached (type and owner unknown).
+        let unsearchable_dir = base.join("nosearch");
+        std::fs::create_dir_all(&unsearchable_dir)?;
+        let hidden_sock = unsearchable_dir.join("pool.sock");
+        let _hidden_listener = UnixListener::bind(&hidden_sock)?;
+        std::fs::set_permissions(&hidden_sock, std::fs::Permissions::from_mode(0o660))?;
+        std::fs::set_permissions(&unsearchable_dir, std::fs::Permissions::from_mode(0o000))?;
+        let unreachable_cfg = conf_dir.join("unreachable.kdl");
+        std::fs::write(
+            &unreachable_cfg,
+            format!(
+                r#"
+server {{
+    listen ":443"
+}}
+site "php-unreachable.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+"#,
+                www_dir.display(),
+                hidden_sock.display()
+            ),
+        )?;
+        let unreach_strict = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&unreachable_cfg)
+            .output()?;
+        let unreach_allowed = Command::new(miraserve_bin())
+            .args([
+                "check",
+                "--fs",
+                "--strict",
+                "--allow-warning",
+                "W033",
+                "--dev-tls",
+            ])
+            .arg(&unreachable_cfg)
+            .output()?;
+        let _ = std::fs::set_permissions(&unsearchable_dir, std::fs::Permissions::from_mode(0o700));
+        assert!(
+            !unreach_strict.status.success(),
+            "unsearchable parent directory must fail check --fs --strict with W033"
+        );
+        let unreach_stderr = String::from_utf8_lossy(&unreach_strict.stderr);
+        assert!(
+            unreach_stderr.contains("warning[W033]:")
+                && unreach_stderr.contains("could not be reached")
+                && unreach_stderr.contains("type and owner unknown")
+                && unreach_stderr.contains(&expected_uid_gid),
+            "unexpected unreachable-socket W033 diagnostic:\n{unreach_stderr}"
+        );
+        assert!(
+            unreach_allowed.status.success(),
+            "unreachable-socket W033 must be allow-listable: stderr={}",
+            String::from_utf8_lossy(&unreach_allowed.stderr)
         );
 
         // 3. Read-only (0400, missing write) socket also triggers W033.
@@ -9859,6 +9982,259 @@ site "php-b.example" {{
 
     let _ = std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::set_permissions(&ro_sock, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// Oracle for 0.1.6 Round 2 (Codex P1 #3 & P2 #6):
+/// 1. Under a seccomp filter that KILLS on `faccessat2` while permitting classic `faccessat`,
+///    `miraserve check --fs --strict` succeeds cleanly on an accessible socket and emits W033 on
+///    an inaccessible socket without ever invoking `faccessat2`.
+/// 2. Under a seccomp filter returning `EPERM` or `ENOSYS` on `faccessat`, `check --fs --strict`
+///    treats access as INDETERMINATE (no W033, passes `--strict`, emits one plain note naming the
+///    error even across multiple sockets), and prints that note once after warnings on failed
+///    text runs too.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate_seccomp()
+-> TestResult {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    if rustix::process::geteuid().is_root() {
+        // Root skips faccessat and emits the root note (tested in the test above).
+        return Ok(());
+    }
+
+    const SYS_FACCESSAT2: i64 = 439;
+    const LINUX_EPERM: u32 = 1;
+    const LINUX_ENOSYS: u32 = 38;
+
+    let arch = TargetArch::try_from(std::env::consts::ARCH)?;
+    let sys_faccessat: i64 = match arch {
+        TargetArch::x86_64 => 269,
+        TargetArch::aarch64 => 48,
+    };
+
+    let compile_filter =
+        |syscalls: &[i64], action: SeccompAction| -> Result<seccompiler::BpfProgram, String> {
+            let mut rules = BTreeMap::new();
+            for &nr in syscalls {
+                rules.insert(nr, Vec::new());
+                if arch == TargetArch::x86_64 {
+                    rules.insert(nr | 0x4000_0000, Vec::new());
+                }
+            }
+            SeccompFilter::new(rules, SeccompAction::Allow, action, arch)
+                .map_err(|e| e.to_string())?
+                .try_into()
+                .map_err(|e: seccompiler::BackendError| e.to_string())
+        };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let base = PathBuf::from(format!("/tmp/ms-w033-sc-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let conf_dir = base.join("c");
+    let www_dir = base.join("www");
+    std::fs::create_dir_all(&conf_dir)?;
+    std::fs::create_dir_all(&www_dir)?;
+
+    let ok_sock = base.join("ok.sock");
+    let ok2_sock = base.join("ok2.sock");
+    let bad_sock = base.join("bad.sock");
+    let _l1 = UnixListener::bind(&ok_sock)?;
+    let _l2 = UnixListener::bind(&ok2_sock)?;
+    let _l3 = UnixListener::bind(&bad_sock)?;
+    std::fs::set_permissions(&ok_sock, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::set_permissions(&ok2_sock, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o000))?;
+
+    let ok_cfg = conf_dir.join("ok.kdl");
+    std::fs::write(
+        &ok_cfg,
+        format!(
+            "server {{ listen \":443\" }}\n\
+             site \"ok-a.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n\
+             site \"ok-b.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
+            www_dir.display(),
+            ok_sock.display(),
+            www_dir.display(),
+            ok2_sock.display()
+        ),
+    )?;
+    let bad_cfg = conf_dir.join("bad.kdl");
+    std::fs::write(
+        &bad_cfg,
+        format!(
+            "server {{ listen \":443\" }}\n\
+             site \"bad.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
+            www_dir.display(),
+            bad_sock.display()
+        ),
+    )?;
+    let fail_cfg = conf_dir.join("fail.kdl");
+    std::fs::write(
+        &fail_cfg,
+        format!(
+            "server {{ listen \":443\"; sandbox {{ seccomp \"off\" }} }}\n\
+             site \"fail.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
+            www_dir.display(),
+            ok_sock.display()
+        ),
+    )?;
+
+    // 1. KILL_PROCESS on `faccessat2`: `check --fs --strict` must survive and work cleanly.
+    let kill_faccessat2 = compile_filter(&[SYS_FACCESSAT2], SeccompAction::KillProcess)
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let ok_cfg_c = ok_cfg.clone();
+    let bad_cfg_c = bad_cfg.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&kill_faccessat2).map_err(|e| e.to_string())?;
+        let ok_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&ok_cfg_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !ok_out.status.success() {
+            return Err(format!(
+                "check --fs under KILL faccessat2 failed on accessible socket: status={:?} stderr={}",
+                ok_out.status,
+                String::from_utf8_lossy(&ok_out.stderr)
+            ));
+        }
+        let bad_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&bad_cfg_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if bad_out.status.code() != Some(1) {
+            return Err(format!(
+                "expected clean exit code 1 (not signal kill) for 0000 socket under KILL faccessat2, got {:?}",
+                bad_out.status
+            ));
+        }
+        let bad_err = String::from_utf8_lossy(&bad_out.stderr);
+        if !bad_err.contains("warning[W033]:") {
+            return Err(format!(
+                "expected W033 under KILL faccessat2, got:\n{bad_err}"
+            ));
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "kill-faccessat2 helper thread panicked")?
+    .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+
+    // 2. EPERM and ENOSYS on `faccessat`: INDETERMINATE (exit 0 with `--strict`, no W033,
+    //    one plain note naming the error across 2 sockets, and printed once after warnings on a
+    //    failed text run too).
+    for (errno_val, tag) in [(LINUX_EPERM, "EPERM"), (LINUX_ENOSYS, "ENOSYS")] {
+        let filter = compile_filter(
+            &[sys_faccessat, SYS_FACCESSAT2],
+            SeccompAction::Errno(errno_val),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let ok_cfg_c = ok_cfg.clone();
+        let fail_cfg_c = fail_cfg.clone();
+        std::thread::spawn(move || -> Result<(), String> {
+            seccompiler::apply_filter(&filter).map_err(|e| e.to_string())?;
+
+            // Valid strict text run with 2 sockets -> exit 0, no W033, exactly ONE note on stdout.
+            let text_out = Command::new(miraserve_bin())
+                .args(["check", "--fs", "--strict", "--dev-tls"])
+                .arg(&ok_cfg_c)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !text_out.status.success() {
+                return Err(format!(
+                    "{tag} filter should be indeterminate and pass --strict, got stderr={}",
+                    String::from_utf8_lossy(&text_out.stderr)
+                ));
+            }
+            if String::from_utf8_lossy(&text_out.stderr).contains("W033") {
+                return Err(format!("{tag} filter must never emit W033"));
+            }
+            let stdout = String::from_utf8_lossy(&text_out.stdout);
+            let note_lines: Vec<&str> = stdout
+                .lines()
+                .filter(|l| l.starts_with("note: FastCGI Unix socket access") && l.contains(tag))
+                .collect();
+            if note_lines.len() != 1 {
+                return Err(format!(
+                    "{tag} filter expected exactly 1 indeterminate note on stdout, got:\n{stdout}"
+                ));
+            }
+
+            // JSON run -> valid=true, no W033, exactly ONE indeterminate note in `notes`.
+            let json_out = Command::new(miraserve_bin())
+                .args(["check", "--fs", "--strict", "--dev-tls", "--format", "json"])
+                .arg(&ok_cfg_c)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !json_out.status.success() {
+                return Err(format!("{tag} JSON check --fs --strict failed"));
+            }
+            let j: serde_json::Value =
+                serde_json::from_slice(&json_out.stdout).map_err(|e| e.to_string())?;
+            let json_notes = j
+                .get("notes")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|n| n.contains("FastCGI Unix socket access") && n.contains(tag))
+                        .count()
+                })
+                .unwrap_or(0);
+            if json_notes != 1 {
+                return Err(format!(
+                    "{tag} JSON expected 1 indeterminate note, got: {j}"
+                ));
+            }
+
+            // Failed text run (`--strict` failing on W003) -> note printed ONCE on stderr AFTER W003.
+            let fail_out = Command::new(miraserve_bin())
+                .args(["check", "--fs", "--strict", "--dev-tls"])
+                .arg(&fail_cfg_c)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if fail_out.status.success() {
+                return Err(format!("{tag} failed-run fixture unexpectedly succeeded"));
+            }
+            let fail_err = String::from_utf8_lossy(&fail_out.stderr);
+            let fail_note_count = fail_err
+                .lines()
+                .filter(|l| l.starts_with("note: FastCGI Unix socket access") && l.contains(tag))
+                .count();
+            if fail_note_count != 1 {
+                return Err(format!(
+                    "{tag} failed text run expected 1 note on stderr, got:\n{fail_err}"
+                ));
+            }
+            let warn_pos = fail_err
+                .find("W003")
+                .ok_or_else(|| format!("{tag} failed run missing W003:\n{fail_err}"))?;
+            let note_pos = fail_err
+                .find("note: FastCGI Unix socket access")
+                .ok_or_else(|| format!("{tag} failed run missing note:\n{fail_err}"))?;
+            if note_pos <= warn_pos {
+                return Err(format!(
+                    "{tag} failed text run note must appear after warnings:\n{fail_err}"
+                ));
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "faccessat-errno helper thread panicked")?
+        .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+    }
+
+    let _ = std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::remove_dir_all(&base);
     Ok(())
 }

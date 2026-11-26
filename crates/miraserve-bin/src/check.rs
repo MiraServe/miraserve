@@ -567,20 +567,20 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
 
     // CFG-6, R4-PKG-2, R5-CHK-1, R7-CHK-1 & R7-SBX-2: Optional `--fs` disk readability,
     // symlink/overlap docroot confinement (`E301`), & PEM/pair/keyd verification.
-    let (fs_errors, classified_for_notes, skipped_fastcgi_socket_access_as_root): (
+    let (fs_errors, classified_for_notes, socket_access_status): (
         Vec<ConfigIssue>,
         Option<Config>,
-        bool,
+        FastCgiSocketAccessNotes,
     ) = if args.fs {
-        let (issues, _, classified, skipped_as_root) = collect_filesystem_issues_classified(
+        let (issues, _, classified, sock_notes) = collect_filesystem_issues_classified(
             loaded,
             cfg_path_opt,
             args.acme_dir.as_deref(),
             args.keyd_auth_secret_file.as_deref(),
         );
-        (issues, Some(classified), skipped_as_root)
+        (issues, Some(classified), sock_notes)
     } else {
-        (Vec::new(), None, false)
+        (Vec::new(), None, FastCgiSocketAccessNotes::default())
     };
 
     // `--fs` findings that the server tolerates at runtime are warnings, not errors.
@@ -643,12 +643,8 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
         notes.extend(collect_precompressed_fs_notes(classified));
     }
     notes.extend(collect_file_cache_notes(&loaded.config));
-    if skipped_fastcgi_socket_access_as_root {
-        notes.push(
-            "FastCGI Unix socket access for the service account was not tested because the check runs as root (euid 0)"
-                .to_owned(),
-        );
-    }
+    let socket_access_notes = socket_access_status.into_note_lines();
+    notes.extend(socket_access_notes.iter().cloned());
     let config_for_advisory = classified_for_notes.as_ref().unwrap_or(&loaded.config);
     if let Some(note) = miraserve_core::openat2_refused_advisory(config_for_advisory) {
         notes.push(note);
@@ -734,6 +730,18 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                                 .write_line(&format!("  help: {help}"));
                         } else {
                             let _ = writeln!(stderr, "  help: {help}");
+                        }
+                    }
+                }
+                // P2 #6: Print the root / indeterminate FastCGI socket access notes in text mode
+                // on failed runs too, once each, after the warnings.
+                if failed {
+                    for note in &socket_access_notes {
+                        if args.writable_set {
+                            let _ = SanitizingLineWriter::new(&mut stderr)
+                                .write_line(&format!("note: {note}"));
+                        } else {
+                            let _ = writeln!(stderr, "note: {note}");
                         }
                     }
                 }
@@ -1832,25 +1840,156 @@ pub(crate) fn quarantined_site_reports(classified: &Config) -> Vec<QuarantinedSi
         .collect()
 }
 
-/// Checks whether an existing exact FastCGI Unix socket can be opened (read + write) by the
-/// checking account's effective credentials without connecting to it (`W033`).
+/// Plain informational notes recorded while checking FastCGI Unix socket access (`check --fs`).
+#[derive(Debug, Default)]
+struct FastCgiSocketAccessNotes {
+    #[cfg(unix)]
+    skipped_as_root: bool,
+    #[cfg(unix)]
+    skipped_ids_differ: bool,
+    #[cfg(unix)]
+    indeterminate_errors: BTreeSet<String>,
+}
+
+impl FastCgiSocketAccessNotes {
+    #[cfg(unix)]
+    fn into_note_lines(self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.skipped_as_root {
+            lines.push(
+                "FastCGI Unix socket access for the service account was not tested because the \
+                 check runs as root (euid 0)"
+                    .to_owned(),
+            );
+        }
+        if self.skipped_ids_differ {
+            lines.push(
+                "FastCGI Unix socket access could not be tested because the real and effective \
+                 ids of the checking process differ"
+                    .to_owned(),
+            );
+        }
+        for err_desc in self.indeterminate_errors {
+            lines.push(format!(
+                "FastCGI Unix socket access could not be tested: {err_desc}"
+            ));
+        }
+        lines
+    }
+
+    #[cfg(not(unix))]
+    const fn into_note_lines(self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn format_access_errno(err: rustix::io::Errno) -> String {
+    let sym = match err {
+        rustix::io::Errno::PERM => Some("EPERM"),
+        rustix::io::Errno::NOSYS => Some("ENOSYS"),
+        rustix::io::Errno::INVAL => Some("EINVAL"),
+        rustix::io::Errno::ROFS => Some("EROFS"),
+        rustix::io::Errno::LOOP => Some("ELOOP"),
+        rustix::io::Errno::NOENT => Some("ENOENT"),
+        rustix::io::Errno::NOTDIR => Some("ENOTDIR"),
+        rustix::io::Errno::OPNOTSUPP => Some("EOPNOTSUPP"),
+        _ => None,
+    };
+    match sym {
+        Some(name) => format!("faccessat failed with {name} ({err})"),
+        None => format!("faccessat failed ({err})"),
+    }
+}
+
+/// Checks whether an existing exact FastCGI Unix socket is reachable and grants read + write
+/// permission to the account running the check without calling `connect()` (`W033`).
 ///
-/// Returns `true` when the check runs as root (effective UID 0) and an existing Unix socket was
-/// encountered, so `miraserve check --fs` emits one plain note per run instead of warning.
+/// Uses the classic `faccessat(..., R_OK | W_OK, 0)` call (never `AT_EACCESS` / `faccessat2`)
+/// when real and effective UID and GID are equal. When real and effective IDs differ, when
+/// running as root (`euid 0`), or when `faccessat` returns any error other than `EACCES`, emits
+/// no `W033` and records a plain informational note in `notes` instead.
 #[cfg(unix)]
 fn check_fastcgi_unix_socket_accessible(
     errors: &mut Vec<ConfigIssue>,
+    notes: &mut FastCgiSocketAccessNotes,
     loaded: &LoadedConfig,
     key_path: &str,
     site_host: &str,
     sock_path: &str,
-) -> bool {
+) {
+    check_fastcgi_unix_socket_accessible_with(
+        errors,
+        notes,
+        loaded,
+        key_path,
+        site_host,
+        sock_path,
+        rustix::process::getuid().as_raw(),
+        rustix::process::geteuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+        rustix::process::getegid().as_raw(),
+        |p| {
+            rustix::fs::accessat(
+                rustix::fs::CWD,
+                p,
+                rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+                rustix::fs::AtFlags::empty(),
+            )
+        },
+    );
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn check_fastcgi_unix_socket_accessible_with<F>(
+    errors: &mut Vec<ConfigIssue>,
+    notes: &mut FastCgiSocketAccessNotes,
+    loaded: &LoadedConfig,
+    key_path: &str,
+    site_host: &str,
+    sock_path: &str,
+    real_uid: u32,
+    effective_uid: u32,
+    real_gid: u32,
+    effective_gid: u32,
+    probe: F,
+) where
+    F: FnOnce(&Path) -> Result<(), rustix::io::Errno>,
+{
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 
     let p = Path::new(sock_path);
-    let Ok(md) = fs::metadata(p) else {
-        // Absent path (or unstatable): behaves identically to 0.1.5 (no new output).
-        return false;
+    let md = match fs::metadata(p) {
+        Ok(md) => md,
+        Err(io_err) => {
+            // `EACCES` on `metadata` means a parent directory cannot be searched by the checking
+            // account, so the socket path cannot be reached at all (type and owner unknown).
+            // `ENOENT` and every other error keep 0.1.5 behaviour (no output).
+            if io_err.raw_os_error() == Some(rustix::io::Errno::ACCESS.raw_os_error()) {
+                errors.push(ConfigIssue {
+                    code: "W033".to_owned(),
+                    severity: Severity::Warning,
+                    message: format!(
+                        "site '{site_host}' FastCGI Unix socket '{sock_path}' could not be \
+                         reached (type and owner unknown); the socket must be reachable (search \
+                         permission on its parent directories) and requires read and write \
+                         permission on the socket for the account running the check \
+                         (uid/gid {effective_uid}/{effective_gid}): {io_err}",
+                    ),
+                    path: Some(key_path.to_owned()),
+                    help: Some(
+                        "grant search permission on parent directories of the socket, set \
+                         `listen.group` of the pool to the server's group, or add the server \
+                         account to the socket's group"
+                            .to_owned(),
+                    ),
+                    label: None,
+                    location: loaded.location_for(key_path),
+                });
+            }
+            return;
+        }
     };
     if !md.file_type().is_socket() {
         // On Linux, an existing non-socket exact Unix endpoint is rejected by the Landlock
@@ -1868,54 +2007,58 @@ fn check_fastcgi_unix_socket_accessible(
                 ),
             );
         }
-        return false;
+        return;
     }
-    let effective_uid = rustix::process::geteuid();
-    if effective_uid.is_root() {
-        return true;
+    if real_uid != effective_uid || real_gid != effective_gid {
+        notes.skipped_ids_differ = true;
+        return;
     }
-    if let Err(err @ (rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)) = rustix::fs::accessat(
-        rustix::fs::CWD,
-        p,
-        rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
-        rustix::fs::AtFlags::EACCESS,
-    ) {
-        let effective_group = rustix::process::getegid();
-        let owner_uid = md.uid();
-        let owner_group = md.gid();
-        let sock_mode = md.mode() & 0o7777;
-        errors.push(ConfigIssue {
-            code: "W033".to_owned(),
-            severity: Severity::Warning,
-            message: format!(
-                "site '{site_host}' FastCGI Unix socket '{sock_path}' \
-                 (owner {owner_uid}:{owner_group}, mode {sock_mode:04o}) cannot be opened by the \
-                 checking account (euid {}, egid {}): {err}",
-                effective_uid.as_raw(),
-                effective_group.as_raw(),
-            ),
-            path: Some(key_path.to_owned()),
-            help: Some(
-                "set `listen.group` of the pool to the server's group, or add the server \
-                 account to the socket's group"
-                    .to_owned(),
-            ),
-            label: None,
-            location: loaded.location_for(key_path),
-        });
+    if effective_uid == 0 {
+        notes.skipped_as_root = true;
+        return;
     }
-    false
+    match probe(p) {
+        Ok(()) => {}
+        Err(err @ rustix::io::Errno::ACCESS) => {
+            let owner_uid = md.uid();
+            let owner_group = md.gid();
+            let sock_mode = md.mode() & 0o7777;
+            errors.push(ConfigIssue {
+                code: "W033".to_owned(),
+                severity: Severity::Warning,
+                message: format!(
+                    "site '{site_host}' FastCGI Unix socket '{sock_path}' \
+                     (owner {owner_uid}:{owner_group}, mode {sock_mode:04o}) requires read and \
+                     write permission on the socket for the account running the check \
+                     (uid/gid {effective_uid}/{effective_gid}): {err}",
+                ),
+                path: Some(key_path.to_owned()),
+                help: Some(
+                    "set `listen.group` of the pool to the server's group, or add the server \
+                     account to the socket's group"
+                        .to_owned(),
+                ),
+                label: None,
+                location: loaded.location_for(key_path),
+            });
+        }
+        Err(other) => {
+            notes
+                .indeterminate_errors
+                .insert(format_access_errno(other));
+        }
+    }
 }
 
 #[cfg(not(unix))]
 const fn check_fastcgi_unix_socket_accessible(
     _errors: &mut Vec<ConfigIssue>,
+    _notes: &mut FastCgiSocketAccessNotes,
     _loaded: &LoadedConfig,
     _key_path: &str,
     _site_host: &str,
     _sock_path: &str,
-) -> bool {
-    false
+) {
 }
 
 pub(crate) fn collect_filesystem_issues_and_quarantined(
@@ -1935,10 +2078,15 @@ fn collect_filesystem_issues_classified(
     config_path: Option<&Path>,
     acme_dir: Option<&Path>,
     keyd_auth_secret_file: Option<&Path>,
-) -> (Vec<ConfigIssue>, Vec<QuarantinedSiteReport>, Config, bool) {
+) -> (
+    Vec<ConfigIssue>,
+    Vec<QuarantinedSiteReport>,
+    Config,
+    FastCgiSocketAccessNotes,
+) {
     let config = &loaded.config;
     let mut errors = Vec::new();
-    let mut skipped_fastcgi_socket_access_as_root = false;
+    let mut socket_access_notes = FastCgiSocketAccessNotes::default();
     let is_split = config.server.tls.key_isolation == KeyIsolation::SplitDaemon;
     let provider = miraserve_tls::build_crypto_provider(config.server.tls.pqc_hybrid);
 
@@ -2511,16 +2659,15 @@ fn collect_filesystem_issues_classified(
                     }
                 }
                 RouteHandler::FastCgi(fcgi) => {
-                    if let FastCgiTarget::Unix { path } = &fcgi.target
-                        && check_fastcgi_unix_socket_accessible(
+                    if let FastCgiTarget::Unix { path } = &fcgi.target {
+                        check_fastcgi_unix_socket_accessible(
                             &mut errors,
+                            &mut socket_access_notes,
                             loaded,
                             &format!("{route_prefix}.fastcgi-pass"),
                             host,
                             path,
-                        )
-                    {
-                        skipped_fastcgi_socket_access_as_root = true;
+                        );
                     }
                 }
                 RouteHandler::Static(_)
@@ -2552,12 +2699,7 @@ fn collect_filesystem_issues_classified(
         }
     }
     errors.extend(server_wide_errors);
-    (
-        errors,
-        quarantined,
-        classified,
-        skipped_fastcgi_socket_access_as_root,
-    )
+    (errors, quarantined, classified, socket_access_notes)
 }
 
 fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {
@@ -2763,6 +2905,173 @@ mod writable_set_unit_tests {
         let second = lines.get(1).copied().unwrap_or("");
         assert!(!second.chars().any(is_c0_del_c1));
         assert!(second.starts_with("line2 ") && second.ends_with(" end"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fastcgi_socket_probe_handles_ids_differ_root_eacces_and_indeterminate_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::net::UnixListener;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = PathBuf::from(format!("/tmp/ms-w033-unit-{}-{nanos}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base)?;
+        let sock_path = base.join("pool.sock");
+        let _listener = UnixListener::bind(&sock_path)?;
+        fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o660))?;
+        let sock_str = sock_path.to_string_lossy().into_owned();
+
+        let kdl = format!(
+            "server {{ listen \":443\"; tls {{ cert \"/c.pem\"; key \"/k.pem\" }} }}\n\
+             site \"unit.example\" {{ root \"/var/www\"; route \"*.php\" {{ fastcgi-pass \"unix:{sock_str}\" }} }}\n"
+        );
+        let cfg_path = base.join("unit.kdl");
+        fs::write(&cfg_path, &kdl)?;
+        let loaded = miraserve_config::load_file_detailed(&cfg_path)?;
+
+        // 1. Real UID != effective UID (and real GID != effective GID): INDETERMINATE note,
+        //    zero W033, and the probe closure is never invoked.
+        for (ruid, euid, rgid, egid) in [
+            (1000, 33, 1000, 1000),
+            (1000, 1000, 1000, 33),
+            (0, 33, 0, 33),
+            (1000, 0, 1000, 0),
+        ] {
+            let mut issues = Vec::new();
+            let mut notes = FastCgiSocketAccessNotes::default();
+            let mut probe_called = false;
+            check_fastcgi_unix_socket_accessible_with(
+                &mut issues,
+                &mut notes,
+                &loaded,
+                "site[0].route[0].fastcgi-pass",
+                "unit.example",
+                &sock_str,
+                ruid,
+                euid,
+                rgid,
+                egid,
+                |_| {
+                    probe_called = true;
+                    Err(rustix::io::Errno::ACCESS)
+                },
+            );
+            assert!(
+                !probe_called,
+                "probe must not run when real and effective IDs differ"
+            );
+            assert!(
+                issues.is_empty(),
+                "must not emit W033 when IDs differ: {issues:?}"
+            );
+            let lines = notes.into_note_lines();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines.first().is_some_and(
+                    |l| l.contains("real and effective ids of the checking process differ")
+                ),
+                "unexpected ids-differ note: {lines:?}"
+            );
+        }
+
+        // 2. Root (ruid == euid == 0): root note, zero W033, probe never invoked.
+        {
+            let mut issues = Vec::new();
+            let mut notes = FastCgiSocketAccessNotes::default();
+            let mut probe_called = false;
+            check_fastcgi_unix_socket_accessible_with(
+                &mut issues,
+                &mut notes,
+                &loaded,
+                "site[0].route[0].fastcgi-pass",
+                "unit.example",
+                &sock_str,
+                0,
+                0,
+                0,
+                0,
+                |_| {
+                    probe_called = true;
+                    Err(rustix::io::Errno::ACCESS)
+                },
+            );
+            assert!(!probe_called);
+            assert!(issues.is_empty());
+            let lines = notes.into_note_lines();
+            assert_eq!(lines.len(), 1);
+            assert!(lines.first().is_some_and(|l| l.contains("root (euid 0)")));
+        }
+
+        // 3. EACCES -> W033 with required wording (NOT "cannot be opened").
+        {
+            let mut issues = Vec::new();
+            let mut notes = FastCgiSocketAccessNotes::default();
+            check_fastcgi_unix_socket_accessible_with(
+                &mut issues,
+                &mut notes,
+                &loaded,
+                "site[0].route[0].fastcgi-pass",
+                "unit.example",
+                &sock_str,
+                1000,
+                1000,
+                1000,
+                1000,
+                |_| Err(rustix::io::Errno::ACCESS),
+            );
+            assert_eq!(issues.len(), 1);
+            let issue = issues.first().ok_or("missing W033 issue")?;
+            assert_eq!(issue.code, "W033");
+            assert!(
+                issue.message.contains(
+                    "requires read and write permission on the socket for the account running the check (uid/gid 1000/1000)"
+                ),
+                "unexpected W033 message: {}",
+                issue.message
+            );
+            assert!(!issue.message.contains("cannot be opened"));
+            assert!(notes.into_note_lines().is_empty());
+        }
+
+        // 4. Non-EACCES errors (EPERM, ENOSYS, EINVAL) -> INDETERMINATE note naming the error, NO W033.
+        for (errno, tag) in [
+            (rustix::io::Errno::PERM, "EPERM"),
+            (rustix::io::Errno::NOSYS, "ENOSYS"),
+            (rustix::io::Errno::INVAL, "EINVAL"),
+        ] {
+            let mut issues = Vec::new();
+            let mut notes = FastCgiSocketAccessNotes::default();
+            check_fastcgi_unix_socket_accessible_with(
+                &mut issues,
+                &mut notes,
+                &loaded,
+                "site[0].route[0].fastcgi-pass",
+                "unit.example",
+                &sock_str,
+                1000,
+                1000,
+                1000,
+                1000,
+                |_| Err(errno),
+            );
+            assert!(
+                issues.is_empty(),
+                "{tag} must be indeterminate and never emit W033: {issues:?}"
+            );
+            let lines = notes.into_note_lines();
+            assert_eq!(lines.len(), 1);
+            assert!(
+                lines.first().is_some_and(|l| l.contains(tag)),
+                "indeterminate note must name {tag}: {lines:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&base);
         Ok(())
     }
 }
