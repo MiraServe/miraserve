@@ -10181,16 +10181,15 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
             }
             let j: serde_json::Value =
                 serde_json::from_slice(&json_out.stdout).map_err(|e| e.to_string())?;
-            let json_notes = j
-                .get("notes")
-                .and_then(serde_json::Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .filter(|n| n.contains("FastCGI Unix socket access") && n.contains(tag))
-                        .count()
-                })
-                .unwrap_or(0);
+            let json_notes =
+                j.get("notes")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, |arr| {
+                        arr.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .filter(|n| n.contains("FastCGI Unix socket access") && n.contains(tag))
+                            .count()
+                    });
             if json_notes != 1 {
                 return Err(format!(
                     "{tag} JSON expected 1 indeterminate note, got: {j}"
