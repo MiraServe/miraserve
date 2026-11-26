@@ -1,12 +1,15 @@
 //! Enforced Linux Landlock end-to-end tests for installer-only Unix socket typing (0.1.6):
-//! 1. Exact FastCGI path pointing at a directory containing a DAC-readable marker outside every
-//!    other grant: marker is NOT readable under enforcing Landlock, the site still answers static
-//!    requests with 200, a sibling site answers 200, FastCGI to that route fails cleanly (502),
-//!    the process stays alive, and exactly one WARN naming path and type is emitted. Also checks
-//!    that a `read-tree` sharing the same spelling as an exact FastCGI path gets no socket rule.
+//! 1. Exact FastCGI path used only as an exact endpoint pointing at a directory containing a
+//!    DAC-readable marker outside every other grant: marker is NOT readable under enforcing
+//!    Landlock, the site still answers static requests with 200, a sibling site answers 200,
+//!    FastCGI to that route fails cleanly (502), the process stays alive, and exactly one WARN
+//!    naming path and type is emitted.
 //! 2. Same for a symlink to such a directory, a regular file, and a FIFO (must not block).
 //! 3. A configured `socket-tree` directory keeps its rule: a late-bound Unix FastCGI socket
 //!    created inside it after Landlock confinement works as in 0.1.5.
+//! 4. A directory that is also another configured directory grant (config directory, `read-tree`,
+//!    ACME directory, or site root) keeps its 0.1.5 socket-class rule (`ReadFile | WriteFile`,
+//!    without `ReadDir`) and emits the directory-grant shadow WARN once across threads.
 
 #![cfg(target_os = "linux")]
 

@@ -322,9 +322,14 @@ pub struct SandboxPolicy {
     pub pinned_read_only_paths: Vec<PinnedReadOnlyPath>,
     /// Exact Unix domain socket paths granted minimal `ReadFile | WriteFile` connect access.
     ///
-    /// On Linux, a wrong-type entry added directly to a supplied or edited policy (including one
-    /// removed from `socket_paths`, finalized, and later re-added) is not in the shadowed-class
-    /// set and gets no socket rule at Landlock rule installation.
+    /// On Linux, a non-socket path added to a supplied or edited policy gets no socket rule at
+    /// Landlock rule installation unless the policy still carries its internal `socket-tree` mark
+    /// (for a directory originally configured as a `socket-tree`) or a shadowed-class mark (where
+    /// a directory keeps the 0.1.5 socket-class rule and any other type is reduced to `ReadFile`
+    /// only). [`Self::finalize_grants`] clears shadowed-class marks for paths no longer in
+    /// `socket_paths`, but does not prune `socket-tree` marks or shadowed-class marks whose path
+    /// remained in `socket_paths` (for example after removing a rotating-log directory from
+    /// `read_write_paths` only).
     pub socket_paths: Vec<PathBuf>,
     /// Paths that only tenant sites (`owner-dir`) ask for (set by the caller from a consumer
     /// analysis). Such a grant that first appears at finalization and cannot be opened is left
@@ -358,8 +363,8 @@ pub struct SandboxPolicy {
     /// [`Self::from_config_with_file`], or matched the canonical rotating-log directory bound by
     /// [`Self::bind_log_rotation_dir`]. Pruned by [`Self::finalize_grants`] whenever a spelling is
     /// no longer in [`Self::socket_paths`]. On Linux, a wrong-type non-`socket-tree` entry in this
-    /// set keeps the 0.1.5 socket-class rule with a warning so no other configured grant loses
-    /// access.
+    /// set keeps the 0.1.5 socket-class rule with a warning when its descriptor is a directory,
+    /// and reduces its socket-class rule to `ReadFile` only with a warning for any other type.
     #[serde(skip)]
     socket_shadows_other_class: BTreeSet<PathBuf>,
 }
@@ -1189,7 +1194,7 @@ impl SandboxPolicy {
         }
         // Keep shadowed-class provenance aligned with `socket_paths`: if a spelling was removed
         // (and pruned from `grant_states`) or dropped above, re-adding it by hand later must treat
-        // it as a plain exact socket entry rather than a shadowed directory grant.
+        // it as a plain exact socket entry rather than a shadowed grant.
         self.socket_shadows_other_class
             .retain(|p| self.socket_paths.iter().any(|s| s == p));
         let failures = self.grant_failures();
@@ -4898,15 +4903,32 @@ mod linux {
                     {
                         sock_rules.push((fd.as_ref(), sock_access));
                     } else if policy.socket_shadows_other_class.contains(p) {
-                        sock_rules.push((fd.as_ref(), sock_access));
                         let display_path = super::sanitize_path_for_display(p);
                         let found = super::linux_file_type_label(*file_type);
-                        if first_time_reported(&format!("sock-shadow-not-socket:{}", p.display())) {
-                            warn!(
-                                path = %display_path,
-                                found,
-                                "unix socket path '{display_path}' is not a socket (found {found}) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path"
-                            );
+                        if *file_type == rustix::fs::FileType::Directory {
+                            sock_rules.push((fd.as_ref(), sock_access));
+                            if first_time_reported(&format!(
+                                "sock-shadow-not-socket:{}",
+                                p.display()
+                            )) {
+                                warn!(
+                                    path = %display_path,
+                                    found,
+                                    "unix socket path '{display_path}' is not a socket (found {found}) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path"
+                                );
+                            }
+                        } else {
+                            sock_rules.push((fd.as_ref(), read_file_access));
+                            if first_time_reported(&format!(
+                                "sock-shadow-not-socket:{}",
+                                p.display()
+                            )) {
+                                warn!(
+                                    path = %display_path,
+                                    found,
+                                    "unix socket path '{display_path}' is not a socket (found {found}) and the same path is configured for another use: its socket rule is reduced to read access; give the socket its own path"
+                                );
+                            }
                         }
                     } else {
                         let display_path = super::sanitize_path_for_display(p);
@@ -8278,6 +8300,297 @@ site "ddk2.example.test" {{
         }
 
         let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    /// Audit 4 P1 #1 (exact-file fallback regular file and FIFO shadowed by exact socket path):
+    /// Split-daemon mode places `cert` and `key` in one temp directory so the parent is refused
+    /// (`parent_covers_excluded_key`), forcing the exact-file read-only fallback. When the same
+    /// file path is also configured as `fastcgi-pass "unix:<file>"`, socket precedence removes it
+    /// from `read_only_paths` and marks it in `socket_shadows_other_class`. The installer keeps a
+    /// socket-class rule on the SAME descriptor at the SAME position with mask `ReadFile` ONLY (no
+    /// `WriteFile`), emits the reduced-to-read-access WARN once per path per process, and under
+    /// enforcing Landlock (where no other class grants write) the file opens for reading and NOT
+    /// for writing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_file_fallback_non_dir_as_exact_socket_gets_read_only_rule_and_warns_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::OpenOptions;
+        use std::io::ErrorKind;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{Arc, Mutex};
+
+        use landlock::{ABI, Access as _, AccessFs};
+        use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, mknodat, openat};
+
+        let all_abi = AccessFs::from_all(ABI::V5);
+        let read_file_mask = all_abi & AccessFs::ReadFile;
+
+        for (tag, is_fifo, expected_type_label) in
+            [("exfb", false, "regular file"), ("exff", true, "FIFO")]
+        {
+            let base = short_socket_test_dir(tag)?;
+            let docroot = base.join("www");
+            let tls_dir = base.join("tls");
+            let outside = base.join("outside");
+            let cert_file = tls_dir.join(if is_fifo { "site.fifo" } else { "site.pem" });
+            let key_file = tls_dir.join("site.key");
+            let outside_marker = outside.join("secret.txt");
+            std::fs::create_dir_all(&docroot)?;
+            std::fs::create_dir_all(&tls_dir)?;
+            std::fs::create_dir_all(&outside)?;
+            if is_fifo {
+                mknodat(CWD, &cert_file, FileType::Fifo, Mode::RUSR | Mode::WUSR, 0)?;
+            } else {
+                std::fs::write(&cert_file, "CERT-FALLBACK-PAYLOAD")?;
+            }
+            std::fs::write(&key_file, "PRIVATE-KEY-SECRET")?;
+            std::fs::write(&outside_marker, "OUTSIDE-SECRET")?;
+
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    tls {{
+        key-isolation "split-daemon"
+        keyd-socket "tcp://127.0.0.1:9443"
+        cert "{cert_file}"
+        key "{key_file}"
+    }}
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "exfb.example.test" {{
+    root "{docroot}"
+    route "/app.php" {{
+        fastcgi-pass "unix:{cert_file}"
+    }}
+}}
+"#,
+                docroot = kdl_escape_test_path(&docroot),
+                cert_file = kdl_escape_test_path(&cert_file),
+                key_file = kdl_escape_test_path(&key_file),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("exfb.kdl", &kdl)?;
+            let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+            policy.finalize_grants()?;
+
+            assert!(
+                policy.exact_file_fallbacks.contains(&cert_file),
+                "case {tag}: cert beside split-daemon key must use exact-file fallback"
+            );
+            assert!(
+                !policy.read_only_paths.contains(&tls_dir),
+                "case {tag}: parent directory holding split-daemon key must NOT be granted RO"
+            );
+            assert!(
+                !policy.read_only_paths.contains(&cert_file),
+                "case {tag}: socket precedence must have removed cert from read_only_paths"
+            );
+            assert!(
+                !policy.read_write_paths.contains(&cert_file),
+                "case {tag}: cert must not be in read_write_paths"
+            );
+            assert_eq!(
+                policy.socket_paths,
+                vec![cert_file.clone()],
+                "case {tag}: socket_paths must contain only the shadowed file"
+            );
+            assert!(
+                policy.socket_shadows_other_class.contains(&cert_file),
+                "case {tag}: shadowed exact-file fallback must be in socket_shadows_other_class"
+            );
+
+            let cert_md = std::fs::metadata(&cert_file)?;
+            let cert_inode = (cert_md.dev(), cert_md.ino());
+            let expected_raw_fd = match policy.grant_states.get(&cert_file) {
+                Some(crate::GrantState::Installed { fd, .. }) => fd.as_raw_fd(),
+                other => {
+                    return Err(format!(
+                        "case {tag}: expected Installed grant_state for cert, got {other:?}"
+                    )
+                    .into());
+                }
+            };
+
+            let events = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+            {
+                let _sub = capture_test_events(Arc::clone(&events));
+                let mut notes = Vec::new();
+                let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+                assert_eq!(
+                    assembled.sock_rules.len(),
+                    1,
+                    "case {tag}: shadowed non-directory must keep one socket-class rule"
+                );
+                let (sock_fd, sock_rule_mask) = assembled
+                    .sock_rules
+                    .first()
+                    .copied()
+                    .ok_or("expected one sock_rule")?;
+                assert_eq!(
+                    sock_fd.as_raw_fd(),
+                    expected_raw_fd,
+                    "case {tag}: socket-class rule must reuse the same descriptor"
+                );
+                let st = fstat(sock_fd)?;
+                #[allow(clippy::useless_conversion)]
+                let sock_inode = (u64::from(st.st_dev), u64::from(st.st_ino));
+                assert_eq!(
+                    sock_inode, cert_inode,
+                    "case {tag}: socket-class rule descriptor must identify the shadowed file"
+                );
+                assert_eq!(
+                    sock_rule_mask, read_file_mask,
+                    "case {tag}: shadowed non-directory socket-class rule must be ReadFile ONLY (no WriteFile)"
+                );
+                assert!(
+                    !sock_rule_mask.contains(AccessFs::WriteFile),
+                    "case {tag}: shadowed non-directory socket-class rule must not grant WriteFile"
+                );
+                for (fd, _) in assembled
+                    .readonly_rules
+                    .iter()
+                    .chain(assembled.writable_rules.iter())
+                {
+                    let other_st = fstat(fd)?;
+                    #[allow(clippy::useless_conversion)]
+                    let other_inode = (u64::from(other_st.st_dev), u64::from(other_st.st_ino));
+                    assert_ne!(
+                        other_inode, cert_inode,
+                        "case {tag}: no other rule class may cover cert in this fixture"
+                    );
+                }
+                assert!(
+                    notes.is_empty(),
+                    "case {tag}: expected no notes, got {notes:?}"
+                );
+            }
+
+            if crate::linux::probe_host_landlock_abi().is_some() {
+                for idx in 1..=2 {
+                    let p = policy.clone();
+                    let ev = Arc::clone(&events);
+                    let cf = cert_file.clone();
+                    let kf = key_file.clone();
+                    let out = outside_marker.clone();
+                    std::thread::spawn(move || -> Result<(), String> {
+                        let _sub = capture_test_events(ev);
+                        let status = crate::apply_landlock_current_thread(&p)
+                            .map_err(|e| format!("case {tag} thread {idx} apply_landlock: {e}"))?;
+                        if !matches!(
+                            status,
+                            crate::EnforcementStatus::Enforced
+                                | crate::EnforcementStatus::PartiallyEnforced
+                        ) {
+                            return Err(format!(
+                                "case {tag} thread {idx} expected enforcing Landlock: {status:?}"
+                            ));
+                        }
+                        if is_fifo {
+                            let _rd = openat(
+                                CWD,
+                                &cf,
+                                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            )
+                            .map_err(|e| {
+                                format!("case {tag} thread {idx} reading FIFO failed: {e}")
+                            })?;
+                            let wr_err = openat(
+                                CWD,
+                                &cf,
+                                OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                                Mode::empty(),
+                            )
+                            .err()
+                            .ok_or_else(|| {
+                                format!(
+                                    "case {tag} thread {idx} FIFO must NOT open for writing under Landlock"
+                                )
+                            })?;
+                            if wr_err != rustix::io::Errno::ACCESS {
+                                return Err(format!(
+                                    "case {tag} thread {idx} expected EACCES writing FIFO, got {wr_err:?}"
+                                ));
+                            }
+                        } else {
+                            let got = std::fs::read_to_string(&cf).map_err(|e| {
+                                format!("case {tag} thread {idx} reading cert failed: {e}")
+                            })?;
+                            if got != "CERT-FALLBACK-PAYLOAD" {
+                                return Err(format!(
+                                    "case {tag} thread {idx} unexpected cert contents: {got:?}"
+                                ));
+                            }
+                            let write_err =
+                                OpenOptions::new().write(true).open(&cf).err().ok_or_else(
+                                    || {
+                                        format!(
+                                            "case {tag} thread {idx} cert must NOT open for writing under Landlock"
+                                        )
+                                    },
+                                )?;
+                            if write_err.kind() != ErrorKind::PermissionDenied {
+                                return Err(format!(
+                                    "case {tag} thread {idx} expected PermissionDenied writing cert, got {write_err:?}"
+                                ));
+                            }
+                        }
+                        let key_err = std::fs::read_to_string(&kf).err().ok_or_else(|| {
+                            format!("case {tag} thread {idx} sibling private key must be denied")
+                        })?;
+                        if key_err.kind() != ErrorKind::PermissionDenied {
+                            return Err(format!(
+                                "case {tag} thread {idx} expected PermissionDenied on sibling key, got {key_err:?}"
+                            ));
+                        }
+                        let out_err = std::fs::read_to_string(&out).err().ok_or_else(|| {
+                            format!("case {tag} thread {idx} outside marker must be denied")
+                        })?;
+                        if out_err.kind() != ErrorKind::PermissionDenied {
+                            return Err(format!(
+                                "case {tag} thread {idx} expected PermissionDenied on outside marker, got {out_err:?}"
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| "exact-file fallback enforcement thread panicked")??;
+                }
+            }
+
+            let expected_warn = format!(
+                "unix socket path '{}' is not a socket (found {expected_type_label}) and the same path is configured for another use: its socket rule is reduced to read access; give the socket its own path",
+                cert_file.display()
+            );
+            let captured = events.lock().map_err(|_| "event capture lock poisoned")?;
+            let matching_warns: Vec<&String> = captured
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn)
+                .map(|e| &e.message)
+                .collect();
+            assert_eq!(
+                matching_warns.len(),
+                1,
+                "case {tag}: expected exactly 1 reduced-to-read WARN `{expected_warn}`, got {matching_warns:?} (all: {:?})",
+                captured
+                    .iter()
+                    .map(|e| (&e.level, &e.message))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                captured.iter().all(|e| {
+                    !e.message.contains("also configured as a directory grant")
+                        && !e.message.contains("no socket rule installed")
+                }),
+                "case {tag}: shadowed non-directory must emit only the reduced-to-read WARN"
+            );
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
         Ok(())
     }
 }
