@@ -9,11 +9,13 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::ErrorKind;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -27,10 +29,24 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const CHILD_ENV: &str = "MIRASERVE_SOCKET_TYPING_PARITY_CHILD";
 const BASE_ENV: &str = "MIRASERVE_SOCKET_TYPING_PARITY_BASE";
 
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn kdl_escape_path(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
+}
+
+/// Picks `std::env::temp_dir()` when it leaves ample headroom below Linux's 108-byte `sun_path`
+/// Unix socket path limit, falling back to `/tmp` when a long `TMPDIR` prefix would exceed it.
+fn short_socket_temp_root() -> PathBuf {
+    let default_tmp = std::env::temp_dir();
+    let resolved = fs::canonicalize(&default_tmp).unwrap_or_else(|_| default_tmp.clone());
+    if default_tmp.as_os_str().len() <= 52 && resolved.as_os_str().len() <= 52 {
+        default_tmp
+    } else {
+        PathBuf::from("/tmp")
+    }
 }
 
 struct TempDir {
@@ -39,16 +55,23 @@ struct TempDir {
 
 impl TempDir {
     fn new(tag: &str) -> Result<Self, std::io::Error> {
-        let nanos = SystemTime::now()
+        let root = short_socket_temp_root();
+        let pid = std::process::id();
+        let salt = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let raw = std::env::temp_dir().join(format!(
-            "miraserve-socktype-parity-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&raw)?;
-        let path = fs::canonicalize(&raw)?;
-        Ok(Self { path })
+            .map_or(0, |d| u64::from(d.subsec_nanos()) & 0xffff);
+        loop {
+            let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let raw = root.join(format!("ms-p-{tag}-{pid}-{salt:x}-{seq}"));
+            match fs::create_dir(&raw) {
+                Ok(()) => {
+                    let path = fs::canonicalize(&raw)?;
+                    return Ok(Self { path });
+                }
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+        }
     }
 }
 
@@ -580,7 +603,7 @@ site "parity.example.test" {{
         return Ok(());
     }
 
-    let tmp = TempDir::new("parity")?;
+    let tmp = TempDir::new("p")?;
     for (dir, file, body) in [
         ("a_rt1", "file.txt", "RT1"),
         ("b_docroot", "index.html", "DOCROOT"),
@@ -665,11 +688,11 @@ site "identity.example.test" {{
             ) {
                 return Err(format!("expected enforcing Landlock, got {status:?}"));
             }
-            // Original socket descriptor's inode keeps its Landlock rule: connecting to the moved
-            // socket inode succeeds.
-            UnixStream::connect(&moved_sock)
-                .map_err(|e| format!("connect to original socket inode failed: {e}"))?;
-            // Replacement directory at the original name has NO Landlock rule.
+            // Positive half (the assembled `sock_rules` descriptor's exact `(dev, ino)` identity
+            // staying pinned to `original_id`) is asserted directly via `fstat` in white-box unit
+            // test `real_socket_replaced_by_directory_assembled_rule_keeps_original_inode_identity`
+            // (pathname `UnixStream::connect` is not restricted by Landlock ABI 5).
+            // Negative half: replacement directory at the original name has NO Landlock rule.
             let dir_err = fs::read_to_string(&dir_marker).err().ok_or_else(|| {
                 "replacement directory at socket name must not be readable under Landlock"
                     .to_owned()
@@ -702,11 +725,426 @@ site "identity.example.test" {{
         return Ok(());
     }
 
-    let tmp = TempDir::new("identity")?;
+    let tmp = TempDir::new("id")?;
     fs::create_dir_all(tmp.path.join("www"))?;
     run_child(
         "real_socket_replaced_by_directory_keeps_original_descriptor_and_no_warning",
         "identity",
+        &tmp.path,
+    )
+}
+
+/// Test D (PARITY — must pass on literal 0.1.5 `074051e` AND on this branch):
+/// Exact endpoints `/.../pools/bad` (a directory), `/.../pools/bad/late.sock` (absent), and
+/// `/.../z.sock` (absent), with NO `socket-tree`:
+/// - `with-z`: the existing missing-socket notice lists ONLY `z.sock` (exact text, `sock:{joined}`
+///   deduplication key verified via a second policy containing only `z.sock`, and report note
+///   compared with literals).
+/// - `without-z`: omitting `z.sock` emits NO missing-socket notice at all.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn parity_missing_socket_notice_suppressed_under_installed_socket_dir() -> TestResult {
+    if let Ok(scenario) = std::env::var(CHILD_ENV) {
+        let base = PathBuf::from(std::env::var(BASE_ENV)?);
+        let docroot = base.join("www");
+        let bad_dir = base.join("pools").join("bad");
+        let late_child = bad_dir.join("late.sock");
+        let z_sock = base.join("z.sock");
+
+        let expected_warn_msg = "configured Landlock Unix socket path(s) do not exist at startup and cannot be granted until restart";
+        let events: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+        match scenario.as_str() {
+            "with-z" => {
+                let kdl = format!(
+                    r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "notice.example.test" {{
+    root "{docroot}"
+    route "/bad.php" {{
+        fastcgi-pass "unix:{bad_dir}"
+    }}
+    route "/late.php" {{
+        fastcgi-pass "unix:{late_child}"
+    }}
+    route "/z.php" {{
+        fastcgi-pass "unix:{z_sock}"
+    }}
+}}
+"#,
+                    docroot = kdl_escape_path(&docroot),
+                    bad_dir = kdl_escape_path(&bad_dir),
+                    late_child = kdl_escape_path(&late_child),
+                    z_sock = kdl_escape_path(&z_sock),
+                );
+                let (cfg, _) = parse_kdl("with-z.kdl", &kdl)?;
+                let mut policy = SandboxPolicy::from_config_with_file(&cfg, None, None);
+                policy.finalize_grants()?;
+
+                let expected_note = format!(
+                    "missing Landlock Unix socket path(s) omitted at startup (restart after creating): {}",
+                    z_sock.display()
+                );
+
+                // Install twice on two separate threads (both with EventCapture).
+                for idx in 1..=2 {
+                    let p = policy.clone();
+                    let ev = Arc::clone(&events);
+                    let exp_note = expected_note.clone();
+                    std::thread::spawn(move || -> Result<(), String> {
+                        let _g = tracing::subscriber::set_default(EventCapture(ev));
+                        let report = apply_sandbox(&p)
+                            .map_err(|e| format!("apply_sandbox #{idx}: {e}"))?;
+                        if !matches!(
+                            report.landlock,
+                            EnforcementStatus::Enforced | EnforcementStatus::PartiallyEnforced
+                        ) {
+                            return Err(format!(
+                                "install #{idx} expected enforcing Landlock, got {:?}",
+                                report.landlock
+                            ));
+                        }
+                        let missing_notes: Vec<&String> = report
+                            .notes
+                            .iter()
+                            .filter(|n| n.starts_with("missing Landlock Unix socket path(s)"))
+                            .collect();
+                        if missing_notes != vec![&exp_note] {
+                            return Err(format!(
+                                "install #{idx} expected missing-socket note [{exp_note:?}], got {missing_notes:?}"
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| "with-z thread panicked")??;
+                }
+
+                // Install a second policy containing ONLY `z.sock`: if the deduplication key from
+                // the first policy was `sock:{z_sock}` (0.1.5 exact key), this thread emits ZERO
+                // additional missing-socket WARNs.
+                let only_z_kdl = format!(
+                    r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "onlyz.example.test" {{
+    root "{docroot}"
+    route "/z.php" {{
+        fastcgi-pass "unix:{z_sock}"
+    }}
+}}
+"#,
+                    docroot = kdl_escape_path(&docroot),
+                    z_sock = kdl_escape_path(&z_sock),
+                );
+                let (only_z_cfg, _) = parse_kdl("only-z.kdl", &only_z_kdl)?;
+                let mut only_z_policy =
+                    SandboxPolicy::from_config_with_file(&only_z_cfg, None, None);
+                only_z_policy.finalize_grants()?;
+                let ev3 = Arc::clone(&events);
+                let exp_note_3 = expected_note;
+                std::thread::spawn(move || -> Result<(), String> {
+                    let _g = tracing::subscriber::set_default(EventCapture(ev3));
+                    let report = apply_sandbox(&only_z_policy)
+                        .map_err(|e| format!("apply_sandbox only-z: {e}"))?;
+                    let missing_notes: Vec<&String> = report
+                        .notes
+                        .iter()
+                        .filter(|n| n.starts_with("missing Landlock Unix socket path(s)"))
+                        .collect();
+                    if missing_notes != vec![&exp_note_3] {
+                        return Err(format!(
+                            "only-z install expected note [{exp_note_3:?}], got {missing_notes:?}"
+                        ));
+                    }
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| "only-z thread panicked")??;
+
+                let captured = events
+                    .lock()
+                    .map_err(|_| "event capture lock poisoned")?
+                    .clone();
+                let missing_warns: Vec<&CapturedEvent> = captured
+                    .iter()
+                    .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn_msg)
+                    .collect();
+                assert_eq!(
+                    missing_warns.len(),
+                    1,
+                    "expected exactly 1 missing-socket WARN with dedup key sock:<z.sock>, got {missing_warns:?} (all: {captured:?})"
+                );
+                let first = missing_warns
+                    .first()
+                    .ok_or("expected one missing-socket WARN")?;
+                assert_eq!(
+                    first.fields.get("missing_sockets").map(String::as_str),
+                    Some(z_sock.to_string_lossy().as_ref()),
+                    "missing_sockets must list ONLY z.sock: {first:?}"
+                );
+            }
+            "without-z" => {
+                let kdl = format!(
+                    r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "notice.example.test" {{
+    root "{docroot}"
+    route "/bad.php" {{
+        fastcgi-pass "unix:{bad_dir}"
+    }}
+    route "/late.php" {{
+        fastcgi-pass "unix:{late_child}"
+    }}
+}}
+"#,
+                    docroot = kdl_escape_path(&docroot),
+                    bad_dir = kdl_escape_path(&bad_dir),
+                    late_child = kdl_escape_path(&late_child),
+                );
+                let (cfg, _) = parse_kdl("without-z.kdl", &kdl)?;
+                let mut policy = SandboxPolicy::from_config_with_file(&cfg, None, None);
+                policy.finalize_grants()?;
+
+                for idx in 1..=2 {
+                    let p = policy.clone();
+                    let ev = Arc::clone(&events);
+                    std::thread::spawn(move || -> Result<(), String> {
+                        let _g = tracing::subscriber::set_default(EventCapture(ev));
+                        let report = apply_sandbox(&p)
+                            .map_err(|e| format!("apply_sandbox #{idx}: {e}"))?;
+                        if !matches!(
+                            report.landlock,
+                            EnforcementStatus::Enforced | EnforcementStatus::PartiallyEnforced
+                        ) {
+                            return Err(format!(
+                                "install #{idx} expected enforcing Landlock, got {:?}",
+                                report.landlock
+                            ));
+                        }
+                        let missing_notes: Vec<&String> = report
+                            .notes
+                            .iter()
+                            .filter(|n| n.starts_with("missing Landlock Unix socket path(s)"))
+                            .collect();
+                        if !missing_notes.is_empty() {
+                            return Err(format!(
+                                "install #{idx} without z.sock must emit zero missing-socket notes, got {missing_notes:?}"
+                            ));
+                        }
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| "without-z thread panicked")??;
+                }
+
+                let captured = events
+                    .lock()
+                    .map_err(|_| "event capture lock poisoned")?
+                    .clone();
+                let missing_warns: Vec<&CapturedEvent> = captured
+                    .iter()
+                    .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn_msg)
+                    .collect();
+                assert!(
+                    missing_warns.is_empty(),
+                    "without z.sock must emit zero missing-socket WARNs, got {missing_warns:?}"
+                );
+            }
+            other => return Err(format!("unknown scenario: {other}").into()),
+        }
+        return Ok(());
+    }
+
+    if !kernel_enforces_landlock()? {
+        eprintln!(
+            "skipping parity_missing_socket_notice_suppressed_under_installed_socket_dir: host kernel lacks Landlock LSM"
+        );
+        return Ok(());
+    }
+
+    for scenario in ["with-z", "without-z"] {
+        let tmp = TempDir::new(if scenario == "with-z" { "nz" } else { "no" })?;
+        fs::create_dir_all(tmp.path.join("www"))?;
+        fs::create_dir_all(tmp.path.join("pools").join("bad"))?;
+        run_child(
+            "parity_missing_socket_notice_suppressed_under_installed_socket_dir",
+            scenario,
+            &tmp.path,
+        )?;
+    }
+    Ok(())
+}
+
+/// Test E (black-box PARITY — must pass on literal 0.1.5 `074051e` AND on this branch):
+/// For Test A's shadowed config-directory configuration (config file in directory `D`, `D` also
+/// `fastcgi-pass "unix:D"`, no other grant covers `D`), verifies exact 0.1.5 path lists, open FD
+/// sequence & count, `(dev, ino)` identity, and kernel-enforced Landlock masks (`ReadFile` and
+/// `WriteFile` allowed on `D`, `ReadDir` and `MakeReg` denied on `D`).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn parity_shadowed_config_dir_matches_015_fds_identity_and_masks() -> TestResult {
+    if let Ok(scenario) = std::env::var(CHILD_ENV) {
+        assert_eq!(scenario, "shadow-parity");
+        let base = PathBuf::from(std::env::var(BASE_ENV)?);
+        let conf_dir = base.join("conf");
+        let cfg_file = conf_dir.join("miraserve.kdl");
+        let docroot = base.join("www");
+        let outside = base.join("outside");
+
+        let kdl = fs::read_to_string(&cfg_file)?;
+        let (cfg, _) = parse_kdl("miraserve.kdl", &kdl)?;
+
+        let mut expected_ro_set = expected_linux_system_ro_paths();
+        expected_ro_set.insert(docroot.clone());
+        let expected_read_only: Vec<PathBuf> = expected_ro_set.into_iter().collect();
+        let expected_read_write: Vec<PathBuf> = Vec::new();
+        let expected_socks: Vec<PathBuf> = vec![conf_dir.clone()];
+        let trees: BTreeSet<PathBuf> = BTreeSet::new();
+
+        let pre_fds: BTreeSet<i32> = snapshot_open_fds()?.keys().copied().collect();
+        let expected_new_fds = predict_015_open_fd_map(
+            &pre_fds,
+            &expected_read_only,
+            &expected_read_write,
+            &expected_socks,
+            &trees,
+        )?;
+
+        let mut policy = SandboxPolicy::from_config_with_file(&cfg, Some(&cfg_file), None);
+        policy.finalize_grants()?;
+
+        let actual_new_fds: BTreeMap<i32, PathBuf> = snapshot_open_fds()?
+            .into_iter()
+            .filter(|(fd, _)| !pre_fds.contains(fd))
+            .collect();
+
+        assert_eq!(policy.read_only_paths, expected_read_only);
+        assert_eq!(policy.read_write_paths, expected_read_write);
+        assert_eq!(policy.socket_paths, expected_socks);
+        assert_eq!(actual_new_fds, expected_new_fds);
+
+        let conf_md = fs::metadata(&conf_dir)?;
+        assert_eq!(
+            policy.granted_identity(&conf_dir),
+            Some((conf_md.dev(), conf_md.ino()))
+        );
+
+        let cfg_file_c = cfg_file.clone();
+        let conf_dir_c = conf_dir.clone();
+        let docroot_c = docroot.clone();
+        let outside_c = outside.clone();
+        let expected_kdl = kdl;
+        std::thread::spawn(move || -> Result<(), String> {
+            let report = apply_sandbox(&policy).map_err(|e| format!("apply_sandbox: {e}"))?;
+            if !matches!(
+                report.landlock,
+                EnforcementStatus::Enforced | EnforcementStatus::PartiallyEnforced
+            ) {
+                return Err(format!(
+                    "expected enforcing Landlock, got {:?}",
+                    report.landlock
+                ));
+            }
+            // Shadowed config dir keeps 0.1.5 socket-class mask: ReadFile + WriteFile allowed,
+            // ReadDir + MakeReg denied.
+            let mut f = File::open(&cfg_file_c)
+                .map_err(|e| format!("File::open on shadowed config failed: {e}"))?;
+            let mut got = String::new();
+            f.read_to_string(&mut got)
+                .map_err(|e| format!("read_to_string failed: {e}"))?;
+            if got != expected_kdl {
+                return Err("config contents mismatch".to_owned());
+            }
+            OpenOptions::new()
+                .write(true)
+                .open(&cfg_file_c)
+                .map_err(|e| format!("WriteFile on shadowed config dir failed: {e}"))?;
+            if fs::read_dir(&conf_dir_c).err().map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("shadowed config dir must deny ReadDir".to_owned());
+            }
+            if fs::write(conf_dir_c.join("new.txt"), b"x")
+                .err()
+                .map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("shadowed config dir must deny MakeReg".to_owned());
+            }
+            // Docroot keeps RO mask.
+            fs::read_to_string(docroot_c.join("index.html"))
+                .map_err(|e| format!("docroot ReadFile failed: {e}"))?;
+            fs::read_dir(&docroot_c).map_err(|e| format!("docroot ReadDir failed: {e}"))?;
+            if OpenOptions::new()
+                .write(true)
+                .open(docroot_c.join("index.html"))
+                .err()
+                .map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("docroot must deny WriteFile".to_owned());
+            }
+            // Outside ungranted dir denied.
+            if fs::read_to_string(outside_c.join("marker.txt"))
+                .err()
+                .map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("outside dir must deny ReadFile".to_owned());
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "shadow-parity thread panicked")??;
+        return Ok(());
+    }
+
+    if !kernel_enforces_landlock()? {
+        eprintln!(
+            "skipping parity_shadowed_config_dir_matches_015_fds_identity_and_masks: host kernel lacks Landlock LSM"
+        );
+        return Ok(());
+    }
+
+    let tmp = TempDir::new("sp")?;
+    let conf_dir = tmp.path.join("conf");
+    let www = tmp.path.join("www");
+    let outside = tmp.path.join("outside");
+    fs::create_dir_all(&conf_dir)?;
+    fs::create_dir_all(&www)?;
+    fs::create_dir_all(&outside)?;
+    fs::write(www.join("index.html"), "DOCROOT-OK")?;
+    fs::write(outside.join("marker.txt"), "OUTSIDE-SECRET")?;
+    let kdl = format!(
+        r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "shadow.example.test" {{
+    root "{www}"
+    route "/app.php" {{
+        fastcgi-pass "unix:{conf_dir}"
+    }}
+}}
+"#,
+        www = kdl_escape_path(&www),
+        conf_dir = kdl_escape_path(&conf_dir),
+    );
+    fs::write(conf_dir.join("miraserve.kdl"), &kdl)?;
+
+    run_child(
+        "parity_shadowed_config_dir_matches_015_fds_identity_and_masks",
+        "shadow-parity",
         &tmp.path,
     )
 }
