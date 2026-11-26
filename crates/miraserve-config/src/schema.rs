@@ -1264,7 +1264,7 @@ pub enum RouteHandler {
     #[serde(rename = "fastcgi")]
     FastCgi(FastCgiConfig),
     /// Resolve static files in order with fallback URI/status (`try-files`).
-    TryFiles(Vec<String>),
+    TryFiles(TryFilesConfig),
     /// Model Context Protocol security gateway with OAuth & tool RBAC.
     McpGateway(McpGatewayConfig),
     /// Reverse proxy pool with health checks and streaming controls.
@@ -1278,6 +1278,36 @@ pub enum RouteHandler {
     /// Answer every request with a fixed status and the site's error page for it
     /// (`respond 503`), for example a suspended or maintenance site.
     Respond(u16),
+}
+
+/// Configuration for a `try-files` route handler.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TryFilesConfig {
+    /// Candidate paths or `=status` codes tried in order.
+    pub candidates: Vec<String>,
+    /// When `true`, skip the final candidate if the normalised request path (without query string)
+    /// ends with a dot followed by 1 to 8 ASCII letters or digits (`\.[A-Za-z0-9]{1,8}$`).
+    pub fallback_unless_extension: bool,
+}
+
+impl Serialize for TryFilesConfig {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Preserve 0.1.5 `--dump-normalized` JSON output byte-for-byte when the default
+        // (`fallback-unless-extension=#false`) is used: serialize as a plain array of candidates.
+        // When `#true`, serialize as an object carrying both fields.
+        if self.fallback_unless_extension {
+            use serde::ser::SerializeStruct as _;
+            let mut state = serializer.serialize_struct("TryFilesConfig", 2)?;
+            state.serialize_field("candidates", &self.candidates)?;
+            state.serialize_field("fallback_unless_extension", &self.fallback_unless_extension)?;
+            state.end()
+        } else {
+            self.candidates.serialize(serializer)
+        }
+    }
 }
 
 /// HTTP redirect handler (`redirect "<target>" status=301`).

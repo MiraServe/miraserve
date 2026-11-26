@@ -97,7 +97,7 @@ fn print_version() -> ExitCode {
     );
     let _ = writeln!(
         stdout,
-        "features: precompressed, header-rule-status, service-allow-openat2, writable-set"
+        "features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless"
     );
     ExitCode::SUCCESS
 }

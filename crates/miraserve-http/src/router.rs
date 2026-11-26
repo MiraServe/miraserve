@@ -5212,7 +5212,8 @@ fn compile_site(
                     }
                 }
             }
-            RouteHandler::TryFiles(candidates) => {
+            RouteHandler::TryFiles(tf) => {
+                let candidates = &tf.candidates;
                 let root = route
                     .root
                     .as_deref()
@@ -5236,6 +5237,9 @@ fn compile_site(
                                 .with_file_cache(Arc::clone(cache), *window)
                                 .with_try_files_candidates(candidates.clone())
                                 .with_try_files_script_extensions(fastcgi_extensions.clone());
+                        }
+                        if tf.fallback_unless_extension {
+                            srv = srv.with_try_files_fallback_unless_extension(true);
                         }
                         CompiledHandler::TryFiles {
                             static_server: srv,

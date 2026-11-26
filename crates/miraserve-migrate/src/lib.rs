@@ -287,8 +287,8 @@ fn migrate_str_internal(
                 },
                 (
                     ir::MigratedHandler::TryFiles { candidates },
-                    miraserve_config::RouteHandler::TryFiles(got_cands),
-                ) => candidates == got_cands,
+                    miraserve_config::RouteHandler::TryFiles(got_tf),
+                ) => candidates == &got_tf.candidates && !got_tf.fallback_unless_extension,
                 (ir::MigratedHandler::Static, miraserve_config::RouteHandler::Static(_)) => true,
                 _ => false,
             };

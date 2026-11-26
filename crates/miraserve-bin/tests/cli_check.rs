@@ -6750,8 +6750,8 @@ fn version_features_line_appends_writable_set_in_order() -> TestResult {
         .ok_or("missing features line in `miraserve version`")?;
     assert_eq!(
         features_line,
-        "features: precompressed, header-rule-status, service-allow-openat2, writable-set",
-        "features tokens must keep existing order and append writable-set"
+        "features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless",
+        "features tokens must keep existing order and append try-files-extensionless"
     );
     Ok(())
 }
@@ -9798,5 +9798,155 @@ site "php-b.example" {{
     let _ = std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::set_permissions(&ro_sock, std::fs::Permissions::from_mode(0o600));
     let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// 0.1.6 Item 3: `miraserve check` validates `try-files ... fallback-unless-extension`, preserves
+/// byte-identical 0.1.5 `--dump-normalized` JSON when omitted or `#false`, emits the object form
+/// when `#true`, accepts single-candidate lists, and rejects bad types/unknown/duplicate attrs.
+#[test]
+fn check_validates_try_files_fallback_unless_extension_and_dump_normalized() -> TestResult {
+    let run_stdin = |kdl: &str, extra: &[&str]| -> Result<std::process::Output, std::io::Error> {
+        let mut child = Command::new(miraserve_bin())
+            .arg("check")
+            .args(extra)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(kdl.as_bytes())?;
+        }
+        child.wait_with_output()
+    };
+
+    // 1. Valid `#true`, `#false`, and single-candidate list pass `--strict`.
+    let valid_kdl = r#"
+server {
+    listen ":443"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "spa.example.test" {
+    root "/var/www/spa"
+    route "/single/*" {
+        try-files "/index.html" fallback-unless-extension=#true
+    }
+    route "/default/*" {
+        try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=#false
+    }
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=#true
+    }
+}
+"#;
+    let ok = run_stdin(
+        valid_kdl,
+        &["--strict", "--format", "json", "--dump-normalized"],
+    )?;
+    assert!(
+        ok.status.success(),
+        "valid fallback-unless-extension config must pass --strict: stdout={} stderr={}",
+        String::from_utf8_lossy(&ok.stdout),
+        String::from_utf8_lossy(&ok.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&ok.stdout)?;
+    let routes = parsed
+        .pointer("/config/sites/0/routes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing routes array in normalized dump")?;
+    // Single-candidate `#true`: serialized as object with `fallback_unless_extension: true`.
+    assert_eq!(
+        routes
+            .first()
+            .and_then(|r| r.pointer("/handler/config/fallback_unless_extension"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    // Explicit `#false`: serialized as plain array (0.1.5 byte-for-byte compatible).
+    assert!(
+        routes
+            .get(1)
+            .and_then(|r| r.pointer("/handler/config"))
+            .is_some_and(serde_json::Value::is_array),
+        "fallback-unless-extension=#false must dump as plain array for 0.1.5 parity: {parsed}"
+    );
+    // Multi-candidate `#true`: serialized as object.
+    assert_eq!(
+        routes
+            .get(2)
+            .and_then(|r| r.pointer("/handler/config/fallback_unless_extension"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    // 2. Non-boolean attribute rejected with E004.
+    let bad_type = r#"
+server { listen ":443"; tls { cert "/c.pem"; key "/k.pem" } }
+site "bad.example.test" {
+    root "/var/www/bad"
+    route "/*" { try-files "{path}" "/index.html" fallback-unless-extension="yes" }
+}
+"#;
+    let out_bad_type = run_stdin(bad_type, &["--format", "json"])?;
+    assert!(!out_bad_type.status.success());
+    let j_bad: serde_json::Value = serde_json::from_slice(&out_bad_type.stdout)?;
+    assert!(
+        j_bad
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|e| e.get("code").and_then(serde_json::Value::as_str) == Some("E004"))
+            }),
+        "expected E004 for non-bool fallback-unless-extension: {j_bad}"
+    );
+
+    // 3. Unknown attribute rejected with E003.
+    let unknown_prop = r#"
+server { listen ":443"; tls { cert "/c.pem"; key "/k.pem" } }
+site "bad.example.test" {
+    root "/var/www/bad"
+    route "/*" { try-files "{path}" "/index.html" unknown-attr=#true }
+}
+"#;
+    let out_unknown = run_stdin(unknown_prop, &["--format", "json"])?;
+    assert!(!out_unknown.status.success());
+    let j_unknown: serde_json::Value = serde_json::from_slice(&out_unknown.stdout)?;
+    assert!(
+        j_unknown
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|e| e.get("code").and_then(serde_json::Value::as_str) == Some("E003"))
+            }),
+        "expected E003 for unknown try-files property: {j_unknown}"
+    );
+
+    // 4. Duplicate attribute rejected with E005.
+    let dup_prop = r#"
+server { listen ":443"; tls { cert "/c.pem"; key "/k.pem" } }
+site "bad.example.test" {
+    root "/var/www/bad"
+    route "/*" {
+        try-files "{path}" "/index.html" fallback-unless-extension=#true fallback-unless-extension=#false
+    }
+}
+"#;
+    let out_dup = run_stdin(dup_prop, &["--format", "json"])?;
+    assert!(!out_dup.status.success());
+    let j_dup: serde_json::Value = serde_json::from_slice(&out_dup.stdout)?;
+    assert!(
+        j_dup
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|e| e.get("code").and_then(serde_json::Value::as_str) == Some("E005"))
+            }),
+        "expected E005 for duplicate fallback-unless-extension: {j_dup}"
+    );
+
     Ok(())
 }

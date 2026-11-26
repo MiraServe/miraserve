@@ -1861,7 +1861,7 @@ impl ValidatorCtx<'_> {
                         );
                     }
                 }
-                RouteHandler::TryFiles(candidates) => {
+                RouteHandler::TryFiles(tf) => {
                     if !has_filesystem_root {
                         self.error(
                             "E303",
@@ -1873,7 +1873,7 @@ impl ValidatorCtx<'_> {
                             Some("add a 'root \"/path/to/docroot\"' directive to the site or route"),
                         );
                     }
-                    for candidate in candidates {
+                    for candidate in &tf.candidates {
                         if let Some(status) = candidate
                             .strip_prefix('=')
                             .and_then(|code| code.parse::<u16>().ok())

@@ -1571,3 +1571,138 @@ async fn p2_d_foreign_fill_start_across_caches_is_refused() -> TestResult {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+/// 0.1.6 Item 3: enabling `fallback-unless-extension` allocates a fresh file-cache namespace,
+/// never serves an extension-like path from an earlier cached fallback entry, and never creates
+/// a cached entry when fallback is refused.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn try_files_fallback_unless_extension_isolates_and_never_caches_refused_fallback()
+-> TestResult {
+    let root = temp_root("tf-ext-cache")?;
+    fs::write(root.join("index.html"), b"SPA_SHELL")?;
+    fs::write(root.join("real.js"), b"REAL_JS")?;
+
+    let clock = ManualClock::new();
+    let counters = FileCacheCounters::new();
+    let cache = FileCache::with_clock(
+        Arc::new(FileCacheBudget::new(1024 * 1024)),
+        counters.clone(),
+        clock.cache_clock(),
+    );
+    let candidates = vec![
+        "{path}".to_owned(),
+        "{path}/".to_owned(),
+        "/index.html".to_owned(),
+    ];
+    let no_scripts: miraserve_static::ScriptOwner = Arc::new(|_| false);
+
+    // 1. Default server (`fallback_unless_extension = false`) caches `/assets/nope.js` -> `/index.html`.
+    let default_srv = StaticServer::open(&root, StaticConfig::default())?
+        .with_file_cache(Arc::clone(&cache), Duration::from_secs(60))
+        .with_try_files_candidates(candidates.clone())
+        .with_try_files_script_owner(Arc::clone(&no_scripts));
+    let out_warm = default_srv
+        .serve_try_files_canonical_routed(
+            &Method::GET,
+            "/assets/nope.js",
+            None,
+            &HeaderMap::new(),
+            &candidates,
+            &[],
+            &no_scripts,
+        )
+        .await;
+    let TryFilesOutcome::FallbackResponse { response, .. } = out_warm else {
+        return Err("expected default server to serve fallback for /assets/nope.js".into());
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(*response).await?, b"SPA_SHELL");
+    assert_eq!(counters.fills(), 1);
+    assert_eq!(cache.entry_count(), 1);
+
+    // 2. Cloning with `with_try_files_fallback_unless_extension(true)` allocates a fresh namespace:
+    //    `/assets/nope.js` MUST NOT hit the cached fallback entry and MUST NOT create one.
+    let ext_srv = default_srv.with_try_files_fallback_unless_extension(true);
+    let hits_before = counters.hits();
+    let fills_before = counters.fills();
+    let entries_before = cache.entry_count();
+    for _ in 0..2 {
+        let out_refused = ext_srv
+            .serve_try_files_canonical_routed(
+                &Method::GET,
+                "/assets/nope.js",
+                None,
+                &HeaderMap::new(),
+                &candidates,
+                &[],
+                &no_scripts,
+            )
+            .await;
+        let TryFilesOutcome::Response(resp) = out_refused else {
+            return Err("expected 404 Response for refused extension fallback".into());
+        };
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(counters.hits(), hits_before);
+    assert_eq!(counters.fills(), fills_before);
+    assert_eq!(cache.entry_count(), entries_before);
+
+    // 3. Extensionless `/about` DOES fall back and cache; `/assets/nope.js` still misses & 404s.
+    let out_about = ext_srv
+        .serve_try_files_canonical_routed(
+            &Method::GET,
+            "/about",
+            None,
+            &HeaderMap::new(),
+            &candidates,
+            &[],
+            &no_scripts,
+        )
+        .await;
+    let TryFilesOutcome::FallbackResponse { response, .. } = out_about else {
+        return Err("expected fallback for /about".into());
+    };
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(read_body(*response).await?, b"SPA_SHELL");
+    assert_eq!(counters.fills(), fills_before + 1);
+
+    let out_still_404 = ext_srv
+        .serve_try_files_canonical_routed(
+            &Method::GET,
+            "/assets/nope.js",
+            None,
+            &HeaderMap::new(),
+            &candidates,
+            &[],
+            &no_scripts,
+        )
+        .await;
+    let TryFilesOutcome::Response(resp) = out_still_404 else {
+        return Err("expected 404 for /assets/nope.js after /about cached".into());
+    };
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // 4. Existing file `/real.js` is served and cached directly.
+    let out_real = ext_srv
+        .serve_try_files_canonical_routed(
+            &Method::GET,
+            "/real.js",
+            None,
+            &HeaderMap::new(),
+            &candidates,
+            &[],
+            &no_scripts,
+        )
+        .await;
+    let TryFilesOutcome::Response(resp) = out_real else {
+        return Err("expected direct Response for existing /real.js".into());
+    };
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(read_body(*resp).await?, b"REAL_JS");
+    assert_eq!(counters.fills(), fills_before + 2);
+
+    let _ = fs::remove_dir_all(&root);
+    Ok(())
+}

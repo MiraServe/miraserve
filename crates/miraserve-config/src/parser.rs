@@ -19,7 +19,7 @@ use crate::schema::{
     RewriteAction, RewriteCondition, RewriteConditionKind, RewriteRule, RouteConfig, RouteHandler,
     SandboxConfig, SeccompMode, SecurityHeadersPolicy, ServerConfig, SignatureAlgorithm,
     SignatureRequirement, SiteConfig, SiteHttpMode, SitePreset, SiteTlsConfig, StaticConfig,
-    StreamingFlushMode, TelemetryConfig, TimeoutsConfig, TlsConfig, TlsVersion,
+    StreamingFlushMode, TelemetryConfig, TimeoutsConfig, TlsConfig, TlsVersion, TryFilesConfig,
     UnverifiedBotAction, UpstreamConfig, UpstreamTlsConfig, WasmPluginConfig,
     header_rule_rejection, parse_header_status_list,
 };
@@ -2678,8 +2678,8 @@ impl<'a> ParserCtx<'a> {
                         continue;
                     }
                     self.record_span(format!("{route_prefix}.try-files"), child.span());
-                    if let Some(candidates) = self.parse_string_list_node(child, "try-files") {
-                        handler = Some(RouteHandler::TryFiles(candidates));
+                    if let Some(tf) = self.parse_try_files(child) {
+                        handler = Some(RouteHandler::TryFiles(tf));
                     }
                 }
                 "mcp-gateway" => {
@@ -2800,6 +2800,50 @@ impl<'a> ParserCtx<'a> {
             headers,
             access,
             basic_auth,
+        })
+    }
+
+    fn parse_try_files(&mut self, node: &KdlNode) -> Option<TryFilesConfig> {
+        self.expect_no_children(node, "try-files");
+        let (args, props) = self.split_entries(node);
+        let mut fallback_unless_extension = false;
+        for (prop, entry) in props {
+            match prop {
+                "fallback-unless-extension" => {
+                    if let Some(flag) =
+                        self.expect_bool(entry, "try-files fallback-unless-extension")
+                    {
+                        fallback_unless_extension = flag;
+                    }
+                }
+                other => {
+                    self.push_error(
+                        "E003",
+                        format!("unknown property '{other}' on 'try-files'"),
+                        Some(entry.span()),
+                        Some("allowed property on 'try-files' is: fallback-unless-extension"),
+                    );
+                }
+            }
+        }
+        if args.is_empty() {
+            self.push_error(
+                "E004",
+                "'try-files' requires at least one string argument",
+                Some(node.span()),
+                None,
+            );
+            return None;
+        }
+        let mut candidates = Vec::with_capacity(args.len());
+        for arg in args {
+            if let Some(s) = self.expect_string(arg, "try-files") {
+                candidates.push(s.to_owned());
+            }
+        }
+        Some(TryFilesConfig {
+            candidates,
+            fallback_unless_extension,
         })
     }
 

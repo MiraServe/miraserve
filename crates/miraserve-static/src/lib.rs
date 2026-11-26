@@ -2113,6 +2113,9 @@ pub struct StaticServer {
     test_clock_ns: Option<Arc<AtomicU64>>,
     /// Opt-in time-bounded in-memory file cache (`None` by default; single off-switch branch).
     file_cache: Option<SiteFileCache>,
+    /// When `true`, `try-files` skips its final candidate if the normalised request path (without
+    /// query string) ends with `\.[A-Za-z0-9]{1,8}$`.
+    try_files_fallback_unless_extension: bool,
     /// Compile-time count of distinct response header keys the caller will insert after static
     /// response construction (security headers + site/route `headers` rules) so the response
     /// `HeaderMap` is sized once without regrowing.
@@ -2273,6 +2276,7 @@ impl StaticServer {
             #[cfg(test)]
             test_clock_ns: None,
             file_cache: None,
+            try_files_fallback_unless_extension: false,
             extra_response_headers: 0,
             #[cfg(test)]
             dir_index_blocking_hook: None,
@@ -2378,6 +2382,41 @@ impl StaticServer {
         self
     }
 
+    /// Configures `try-files ... fallback-unless-extension` on this static server and allocates a
+    /// fresh file-cache namespace ID when a cache is attached so extension-skipping routes never
+    /// share cached fallback entries with routes that allow extension fallback.
+    #[must_use]
+    pub fn with_try_files_fallback_unless_extension(mut self, enabled: bool) -> Self {
+        self.try_files_fallback_unless_extension = enabled;
+        if let Some(fc) = self.file_cache.as_mut() {
+            fc.refresh_namespace_id();
+        }
+        self
+    }
+
+    fn should_skip_try_files_last(&self, path_input: &str, decode_percent: bool) -> bool {
+        if !self.try_files_fallback_unless_extension {
+            return false;
+        }
+        if decode_percent {
+            percent_decode(path_input).is_some_and(|decoded| path_ends_with_extension(&decoded))
+        } else {
+            path_ends_with_extension(path_input)
+        }
+    }
+}
+
+/// Returns `true` when `path` ends with a dot followed by 1 to 8 ASCII letters or digits
+/// (`\.[A-Za-z0-9]{1,8}$`), matching the single-page-app `try-files` extensionless fallback rule.
+#[must_use]
+pub fn path_ends_with_extension(path: &str) -> bool {
+    let Some((_, tail)) = path.rsplit_once('.') else {
+        return false;
+    };
+    (1..=8).contains(&tail.len()) && tail.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+impl StaticServer {
     /// Computes the 3-bit `Accept-Encoding` negotiation mask for `req_headers`, or `0` when
     /// compression is disabled on this server.
     fn request_enc_mask(&self, req_headers: &HeaderMap) -> u8 {
@@ -5966,7 +6005,8 @@ impl StaticServer {
                 return static_outcome(method_not_allowed(), tpl_path, candidate_path);
             }
         }
-        if let Some(last) = candidates.last() {
+        let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
+        if !skip_last && let Some(last) = candidates.last() {
             if let Some(code_str) = last.strip_prefix('=')
                 && let Ok(code_num) = code_str.parse::<u16>()
                 && let Ok(status) = StatusCode::from_u16(code_num)
@@ -6013,6 +6053,9 @@ impl StaticServer {
         runs_script: Option<&ScriptOwner>,
         decode_percent: bool,
     ) -> TryFilesOutcome {
+        if candidates.len() <= 1 && self.should_skip_try_files_last(path_input, decode_percent) {
+            return TryFilesOutcome::Response(Box::new(status_response(StatusCode::NOT_FOUND)));
+        }
         #[cfg(target_os = "linux")]
         if *method == Method::GET
             && self.should_spawn_static_task()
@@ -6101,8 +6144,12 @@ impl StaticServer {
                 .await;
         }
 
+        let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
         for (idx, template) in candidates.iter().enumerate() {
             let is_last = idx + 1 == candidates.len();
+            if is_last && skip_last {
+                break;
+            }
 
             if let Some(code_str) = template.strip_prefix('=')
                 && let Ok(code_num) = code_str.parse::<u16>()
@@ -6260,6 +6307,10 @@ impl StaticServer {
                     decode_percent,
                 )
                 .await;
+        }
+
+        if candidates.len() <= 1 && self.should_skip_try_files_last(path_input, decode_percent) {
+            return TryFilesOutcome::Response(Box::new(status_response(StatusCode::NOT_FOUND)));
         }
 
         // Cache-enabled `try-files` path: a hit answers before probing ANY candidate or directory
@@ -6431,8 +6482,12 @@ impl StaticServer {
                 }
             };
 
+        let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
         for (idx, template) in candidates.iter().enumerate() {
             let is_last = idx + 1 == candidates.len();
+            if is_last && skip_last {
+                break;
+            }
 
             if let Some(code_str) = template.strip_prefix('=')
                 && let Ok(code_num) = code_str.parse::<u16>()

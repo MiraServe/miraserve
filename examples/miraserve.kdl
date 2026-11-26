@@ -102,6 +102,11 @@ site "legacy-blog.example.com" {
     //     }
     // }
 
+    // Single-page-app fallback that returns 404 for missing extensioned paths (`.js`, `.css`, ...):
+    // route "/*" {
+    //     try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=true
+    // }
+
     route "*.php" {
         fastcgi-pass "unix:/run/php/php8.3-fpm.sock"
     }
