@@ -1691,8 +1691,11 @@ impl SandboxPolicy {
         self.grant_states.insert(real_parent.clone(), rp_state);
         // Log binding adds the canonical RW path and replaces its grant state after initial class
         // precedence. If the same path key is in `socket_paths`, record the socket list's spelling
-        // so the Linux installer keeps the 0.1.5 socket-class rule on the replacement descriptor
-        // (followed by the pinned RW rule) and emits the shadow WARN instead of skipping it.
+        // so the Linux installer emits the shadow WARN instead of skipping it: when `real_parent`
+        // is a directory it keeps the 0.1.5 socket-class rule on the replacement descriptor
+        // (followed by the pinned RW rule); when the log parent is a regular file (or other
+        // non-directory) there is no directory pin and the socket rule is reduced to read access
+        // (`AccessFs::ReadFile` only).
         for sock_path in &self.socket_paths {
             if sock_path == &real_parent {
                 self.socket_shadows_other_class.insert(sock_path.clone());
