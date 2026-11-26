@@ -2819,9 +2819,9 @@ impl<'a> ParserCtx<'a> {
                 other => {
                     self.push_error(
                         "E003",
-                        format!("unknown property '{other}' on 'try-files'"),
+                        format!("unexpected property '{other}' on 'try-files'"),
                         Some(entry.span()),
-                        Some("allowed property on 'try-files' is: fallback-unless-extension"),
+                        None,
                     );
                 }
             }

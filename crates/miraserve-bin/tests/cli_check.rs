@@ -10480,7 +10480,7 @@ site "bad.example.test" {
         "expected E004 for non-bool fallback-unless-extension: {j_bad}"
     );
 
-    // 3. Unknown attribute rejected with E003.
+    // 3. Unknown attribute rejected with exact 0.1.5 E003 diagnostic text and no help line.
     let unknown_prop = r#"
 server { listen ":443"; tls { cert "/c.pem"; key "/k.pem" } }
 site "bad.example.test" {
@@ -10496,10 +10496,14 @@ site "bad.example.test" {
             .get("errors")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|arr| {
-                arr.iter()
-                    .any(|e| e.get("code").and_then(serde_json::Value::as_str) == Some("E003"))
+                arr.iter().any(|e| {
+                    e.get("code").and_then(serde_json::Value::as_str) == Some("E003")
+                        && e.get("message").and_then(serde_json::Value::as_str)
+                            == Some("unexpected property 'unknown-attr' on 'try-files'")
+                        && e.get("help").is_none_or(serde_json::Value::is_null)
+                })
             }),
-        "expected E003 for unknown try-files property: {j_unknown}"
+        "expected exact 0.1.5 E003 diagnostic for unknown try-files property: {j_unknown}"
     );
 
     // 4. Duplicate attribute rejected with E005.
