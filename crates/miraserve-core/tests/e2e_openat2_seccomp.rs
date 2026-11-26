@@ -912,7 +912,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
     fs::write(www.join("index.html"), b"ok")?;
     let tls_port = reserve_free_port()?;
 
-    let (kdl, expected_level) = match mode {
+    let (kdl, expected_level, expected_impact) = match mode {
         "default_h2_static" => (
             format!(
                 "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
@@ -920,6 +920,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
                 www.display()
             ),
             tracing::Level::INFO,
+            "static HTTP/2 streams will run as separate tasks instead of in-task",
         ),
         "file_cache_zero_budget" => (
             format!(
@@ -928,6 +929,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
                 www.display()
             ),
             tracing::Level::INFO,
+            "static HTTP/2 streams will run as separate tasks instead of in-task",
         ),
         "file_cache_enabled" => (
             format!(
@@ -936,6 +938,8 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
                 www.display()
             ),
             tracing::Level::WARN,
+            "file-cache will store nothing and static HTTP/2 streams will run as separate tasks \
+             instead of in-task",
         ),
         "workers_non_shared" => (
             format!(
@@ -944,13 +948,15 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
                 www.display()
             ),
             tracing::Level::WARN,
+            "worker loops will not look up static files inline and static HTTP/2 streams will run \
+             as separate tasks instead of in-task",
         ),
         other => return Err(format!("unknown level child mode: {other}").into()),
     };
 
     let (cfg, _) = parse_kdl("openat2-level.kdl", &kdl)?;
     let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg.clone())),
+        Arc::new(ConfigStore::new(cfg)),
         ServerOptions {
             dev_tls: true,
             apply_sandbox: true,
@@ -958,25 +964,33 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
         },
     )
     .await?;
-    let expected_text = miraserve_core::openat2_refused_advisory_for_runtime_with_static_work(
-        &cfg,
-        server.sandbox_report(),
-        Some(true),
-        true,
-    )
-    .ok_or("expected openat2 refusal advisory text")?;
+
+    // Pin against a literal copy of the 0.1.5 advisory text (never calling the production
+    // formatter), so any unintentional wording drift fails this test.
+    let enosys = std::io::Error::from_raw_os_error(38).to_string();
+    let expected_text = format!(
+        "openat2 is refused in this process ({enosys}; either a system-call filter such as \
+         systemd RestrictSUIDSGID=yes / DefaultRestrictSUIDSGID=yes or an outer container \
+         seccomp profile, or a kernel older than 5.6): {expected_impact}; if blocked by systemd \
+         RestrictSUIDSGID=yes, regenerate the worker unit with `miraserve service generate \
+         --target systemd --allow-openat2` (or set `RestrictSUIDSGID=no` if \
+         systemd 258+ enables `DefaultRestrictSUIDSGID=yes`); if blocked by a container or \
+         outer seccomp profile, allow openat2 there; if the host kernel is older than 5.6, \
+         upgrade the kernel (regenerating the unit cannot help)"
+    );
 
     let captured = events.lock().map_err(|_| "events mutex poisoned")?.clone();
-    let openat2_events: Vec<&(tracing::Level, String)> = captured
+    let openat2_events: Vec<(usize, &(tracing::Level, String))> = captured
         .iter()
-        .filter(|(_, msg)| msg.contains("openat2 is refused in this process"))
+        .enumerate()
+        .filter(|(_, (_, msg))| msg.contains("openat2 is refused in this process"))
         .collect();
     assert_eq!(
         openat2_events.len(),
         1,
         "mode={mode}: expected exactly one openat2 refusal event, got: {openat2_events:?}"
     );
-    let (actual_level, actual_msg) = openat2_events
+    let (openat2_idx, (actual_level, actual_msg)) = openat2_events
         .first()
         .copied()
         .ok_or("missing openat2 event")?;
@@ -986,13 +1000,20 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
     );
     assert_eq!(
         actual_msg, &expected_text,
-        "mode={mode}: message text must stay identical"
+        "mode={mode}: message text must match the literal 0.1.5 advisory"
     );
-    assert!(
-        captured.iter().any(|(lvl, msg)| {
+    let h2_idx = captured
+        .iter()
+        .position(|(lvl, msg)| {
             *lvl == tracing::Level::INFO && msg.contains("HTTP/2 stream execution mode selected")
-        }),
-        "mode={mode}: expected HTTP/2 execution-mode INFO line, got: {captured:?}"
+        })
+        .ok_or_else(|| {
+            format!("mode={mode}: expected HTTP/2 execution-mode INFO line, got: {captured:?}")
+        })?;
+    assert!(
+        h2_idx < openat2_idx,
+        "mode={mode}: HTTP/2 execution-mode INFO line (idx={h2_idx}) must precede the openat2 \
+         refusal advisory (idx={openat2_idx}): {captured:?}"
     );
 
     server.shutdown().await;
