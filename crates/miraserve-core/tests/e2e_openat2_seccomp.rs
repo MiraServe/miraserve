@@ -30,6 +30,11 @@ use http::{Request, StatusCode};
 use http_body_util::{BodyExt as _, Empty};
 use hyper_util::rt::TokioIo;
 use miraserve_config::{ConfigStore, parse_kdl};
+
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+
+use kdl_test_util::kdl_escape_path;
 use miraserve_core::{
     ListenerKind, MiraServeServer, RunningServer, SandboxPolicy, ServerOptions,
     apply_landlock_current_thread, openat2_refused_advisory, probe_openat2_refused,
@@ -469,8 +474,8 @@ async fn run_child_scenario(expect_openat2_allowed: bool) -> TestResult {
         "server {{\n    listen \"127.0.0.1:{tls_port}\" protocols=\"h1\"\n    workers 1\n    sandbox {{ landlock #{use_landlock}; seccomp \"strict\" }}\n}}\n\
          site \"cached.openat2.test\" {{\n    root \"{}\"\n    file-cache \"60s\"\n}}\n\
          site \"plain.openat2.test\" {{\n    root \"{}\"\n}}\n",
-        cached_root.display(),
-        plain_root.display(),
+        kdl_escape_path(&cached_root),
+        kdl_escape_path(&plain_root),
     );
     let (cfg, _) = parse_kdl("openat2-seccomp.kdl", &kdl)?;
 
@@ -658,11 +663,8 @@ async fn run_kill_openat2_proxy_child(
         None
     };
     let tenant_block = if let Some((_, owner_dir)) = &tenant_dir {
-        let owner = owner_dir.to_string_lossy().replace('\\', "/");
-        let missing_root = owner_dir
-            .join("missing-docroot")
-            .to_string_lossy()
-            .replace('\\', "/");
+        let owner = kdl_escape_path(owner_dir);
+        let missing_root = kdl_escape_path(&owner_dir.join("missing-docroot"));
         format!(
             r#"
 site "quarantined-tenant.test" {{
@@ -913,12 +915,12 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
     fs::write(www.join("index.html"), b"ok")?;
     let tls_port = reserve_free_port()?;
 
+    let www_escaped = kdl_escape_path(&www);
     let (kdl, expected_level, expected_impact) = match mode {
         "default_h2_static" => (
             format!(
                 "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
-                 site \"level.openat2.test\" {{\n    root \"{}\"\n}}\n",
-                www.display()
+                 site \"level.openat2.test\" {{\n    root \"{www_escaped}\"\n}}\n"
             ),
             tracing::Level::INFO,
             "static HTTP/2 streams will run as separate tasks instead of in-task",
@@ -926,8 +928,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
         "file_cache_zero_budget" => (
             format!(
                 "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    limits {{ file-cache-bytes \"0\" }}\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
-                 site \"level.openat2.test\" {{\n    root \"{}\"\n    file-cache \"5s\"\n}}\n",
-                www.display()
+                 site \"level.openat2.test\" {{\n    root \"{www_escaped}\"\n    file-cache \"5s\"\n}}\n"
             ),
             tracing::Level::INFO,
             "static HTTP/2 streams will run as separate tasks instead of in-task",
@@ -935,8 +936,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
         "file_cache_enabled" => (
             format!(
                 "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
-                 site \"level.openat2.test\" {{\n    root \"{}\"\n    file-cache \"5s\"\n}}\n",
-                www.display()
+                 site \"level.openat2.test\" {{\n    root \"{www_escaped}\"\n    file-cache \"5s\"\n}}\n"
             ),
             tracing::Level::WARN,
             "file-cache will store nothing and static HTTP/2 streams will run as separate tasks \
@@ -945,8 +945,7 @@ async fn run_openat2_level_child(mode: &str) -> TestResult {
         "workers_non_shared" => (
             format!(
                 "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    workers 1\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
-                 site \"level.openat2.test\" {{\n    root \"{}\"\n}}\n",
-                www.display()
+                 site \"level.openat2.test\" {{\n    root \"{www_escaped}\"\n}}\n"
             ),
             tracing::Level::WARN,
             "worker loops will not look up static files inline and static HTTP/2 streams will run \

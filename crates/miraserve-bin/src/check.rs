@@ -2725,6 +2725,13 @@ fn make_report_handler() -> GraphicalReportHandler {
 mod writable_set_unit_tests {
     use super::*;
 
+    mod kdl_test_util {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../miraserve-config/tests/common/mod.rs"
+        ));
+    }
+
     struct FailWriteWriter;
     impl io::Write for FailWriteWriter {
         fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
@@ -2862,19 +2869,22 @@ mod writable_set_unit_tests {
 
         let kdl = format!(
             "server {{ listen \":443\"; tls {{ cert \"/c.pem\"; key \"/k.pem\" }} }}\n\
-             site \"unit.example\" {{ root \"/var/www\"; route \"*.php\" {{ fastcgi-pass \"unix:{sock_str}\" }} }}\n"
+             site \"unit.example\" {{ root \"/var/www\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
+            kdl_test_util::kdl_escape_str(&sock_str),
         );
         let cfg_path = base.join("unit.kdl");
         fs::write(&cfg_path, &kdl)?;
         let loaded = miraserve_config::load_file_detailed(&cfg_path)?;
 
-        // 1. Real UID != effective UID (and real GID != effective GID): INDETERMINATE note,
-        //    zero W033, and the probe closure is never invoked.
+        // 1. Real UID != effective UID (and real GID != effective GID, including uid = euid = 0
+        //    with differing real/effective GIDs): INDETERMINATE ids-differ note wins (never the
+        //    root note), zero W033, and the probe closure is never invoked.
         for (ruid, euid, rgid, egid) in [
             (1000, 33, 1000, 1000),
             (1000, 1000, 1000, 33),
             (0, 33, 0, 33),
             (1000, 0, 1000, 0),
+            (0, 0, 0, 33),
         ] {
             let mut issues = Vec::new();
             let mut notes = FastCgiSocketAccessNotes::default();

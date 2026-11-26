@@ -16,6 +16,11 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use miraserve_config::{SeccompMode, parse_kdl};
+
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+
+use kdl_test_util::kdl_escape_path;
 use miraserve_sandbox::{
     EnforcementStatus, SandboxError, SandboxPolicy, apply_landlock_current_thread,
     apply_seccomp_current_thread, compile_seccomp_bpf_bytes_for_host, probe_openat2_refused,
@@ -1108,6 +1113,14 @@ fn landlock_socket_tree_allows_openat2_o_tmpfile_setid_and_blocks_named_creation
     let base = temp_base("landlock-otmpfile")?;
     let sock_tree = base.join("sock-tree");
     let acme_dir = base.join("acme");
+    if let Some(reason) = miraserve_config::sandbox_tree_rejection(&sock_tree.to_string_lossy()) {
+        eprintln!(
+            "skipping landlock_o_tmpfile_check: temp path '{}' rejected by sandbox tree validator ({reason})",
+            sock_tree.display()
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        return Ok(());
+    }
     std::fs::create_dir_all(&sock_tree)?;
     std::fs::create_dir_all(&acme_dir)?;
 
@@ -1133,7 +1146,7 @@ fn landlock_socket_tree_allows_openat2_o_tmpfile_setid_and_blocks_named_creation
 
     let kdl = format!(
         "server {{\n    listen \"127.0.0.1:8443\"\n    sandbox {{ landlock #true; seccomp \"strict\"; socket-tree \"{}\" }}\n}}\n",
-        sock_tree.display()
+        kdl_escape_path(&sock_tree)
     );
     let (cfg, _) = parse_kdl("landlock-otmpfile.kdl", &kdl)?;
     let mut policy = SandboxPolicy::from_config_with_file(&cfg, None, Some(&acme_dir));

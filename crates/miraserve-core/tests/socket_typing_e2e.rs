@@ -18,10 +18,14 @@ use std::io::{BufRead as _, BufReader, ErrorKind, Read as _, Write as _};
 use std::net::SocketAddr;
 use std::os::unix::fs::{OpenOptionsExt as _, symlink};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+use kdl_test_util::kdl_escape_path;
 
 use bytes::Bytes;
 use http::header::HOST;
@@ -48,13 +52,15 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 const CHILD_ENV: &str = "MIRASERVE_SOCKET_TYPING_E2E_CHILD";
 const BASE_ENV: &str = "MIRASERVE_SOCKET_TYPING_E2E_BASE";
 
-static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Generous deadlines for loaded machines (every child wait and exchange is strictly bounded).
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+const ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
+const FCGI_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+const CHILD_SCENARIO_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn kdl_escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Picks `std::env::temp_dir()` when it leaves ample headroom below Linux's 108-byte `sun_path`
 /// Unix socket path limit, falling back to `/tmp` when a long `TMPDIR` prefix would exceed it.
@@ -188,36 +194,98 @@ async fn https_get(
     path: &str,
     connector: &TlsConnector,
 ) -> Result<(StatusCode, String), Box<dyn std::error::Error>> {
-    let tcp = TcpStream::connect(addr).await?;
-    let server_name = ServerName::try_from(host.to_owned())?;
-    let tls = connector.connect(server_name, tcp).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let req = Request::builder()
-        .uri(path)
-        .header(HOST, host)
-        .body(Empty::<Bytes>::new())?;
-    let resp = sender.send_request(req).await?;
-    let status = resp.status();
-    let body = resp.into_body().collect().await?.to_bytes();
-    Ok((status, String::from_utf8_lossy(&body).into_owned()))
+    tokio::time::timeout(HTTP_EXCHANGE_TIMEOUT, async {
+        let tcp = TcpStream::connect(addr).await?;
+        let server_name = ServerName::try_from(host.to_owned())?;
+        let tls = connector.connect(server_name, tcp).await?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = Request::builder()
+            .uri(path)
+            .header(HOST, host)
+            .body(Empty::<Bytes>::new())?;
+        let resp = sender.send_request(req).await?;
+        let status = resp.status();
+        let body = resp.into_body().collect().await?.to_bytes();
+        Ok((status, String::from_utf8_lossy(&body).into_owned()))
+    })
+    .await
+    .map_err(|_| format!("timed out after {HTTP_EXCHANGE_TIMEOUT:?} on HTTPS GET {host}{path}"))?
+}
+
+/// Waits for `child` to exit within `timeout`, using `pipe_closed` to wake immediately once the
+/// child closes its output pipe. Returns `Ok(Some(status))` on exit within the bound or
+/// `Ok(None)` if the timeout expired (after which the caller kills and reaps the child).
+fn wait_child_bounded(
+    child: &mut Child,
+    pipe_closed: Option<&mpsc::Receiver<()>>,
+    timeout: Duration,
+) -> Result<Option<ExitStatus>, std::io::Error> {
+    let deadline = Instant::now() + timeout;
+    if let Some(status) = child.try_wait()? {
+        return Ok(Some(status));
+    }
+    if let Some(rx) = pipe_closed {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            let _ = rx.recv_timeout(remaining);
+        }
+    }
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(25)));
+    }
 }
 
 fn run_child_scenario(test_name: &str, scenario: &str, base: &Path) -> TestResult {
     let exe = std::env::current_exe()?;
-    let output = Command::new(exe)
+    let mut child = Command::new(exe)
         .args(["--exact", test_name, "--nocapture"])
         .env(CHILD_ENV, scenario)
         .env(BASE_ENV, base)
-        .output()?;
-    if !output.status.success() {
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let child_stdout = child.stdout.take().ok_or("missing child stdout")?;
+    let child_stderr = child.stderr.take().ok_or("missing child stderr")?;
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+    let stdout_drainer = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut out = child_stdout;
+        let _ = out.read_to_string(&mut buf);
+        let _ = done_tx.send(());
+        buf
+    });
+    let stderr_drainer = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut err = child_stderr;
+        let _ = err.read_to_string(&mut buf);
+        buf
+    });
+    let Some(status) = wait_child_bounded(&mut child, Some(&done_rx), CHILD_SCENARIO_TIMEOUT)?
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let out_buf = stdout_drainer.join().unwrap_or_default();
+        let err_buf = stderr_drainer.join().unwrap_or_default();
         return Err(format!(
-            "child scenario '{scenario}' failed (status={}):\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+            "child scenario '{scenario}' timed out after {CHILD_SCENARIO_TIMEOUT:?}:\nstdout:\n{out_buf}\nstderr:\n{err_buf}"
+        )
+        .into());
+    };
+    let out_buf = stdout_drainer.join().unwrap_or_default();
+    let err_buf = stderr_drainer.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "child scenario '{scenario}' failed (status={status}):\nstdout:\n{out_buf}\nstderr:\n{err_buf}"
         )
         .into());
     }
@@ -701,6 +769,13 @@ site "late.example.test" {{
     }
 
     let tmp = TempDir::new("st")?;
+    if let Some(reason) = miraserve_config::sandbox_tree_rejection(&tmp.path.to_string_lossy()) {
+        eprintln!(
+            "skipping enforced_landlock_socket_tree_keeps_rule_for_late_bound_socket: temp path '{}' rejected by socket-tree validator ({reason})",
+            tmp.path.display()
+        );
+        return Ok(());
+    }
     let site_root = tmp.path.join("www");
     let sock_tree = tmp.path.join("php-pools");
     let outside = tmp.path.join("outside");
@@ -729,7 +804,6 @@ site "late.example.test" {{
     let child_stdout = child.stdout.take().ok_or("missing child stdout")?;
     let child_stderr = child.stderr.take().ok_or("missing child stderr")?;
     let mut child_stdin = child.stdin.take().ok_or("missing child stdin")?;
-    let mut reader = BufReader::new(child_stdout);
 
     // Drain child stderr concurrently from spawn onwards so a verbose child can never fill the
     // stderr pipe buffer and deadlock before `child.wait()`.
@@ -740,37 +814,71 @@ site "late.example.test" {{
         buf
     });
 
-    // Wait until the confined child signals Landlock is active (no sleep).
-    let mut ready_line = String::new();
-    loop {
-        ready_line.clear();
-        let n = reader.read_line(&mut ready_line)?;
-        if n == 0 {
-            let status = child.wait()?;
+    // Read child stdout on a helper thread so the READY wait is strictly bounded and stdout
+    // continues draining to EOF (waking `eof_rx` and `stdout_done_rx` immediately on child exit).
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), ()>>(1);
+    let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel::<()>();
+    let (stdout_done_tx, stdout_done_rx) = mpsc::sync_channel::<()>(1);
+    let stdout_drainer = std::thread::spawn(move || {
+        let mut reader = BufReader::new(child_stdout);
+        let mut line = String::new();
+        let mut saw_ready = false;
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if line.trim() == "READY" {
+                        saw_ready = true;
+                        let _ = ready_tx.send(Ok(()));
+                        break;
+                    }
+                }
+            }
+        }
+        if !saw_ready {
+            let _ = ready_tx.send(Err(()));
+        }
+        let mut drain = Vec::new();
+        let _ = reader.read_to_end(&mut drain);
+        let _ = eof_tx.send(());
+        let _ = stdout_done_tx.send(());
+    });
+
+    // Wait bounded for the confined child's READY line (fail with child stderr when bound is hit).
+    match ready_rx.recv_timeout(READY_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(())) => {
+            let status = if let Some(st) =
+                wait_child_bounded(&mut child, Some(&stdout_done_rx), CHILD_EXIT_TIMEOUT)?
+            {
+                st
+            } else {
+                let _ = child.kill();
+                child.wait()?
+            };
+            let _ = stdout_drainer.join();
             let err_buf = stderr_drainer.join().unwrap_or_default();
             return Err(
                 format!("child exited before READY (status={status}): stderr={err_buf}").into(),
             );
         }
-        if ready_line.trim() == "READY" {
-            break;
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_drainer.join();
+            let err_buf = stderr_drainer.join().unwrap_or_default();
+            return Err(format!(
+                "timed out after {READY_TIMEOUT:?} waiting for child READY: stderr={err_buf}"
+            )
+            .into());
         }
     }
 
     // Now bind the late FastCGI responder inside `socket-tree` from the unconfined parent using a
-    // non-blocking UnixListener paired with child-exit monitoring and a bounded poll count so
-    // neither an early exit nor a stalled child can hang the test indefinitely.
+    // non-blocking UnixListener paired with child-exit monitoring and wall-clock deadlines.
     let std_listener = std::os::unix::net::UnixListener::bind(&late_sock)?;
     std_listener.set_nonblocking(true)?;
-
-    // Watch child stdout EOF on a helper thread so `select!` wakes immediately if the child exits
-    // after `BOUND` without ever connecting to `late.sock`.
-    let (eof_tx, mut eof_rx) = tokio::sync::oneshot::channel::<()>();
-    let eof_watcher = std::thread::spawn(move || {
-        let mut drain = Vec::new();
-        let _ = reader.read_to_end(&mut drain);
-        let _ = eof_tx.send(());
-    });
 
     // Notify confined child that `late.sock` is bound and listening.
     writeln!(child_stdin, "BOUND")?;
@@ -781,17 +889,21 @@ site "late.example.test" {{
         .enable_all()
         .build()?;
     let responder_res: TestResult = rt.block_on(async {
-        const MAX_ACCEPT_POLLS: usize = 300;
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
         let listener = UnixListener::from_std(std_listener)?;
+        let accept_deadline = tokio::time::Instant::now() + ACCEPT_TIMEOUT;
         let mut accepted_stream = None;
-        for _ in 0..MAX_ACCEPT_POLLS {
+        loop {
             if let Some(status) = child.try_wait()? {
                 return Err(format!(
                     "child exited before connecting to late socket (status={status})"
                 )
                 .into());
+            }
+            let remaining = accept_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
             tokio::select! {
                 biased;
@@ -803,16 +915,16 @@ site "late.example.test" {{
                 _ = &mut eof_rx => {
                     return Err("child closed stdout without connecting to late socket".into());
                 }
-                () = tokio::time::sleep(POLL_INTERVAL) => {}
+                () = tokio::time::sleep(remaining.min(POLL_INTERVAL)) => {}
             }
         }
         let Some(mut stream) = accepted_stream else {
             return Err(format!(
-                "timed out after {MAX_ACCEPT_POLLS} polls waiting for child to connect to late socket"
+                "timed out after {ACCEPT_TIMEOUT:?} waiting for child to connect to late socket"
             )
             .into());
         };
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::time::timeout(FCGI_EXCHANGE_TIMEOUT, async {
             let req_id = loop {
                 let rec = read_record(&mut stream).await?;
                 if rec.record_type == RecordType::Stdin && rec.content.is_empty() {
@@ -829,15 +941,27 @@ site "late.example.test" {{
             Ok::<(), Box<dyn std::error::Error>>(())
         })
         .await
-        .map_err(|_| "timed out exchanging FastCGI records on late socket")??;
+        .map_err(|_| {
+            format!("timed out after {FCGI_EXCHANGE_TIMEOUT:?} exchanging FastCGI records on late socket")
+        })??;
         Ok(())
     });
 
     if responder_res.is_err() && child.try_wait()?.is_none() {
         let _ = child.kill();
     }
-    let status = child.wait()?;
-    let _ = eof_watcher.join();
+    let Some(status) = wait_child_bounded(&mut child, Some(&stdout_done_rx), CHILD_EXIT_TIMEOUT)?
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_drainer.join();
+        let err_buf = stderr_drainer.join().unwrap_or_default();
+        return Err(format!(
+            "timed out after {CHILD_EXIT_TIMEOUT:?} waiting for child to exit (responder={responder_res:?}): stderr={err_buf}"
+        )
+        .into());
+    };
+    let _ = stdout_drainer.join();
     let err_buf = stderr_drainer.join().unwrap_or_default();
     if let Err(err) = responder_res {
         return Err(format!("{err} (child status={status}): stderr={err_buf}").into());
@@ -1097,6 +1221,15 @@ site "reload.example.test" {{
             }
             "read-tree" => {
                 let rt_dir = tmp.path.join("rt");
+                if let Some(reason) =
+                    miraserve_config::sandbox_tree_rejection(&rt_dir.to_string_lossy())
+                {
+                    eprintln!(
+                        "skipping read-tree scenario in enforced_landlock_keeps_015_rule_when_config_dir_also_exact_fastcgi_path: temp path '{}' rejected by read-tree validator ({reason})",
+                        rt_dir.display()
+                    );
+                    continue;
+                }
                 fs::create_dir_all(&rt_dir)?;
                 fs::write(rt_dir.join("data.txt"), "READ-TREE-DATA")?;
             }

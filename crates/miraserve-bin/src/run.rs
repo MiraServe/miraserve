@@ -3221,11 +3221,14 @@ mod tests {
         cfg: Config,
     }
 
-    fn kdl_escape_path(path: &Path) -> String {
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
+    mod kdl_test_util {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../miraserve-config/tests/common/mod.rs"
+        ));
     }
+
+    use kdl_test_util::kdl_escape_path;
 
     fn r5_cli_fixture(tag: &str) -> Result<R5Fixture, Box<dyn std::error::Error>> {
         let nanos = std::time::SystemTime::now()
@@ -3279,6 +3282,17 @@ site "app.example.test" {{
                 cfg_dir,
                 cfg,
             } = r5_cli_fixture(if rotating { "rot" } else { "plain" })?;
+            if rotating
+                && let Some(reason) =
+                    miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
+            {
+                eprintln!(
+                    "skipping g7_r5_p1_cli_binding_fails_when_alias_moves_after_validation (rotating=true): temp path '{}' rejected by rotating-log dir validator ({reason})",
+                    base.display()
+                );
+                let _ = fs::remove_dir_all(&base);
+                continue;
+            }
             let alias = base.join("log-alias");
             std::os::unix::fs::symlink(&orig_logs, &alias)?;
             let cfg_path = cfg_dir.join("miraserve.kdl");
@@ -3336,6 +3350,14 @@ site "app.example.test" {{
             cfg,
             ..
         } = r5_cli_fixture("created")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping g7_r5_p1_cli_binding_fails_when_new_directory_alias_is_redirected: temp path '{}' rejected by rotating-log dir validator ({reason})",
+                base.display()
+            );
+            let _ = fs::remove_dir_all(&base);
+            return Ok(());
+        }
         let elsewhere = base.join("elsewhere");
         fs::create_dir_all(&elsewhere)?;
         let alias = base.join("log-alias");

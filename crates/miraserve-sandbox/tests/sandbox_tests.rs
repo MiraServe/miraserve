@@ -13,14 +13,17 @@ use miraserve_sandbox::{
     SandboxError, SandboxPolicy, apply_sandbox, blocked_syscalls_for_mode, verify_privilege_state,
 };
 
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 /// Formats a filesystem path for interpolation inside a KDL double-quoted string: strips any
-/// Windows `\\?\` verbatim prefix and escapes backslashes so Windows paths parse as KDL strings.
+/// Windows `\\?\` verbatim prefix and escapes via the shared KDL test helper.
 fn kdl_path(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
-    stripped.replace('\\', "\\\\")
+    kdl_test_util::kdl_escape_str(stripped)
 }
 
 #[allow(clippy::too_many_lines)]

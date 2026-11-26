@@ -4,6 +4,11 @@ use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+
+use kdl_test_util::kdl_escape_path;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn miraserve_bin() -> &'static str {
@@ -9428,8 +9433,8 @@ site "php-denied.example" {{
     }}
 }}
 "#,
-            www_dir.display(),
-            bad_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&bad_sock)
         ),
     )?;
 
@@ -9448,8 +9453,8 @@ site "php-ro.example" {{
     }}
 }}
 "#,
-            www_dir.display(),
-            ro_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&ro_sock)
         ),
     )?;
 
@@ -9477,10 +9482,10 @@ site "php-clean.example" {{
     }}
 }}
 "#,
-            www_dir.display(),
-            ok_sock.display(),
-            absent_sock.display(),
-            regular_file.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&ok_sock),
+            kdl_escape_path(&absent_sock),
+            kdl_escape_path(&regular_file)
         ),
     )?;
 
@@ -9505,9 +9510,9 @@ site "php-no-existing.example" {{
     }}
 }}
 "#,
-            www_dir.display(),
-            absent_sock.display(),
-            regular_file.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&absent_sock),
+            kdl_escape_path(&regular_file)
         ),
     )?;
 
@@ -9532,10 +9537,10 @@ site "php-b.example" {{
     }}
 }}
 "#,
-            www_dir.display(),
-            ok_sock.display(),
-            www_dir.display(),
-            bad_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&ok_sock),
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&bad_sock)
         ),
     )?;
 
@@ -9766,8 +9771,8 @@ site "php-unreachable.example" {{
     }}
 }}
 "#,
-                www_dir.display(),
-                hidden_sock.display()
+                kdl_escape_path(&www_dir),
+                kdl_escape_path(&hidden_sock)
             ),
         )?;
         let unreach_strict = Command::new(miraserve_bin())
@@ -9996,10 +10001,10 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
             "server {{ listen \":443\" }}\n\
              site \"ok-a.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n\
              site \"ok-b.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
-            www_dir.display(),
-            ok_sock.display(),
-            www_dir.display(),
-            second_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&ok_sock),
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&second_sock)
         ),
     )?;
     let bad_cfg = conf_dir.join("bad.kdl");
@@ -10008,8 +10013,8 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
         format!(
             "server {{ listen \":443\" }}\n\
              site \"bad.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
-            www_dir.display(),
-            bad_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&bad_sock)
         ),
     )?;
     let fail_cfg = conf_dir.join("fail.kdl");
@@ -10018,8 +10023,8 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
         format!(
             "server {{ listen \":443\"; sandbox {{ seccomp \"off\" }} }}\n\
              site \"fail.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
-            www_dir.display(),
-            ok_sock.display()
+            kdl_escape_path(&www_dir),
+            kdl_escape_path(&ok_sock)
         ),
     )?;
 
@@ -11035,9 +11040,9 @@ site "second.example.test" {{
     }}
 }}
 "#,
-            www = www_dir.display(),
-            sock0 = sock0.display(),
-            sock1 = sock1.display(),
+            www = kdl_escape_path(&www_dir),
+            sock0 = kdl_escape_path(&sock0),
+            sock1 = kdl_escape_path(&sock1),
         ),
     )?;
 

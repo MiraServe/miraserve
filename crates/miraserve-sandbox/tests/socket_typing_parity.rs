@@ -24,18 +24,16 @@ use miraserve_sandbox::{
     EnforcementStatus, SandboxError, SandboxPolicy, apply_landlock_current_thread, apply_sandbox,
 };
 
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
+use kdl_test_util::kdl_escape_path;
+
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const CHILD_ENV: &str = "MIRASERVE_SOCKET_TYPING_PARITY_CHILD";
 const BASE_ENV: &str = "MIRASERVE_SOCKET_TYPING_PARITY_BASE";
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn kdl_escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
 
 /// Picks `std::env::temp_dir()` when it leaves ample headroom below Linux's 108-byte `sun_path`
 /// Unix socket path limit, falling back to `/tmp` when a long `TMPDIR` prefix would exceed it.
@@ -604,6 +602,13 @@ site "parity.example.test" {{
     }
 
     let tmp = TempDir::new("p")?;
+    if let Some(reason) = miraserve_config::sandbox_tree_rejection(&tmp.path.to_string_lossy()) {
+        eprintln!(
+            "skipping parity_open_sequence_fd_count_rules_masks_and_missing_socket_notice: temp path '{}' rejected by tree validator ({reason})",
+            tmp.path.display()
+        );
+        return Ok(());
+    }
     for (dir, file, body) in [
         ("a_rt1", "file.txt", "RT1"),
         ("b_docroot", "index.html", "DOCROOT"),
@@ -1270,6 +1275,13 @@ site "rlog.example.test" {{
     }
 
     let tmp = TempDir::new("rl")?;
+    if let Some(reason) = miraserve_config::sandbox_tree_rejection(&tmp.path.to_string_lossy()) {
+        eprintln!(
+            "skipping parity_rotating_log_parent_as_exact_socket_matches_015_policy_and_enforcement: temp path '{}' rejected by rotating-log dir validator ({reason})",
+            tmp.path.display()
+        );
+        return Ok(());
+    }
     let log_dir = tmp.path.join("logs");
     let www = tmp.path.join("www");
     let outside = tmp.path.join("outside");

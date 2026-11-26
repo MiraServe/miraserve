@@ -1,7 +1,7 @@
 //! Oracle and regression tests for `try-files ... fallback-unless-extension=#true` (0.1.6 Item 3).
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,13 +16,12 @@ use miraserve_tls::AcmeChallengeStore;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 
-type TestResult = Result<(), Box<dyn std::error::Error>>;
+#[path = "../../miraserve-config/tests/common/mod.rs"]
+mod kdl_test_util;
 
-fn kdl_escape_path(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
+use kdl_test_util::kdl_escape_path;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn host_allows_file_cache_admission() -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]

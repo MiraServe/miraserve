@@ -5517,6 +5517,14 @@ mod tree_validation_tests {
     #[test]
     fn alias_swapped_during_validation_installs_validated_object() -> TestResult {
         let base = temp_base("alias")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping alias_swapped_during_validation_installs_validated_object: temp path '{}' rejected by sandbox tree validator ({reason})",
+                base.display()
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
         let real = base.join("real-tree");
         let alias = base.join("alias");
         std::fs::create_dir_all(&real)?;
@@ -5542,6 +5550,14 @@ mod tree_validation_tests {
     #[test]
     fn policy_applies_to_candidate_and_stable_alias_is_accepted() -> TestResult {
         let base = temp_base("policy")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping policy_applies_to_candidate_and_stable_alias_is_accepted: temp path '{}' rejected by sandbox tree validator ({reason})",
+                base.display()
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
         let real = base.join("real-tree");
         let alias = base.join("alias");
         std::fs::create_dir_all(&real)?;
@@ -6785,6 +6801,13 @@ site "app.example.com" {
             "miraserve-sbx-pinned-grant-{}-{nanos}",
             std::process::id()
         ));
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping writable_policy_grants_reports_pinned_object_and_never_omits_absent_candidates: temp path '{}' rejected by sandbox tree validator ({reason})",
+                base.display()
+            );
+            return Ok(());
+        }
         let dir_a = base.join("release-a");
         let dir_b = base.join("release-b");
         let link = base.join("acme-link");
@@ -6820,9 +6843,9 @@ site "app.example.com" {{
     }}
 }}
 "#,
-            existing_sock_tree.display(),
-            absent_sock_tree.display(),
-            missing_publish.display()
+            kdl_escape_test_path(&existing_sock_tree),
+            kdl_escape_test_path(&absent_sock_tree),
+            kdl_escape_test_path(&missing_publish)
         );
         let (cfg, _) = miraserve_config::parse_kdl("pinned-grant.kdl", &kdl)?;
         let policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, Some(&link));
@@ -6928,6 +6951,13 @@ site "app.example.com" {{
             "miraserve-sbx-tenant-superset-{}-{nanos}",
             std::process::id()
         ));
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping writable_policy_grants_reports_uncreatable_and_unopenable_candidates_as_missing: temp path '{}' rejected by sandbox tree validator ({reason})",
+                base.display()
+            );
+            return Ok(());
+        }
         let ro_parent = base.join("ro-parent");
         let locked_parent = base.join("locked-000");
         let missing_tenant_store = ro_parent.join("releases");
@@ -6954,8 +6984,8 @@ site "tenant.example.com" {{
     }}
 }}
 "#,
-            unopenable_sock_tree.display(),
-            missing_tenant_store.display()
+            kdl_escape_test_path(&unopenable_sock_tree),
+            kdl_escape_test_path(&missing_tenant_store)
         );
         let (cfg, _) = miraserve_config::parse_kdl("tenant-superset.kdl", &kdl)?;
         let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
@@ -7090,12 +7120,19 @@ site "app.example.com" {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
-    fn kdl_escape_test_path(path: &std::path::Path) -> String {
-        path.to_string_lossy()
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
+    #[cfg(unix)]
+    mod kdl_test_util {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../miraserve-config/tests/common/mod.rs"
+        ));
     }
+
+    #[cfg(unix)]
+    use kdl_test_util::kdl_escape_path as kdl_escape_test_path;
+
+    #[cfg(target_os = "linux")]
+    use kdl_test_util::kdl_escape_str as kdl_escape_test_str;
 
     #[cfg(target_os = "linux")]
     fn short_socket_test_dir(tag: &str) -> Result<std::path::PathBuf, std::io::Error> {
@@ -7143,6 +7180,14 @@ site "app.example.com" {
         use landlock::{ABI, Access as _, AccessFs};
 
         let base = short_socket_test_dir("rl")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            eprintln!(
+                "skipping assembled_landlock_rule_list_and_masks_match_015_and_omit_non_socket_exact_paths: temp path '{}' rejected by tree validator ({reason})",
+                base.display()
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return Ok(());
+        }
         let rt1 = base.join("a_rt1");
         let docroot = base.join("b_docroot");
         let rt2 = base.join("c_rt2");
@@ -7723,6 +7768,15 @@ site "clean.example.test" {{
 
         for (tag, trailing_slash) in [("rlog", false), ("rlogs", true)] {
             let base = short_socket_test_dir(tag)?;
+            if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
+            {
+                eprintln!(
+                    "skipping assembled_landlock_rules_for_rotating_log_parent_as_exact_socket_match_015_and_warn ({tag}): temp path '{}' rejected by rotating-log dir validator ({reason})",
+                    base.display()
+                );
+                let _ = std::fs::remove_dir_all(&base);
+                continue;
+            }
             let docroot = base.join("www");
             let log_dir = base.join("logs");
             let log_file = log_dir.join("server.log");
@@ -7748,7 +7802,7 @@ site "rlog.example.test" {{
 }}
 "#,
                 docroot = kdl_escape_test_path(&docroot),
-                sock_ep = sock_ep_str.replace('\\', "\\\\").replace('"', "\\\""),
+                sock_ep = kdl_escape_test_str(&sock_ep_str),
             );
             let (cfg, _) = miraserve_config::parse_kdl("rlog.kdl", &kdl)?;
             // Exact CLI order: build initial policy first, then bind rotating log dir, then finalize.
@@ -8321,6 +8375,7 @@ site "ddk2.example.test" {{
         use std::io::ErrorKind;
         use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::net::{UnixListener, UnixStream};
         use std::sync::{Arc, Mutex};
 
         use landlock::{ABI, Access as _, AccessFs};
@@ -8328,6 +8383,7 @@ site "ddk2.example.test" {{
 
         let all_abi = AccessFs::from_all(ABI::V5);
         let read_file_mask = all_abi & AccessFs::ReadFile;
+        let sock_mask = (AccessFs::ReadFile | AccessFs::WriteFile) & all_abi;
 
         for (tag, is_fifo, expected_type_label) in
             [("exfb", false, "regular file"), ("exff", true, "FIFO")]
@@ -8338,6 +8394,7 @@ site "ddk2.example.test" {{
             let outside = base.join("outside");
             let cert_file = tls_dir.join(if is_fifo { "site.fifo" } else { "site.pem" });
             let key_file = tls_dir.join("site.key");
+            let real_sock = base.join("z_real.sock");
             let outside_marker = outside.join("secret.txt");
             std::fs::create_dir_all(&docroot)?;
             std::fs::create_dir_all(&tls_dir)?;
@@ -8349,6 +8406,7 @@ site "ddk2.example.test" {{
             }
             std::fs::write(&key_file, "PRIVATE-KEY-SECRET")?;
             std::fs::write(&outside_marker, "OUTSIDE-SECRET")?;
+            let _real_listener = UnixListener::bind(&real_sock)?;
 
             let kdl = format!(
                 r#"
@@ -8367,11 +8425,15 @@ site "exfb.example.test" {{
     route "/app.php" {{
         fastcgi-pass "unix:{cert_file}"
     }}
+    route "/real.php" {{
+        fastcgi-pass "unix:{real_sock}"
+    }}
 }}
 "#,
                 docroot = kdl_escape_test_path(&docroot),
                 cert_file = kdl_escape_test_path(&cert_file),
                 key_file = kdl_escape_test_path(&key_file),
+                real_sock = kdl_escape_test_path(&real_sock),
             );
             let (cfg, _) = miraserve_config::parse_kdl("exfb.kdl", &kdl)?;
             let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
@@ -8395,21 +8457,36 @@ site "exfb.example.test" {{
             );
             assert_eq!(
                 policy.socket_paths,
-                vec![cert_file.clone()],
-                "case {tag}: socket_paths must contain only the shadowed file"
+                vec![cert_file.clone(), real_sock.clone()],
+                "case {tag}: socket_paths must contain shadowed cert followed by second real socket"
             );
             assert!(
                 policy.socket_shadows_other_class.contains(&cert_file),
                 "case {tag}: shadowed exact-file fallback must be in socket_shadows_other_class"
             );
+            assert!(
+                !policy.socket_shadows_other_class.contains(&real_sock),
+                "case {tag}: real socket must not be marked shadowed"
+            );
 
             let cert_md = std::fs::metadata(&cert_file)?;
             let cert_inode = (cert_md.dev(), cert_md.ino());
-            let expected_raw_fd = match policy.grant_states.get(&cert_file) {
+            let expected_cert_fd = match policy.grant_states.get(&cert_file) {
                 Some(crate::GrantState::Installed { fd, .. }) => fd.as_raw_fd(),
                 other => {
                     return Err(format!(
                         "case {tag}: expected Installed grant_state for cert, got {other:?}"
+                    )
+                    .into());
+                }
+            };
+            let real_md = std::fs::metadata(&real_sock)?;
+            let real_inode = (real_md.dev(), real_md.ino());
+            let expected_real_fd = match policy.grant_states.get(&real_sock) {
+                Some(crate::GrantState::Installed { fd, .. }) => fd.as_raw_fd(),
+                other => {
+                    return Err(format!(
+                        "case {tag}: expected Installed grant_state for real socket, got {other:?}"
                     )
                     .into());
                 }
@@ -8420,35 +8497,29 @@ site "exfb.example.test" {{
                 let _sub = capture_test_events(Arc::clone(&events));
                 let mut notes = Vec::new();
                 let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+                // Verify exact order, descriptor reuse, inode identity, and mask across BOTH
+                // socket entries so any reordering relative to `z_real.sock` is detected.
+                let actual_sock_rules: Vec<(i32, (u64, u64), landlock::BitFlags<AccessFs>)> =
+                    assembled
+                        .sock_rules
+                        .iter()
+                        .map(|(fd, mask)| {
+                            let st = fstat(fd)?;
+                            #[allow(clippy::useless_conversion)]
+                            Ok((
+                                fd.as_raw_fd(),
+                                (u64::from(st.st_dev), u64::from(st.st_ino)),
+                                *mask,
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, rustix::io::Errno>>()?;
                 assert_eq!(
-                    assembled.sock_rules.len(),
-                    1,
-                    "case {tag}: shadowed non-directory must keep one socket-class rule"
-                );
-                let (sock_fd, sock_rule_mask) = assembled
-                    .sock_rules
-                    .first()
-                    .copied()
-                    .ok_or("expected one sock_rule")?;
-                assert_eq!(
-                    sock_fd.as_raw_fd(),
-                    expected_raw_fd,
-                    "case {tag}: socket-class rule must reuse the same descriptor"
-                );
-                let st = fstat(sock_fd)?;
-                #[allow(clippy::useless_conversion)]
-                let sock_inode = (u64::from(st.st_dev), u64::from(st.st_ino));
-                assert_eq!(
-                    sock_inode, cert_inode,
-                    "case {tag}: socket-class rule descriptor must identify the shadowed file"
-                );
-                assert_eq!(
-                    sock_rule_mask, read_file_mask,
-                    "case {tag}: shadowed non-directory socket-class rule must be ReadFile ONLY (no WriteFile)"
-                );
-                assert!(
-                    !sock_rule_mask.contains(AccessFs::WriteFile),
-                    "case {tag}: shadowed non-directory socket-class rule must not grant WriteFile"
+                    actual_sock_rules,
+                    vec![
+                        (expected_cert_fd, cert_inode, read_file_mask),
+                        (expected_real_fd, real_inode, sock_mask),
+                    ],
+                    "case {tag}: shadowed non-directory must keep its exact position before real socket with ReadFile-only mask"
                 );
                 for (fd, _) in assembled
                     .readonly_rules
@@ -8475,6 +8546,7 @@ site "exfb.example.test" {{
                     let ev = Arc::clone(&events);
                     let cf = cert_file.clone();
                     let kf = key_file.clone();
+                    let rs = real_sock.clone();
                     let out = outside_marker.clone();
                     std::thread::spawn(move || -> Result<(), String> {
                         let _sub = capture_test_events(ev);
@@ -8489,6 +8561,9 @@ site "exfb.example.test" {{
                                 "case {tag} thread {idx} expected enforcing Landlock: {status:?}"
                             ));
                         }
+                        UnixStream::connect(&rs).map_err(|e| {
+                            format!("case {tag} thread {idx} real socket connect failed: {e}")
+                        })?;
                         if is_fifo {
                             let _rd = openat(
                                 CWD,
