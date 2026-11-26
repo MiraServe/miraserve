@@ -10016,7 +10016,7 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
     let arch = TargetArch::try_from(std::env::consts::ARCH)?;
     let sys_faccessat: i64 = match arch {
         TargetArch::x86_64 => 269,
-        TargetArch::aarch64 => 48,
+        TargetArch::aarch64 | TargetArch::riscv64 => 48,
     };
 
     let compile_filter =
@@ -10045,13 +10045,13 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
     std::fs::create_dir_all(&www_dir)?;
 
     let ok_sock = base.join("ok.sock");
-    let ok2_sock = base.join("ok2.sock");
+    let second_sock = base.join("ok2.sock");
     let bad_sock = base.join("bad.sock");
     let _l1 = UnixListener::bind(&ok_sock)?;
-    let _l2 = UnixListener::bind(&ok2_sock)?;
+    let _l2 = UnixListener::bind(&second_sock)?;
     let _l3 = UnixListener::bind(&bad_sock)?;
     std::fs::set_permissions(&ok_sock, std::fs::Permissions::from_mode(0o660))?;
-    std::fs::set_permissions(&ok2_sock, std::fs::Permissions::from_mode(0o660))?;
+    std::fs::set_permissions(&second_sock, std::fs::Permissions::from_mode(0o660))?;
     std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o000))?;
 
     let ok_cfg = conf_dir.join("ok.kdl");
@@ -10064,7 +10064,7 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
             www_dir.display(),
             ok_sock.display(),
             www_dir.display(),
-            ok2_sock.display()
+            second_sock.display()
         ),
     )?;
     let bad_cfg = conf_dir.join("bad.kdl");
