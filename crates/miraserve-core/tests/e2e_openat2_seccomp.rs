@@ -846,3 +846,200 @@ async fn e2e_openat2_kill_filter_allows_h1_and_h2_proxy_only_without_probing() -
 
     Ok(())
 }
+
+const LEVEL_CHILD_MODE_ENV: &str = "MIRASERVE_E2E_OPENAT2_LEVEL_CHILD";
+
+struct MessageVisitor {
+    message: String,
+}
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            value.clone_into(&mut self.message);
+        }
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        }
+    }
+}
+
+struct CapturingSubscriber {
+    events: Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+}
+
+impl tracing::Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor {
+            message: String::new(),
+        };
+        event.record(&mut visitor);
+        if let Ok(mut guard) = self.events.lock() {
+            guard.push((*event.metadata().level(), visitor.message));
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+}
+
+async fn run_openat2_level_child(mode: &str) -> TestResult {
+    let _kernel_guard = miraserve_sandbox::test_advisory_kernel_in_range_override_guard(Some(true));
+    let events = Arc::new(std::sync::Mutex::new(Vec::<(tracing::Level, String)>::new()));
+    let _ = tracing::subscriber::set_global_default(CapturingSubscriber {
+        events: Arc::clone(&events),
+    });
+
+    let tmp_path = make_temp_dir(&format!("level-{mode}"))?;
+    let www = tmp_path.join("www");
+    fs::create_dir_all(&www)?;
+    fs::write(www.join("index.html"), b"ok")?;
+    let tls_port = reserve_free_port()?;
+
+    let (kdl, expected_level) = match mode {
+        "default_h2_static" => (
+            format!(
+                "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
+                 site \"level.openat2.test\" {{\n    root \"{}\"\n}}\n",
+                www.display()
+            ),
+            tracing::Level::INFO,
+        ),
+        "file_cache_zero_budget" => (
+            format!(
+                "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    limits {{ file-cache-bytes \"0\" }}\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
+                 site \"level.openat2.test\" {{\n    root \"{}\"\n    file-cache \"5s\"\n}}\n",
+                www.display()
+            ),
+            tracing::Level::INFO,
+        ),
+        "file_cache_enabled" => (
+            format!(
+                "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
+                 site \"level.openat2.test\" {{\n    root \"{}\"\n    file-cache \"5s\"\n}}\n",
+                www.display()
+            ),
+            tracing::Level::WARN,
+        ),
+        "workers_non_shared" => (
+            format!(
+                "server {{\n    listen \"127.0.0.1:{tls_port}\"\n    workers 1\n    sandbox {{ landlock #false; seccomp \"strict\" }}\n}}\n\
+                 site \"level.openat2.test\" {{\n    root \"{}\"\n}}\n",
+                www.display()
+            ),
+            tracing::Level::WARN,
+        ),
+        other => return Err(format!("unknown level child mode: {other}").into()),
+    };
+
+    let (cfg, _) = parse_kdl("openat2-level.kdl", &kdl)?;
+    let server = MiraServeServer::start(
+        Arc::new(ConfigStore::new(cfg.clone())),
+        ServerOptions {
+            dev_tls: true,
+            apply_sandbox: true,
+            ..ServerOptions::default()
+        },
+    )
+    .await?;
+    let expected_text = miraserve_core::openat2_refused_advisory_for_runtime_with_static_work(
+        &cfg,
+        server.sandbox_report(),
+        Some(true),
+        true,
+    )
+    .ok_or("expected openat2 refusal advisory text")?;
+
+    let captured = events.lock().map_err(|_| "events mutex poisoned")?.clone();
+    let openat2_events: Vec<&(tracing::Level, String)> = captured
+        .iter()
+        .filter(|(_, msg)| msg.contains("openat2 is refused in this process"))
+        .collect();
+    assert_eq!(
+        openat2_events.len(),
+        1,
+        "mode={mode}: expected exactly one openat2 refusal event, got: {openat2_events:?}"
+    );
+    let (actual_level, actual_msg) = openat2_events
+        .first()
+        .copied()
+        .ok_or("missing openat2 event")?;
+    assert_eq!(
+        *actual_level, expected_level,
+        "mode={mode}: expected level {expected_level}, got {actual_level} for message: {actual_msg}"
+    );
+    assert_eq!(
+        actual_msg, &expected_text,
+        "mode={mode}: message text must stay identical"
+    );
+    assert!(
+        captured.iter().any(|(lvl, msg)| {
+            *lvl == tracing::Level::INFO && msg.contains("HTTP/2 stream execution mode selected")
+        }),
+        "mode={mode}: expected HTTP/2 execution-mode INFO line, got: {captured:?}"
+    );
+
+    server.shutdown().await;
+    let _ = fs::remove_dir_all(&tmp_path);
+    Ok(())
+}
+
+/// Oracle for 0.1.6 Item 1: under an `ENOSYS` `openat2` filter (default systemd unit with
+/// `RestrictSUIDSGID=yes`), startup logs `"openat2 is refused in this process"` at `INFO` unless
+/// the loaded config asks for `file-cache` (with non-zero budget) or non-`"shared"` `workers`, in
+/// which case the identical text is logged at `WARN`. The HTTP/2 execution-mode `INFO` line stays.
+#[tokio::test(flavor = "current_thread")]
+async fn e2e_openat2_refusal_startup_log_level_info_unless_degraded() -> TestResult {
+    if let Ok(mode) = std::env::var(LEVEL_CHILD_MODE_ENV) {
+        return run_openat2_level_child(&mode).await;
+    }
+
+    let exe = std::env::current_exe()?;
+    let test_name = "e2e_openat2_refusal_startup_log_level_info_unless_degraded";
+    for mode in [
+        "default_h2_static",
+        "file_cache_zero_budget",
+        "file_cache_enabled",
+        "workers_non_shared",
+    ] {
+        let exe_c = exe.clone();
+        let out = std::thread::spawn(move || -> Result<std::process::Output, String> {
+            let bpf = compile_systemd_enosys_openat2_filter().map_err(|e| e.to_string())?;
+            seccompiler::apply_filter(&bpf).map_err(|e| e.to_string())?;
+            Command::new(&exe_c)
+                .args(["--exact", test_name, "--nocapture"])
+                .env(LEVEL_CHILD_MODE_ENV, mode)
+                .output()
+                .map_err(|e| e.to_string())
+        })
+        .join()
+        .map_err(|_| "openat2-level helper thread panicked")?
+        .map_err(|msg| -> Box<dyn std::error::Error> { msg.into() })?;
+
+        assert!(
+            out.status.success(),
+            "openat2 level child ({mode}) failed (status={:?}):\nstdout:\n{}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    }
+
+    Ok(())
+}

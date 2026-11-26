@@ -39,16 +39,17 @@ pub use miraserve_http::{
     users_file_alias_problem, with_nonblocking_inline_context,
 };
 pub use miraserve_sandbox::{
-    LANDLOCK_TARGET_ABI_VERSION, LandlockEnforcement, LogDirBinding, PinnedLogDir,
-    PinnedWritableDir, SandboxPolicy, WritableGrant, apply_landlock_current_thread,
+    LANDLOCK_TARGET_ABI_VERSION, LandlockEnforcement, LogDirBinding, Openat2AdvisoryLevel,
+    PinnedLogDir, PinnedWritableDir, SandboxPolicy, WritableGrant, apply_landlock_current_thread,
     apply_seccomp_current_thread, bind_log_file_dir, check_docroot_classification_resources,
     classify_landlock_enforcement, config_has_static_work, detect_seccomp_filter_active,
     find_docroot_acme_overlaps, find_docroot_log_overlaps, find_docroot_pinned_log_overlaps,
     find_unsafe_docroots, find_unsafe_docroots_with_secret_files,
     is_quarantined_publish_storage_candidate, is_quarantined_socket_candidate,
-    is_resource_io_error, log_path_platform_rejection, openat2_refused_advisory,
-    openat2_refused_advisory_for_runtime, openat2_refused_advisory_for_runtime_with_static_work,
-    probe_landlock_enforcement, probe_openat2_refused, setid_filtered_syscalls_for_mode,
+    is_resource_io_error, log_path_platform_rejection, openat2_refusal_advisory_level,
+    openat2_refused_advisory, openat2_refused_advisory_for_runtime,
+    openat2_refused_advisory_for_runtime_with_static_work, probe_landlock_enforcement,
+    probe_openat2_refused, setid_filtered_syscalls_for_mode,
     validate_writable_candidates_for_inspection, warm_kernel_release,
 };
 use miraserve_sandbox::{SandboxError, SandboxReport, apply_sandbox};
@@ -1131,7 +1132,7 @@ impl MiraServeServer {
             had_outer_seccomp,
             engine.has_static_work(),
         ) {
-            warn!("{advisory}");
+            emit_openat2_refused_advisory(&initial_config, &advisory);
         }
 
         // Phase C: Spawn globally and per-IP connection-bounded accept loops and background supervisors.
@@ -5671,5 +5672,94 @@ mod redirect_lease_tests {
         assert_eq!(conn_sem.available_permits(), 1);
         assert_eq!(tracker.current(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn emit_openat2_refused_advisory_selects_info_vs_warn_with_identical_text()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::Mutex;
+
+        struct MsgVisitor(String);
+        impl tracing::field::Visit for MsgVisitor {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                if field.name() == "message" {
+                    self.0 = value.to_owned();
+                }
+            }
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut v = MsgVisitor(String::new());
+                event.record(&mut v);
+                if let Ok(mut g) = self.0.lock() {
+                    g.push((*event.metadata().level(), v.0));
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let tls = r#"tls { cert "/etc/miraserve/c.pem"; key "/etc/miraserve/k.pem" }"#;
+        let (default_cfg, _) = miraserve_config::parse_kdl(
+            "default.kdl",
+            &format!(
+                "server {{ listen \":443\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+            ),
+        )?;
+        let (fc_cfg, _) = miraserve_config::parse_kdl(
+            "fc.kdl",
+            &format!(
+                "server {{ listen \":443\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\"; file-cache \"2s\" }}"
+            ),
+        )?;
+        let (workers_cfg, _) = miraserve_config::parse_kdl(
+            "wk.kdl",
+            &format!(
+                "server {{ listen \":443\"; workers 2; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+            ),
+        )?;
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let msg = "openat2 is refused in this process (synthetic test)";
+        tracing::subscriber::with_default(Capture(Arc::clone(&captured)), || {
+            super::emit_openat2_refused_advisory(&default_cfg, msg);
+            super::emit_openat2_refused_advisory(&fc_cfg, msg);
+            super::emit_openat2_refused_advisory(&workers_cfg, msg);
+        });
+
+        let events = captured.lock().map_err(|_| "mutex poisoned")?.clone();
+        assert_eq!(
+            events,
+            vec![
+                (tracing::Level::INFO, msg.to_owned()),
+                (tracing::Level::WARN, msg.to_owned()),
+                (tracing::Level::WARN, msg.to_owned()),
+            ]
+        );
+        Ok(())
+    }
+}
+
+/// Logs a runtime `openat2(2)` refusal advisory at `WARN` when the loaded configuration asks for
+/// a feature degraded by the refusal (`file-cache` with a non-zero budget or non-`"shared"`
+/// `workers`), and at `INFO` otherwise (same message text).
+fn emit_openat2_refused_advisory(config: &Config, advisory: &str) {
+    match openat2_refusal_advisory_level(config) {
+        Openat2AdvisoryLevel::Warn => warn!("{advisory}"),
+        Openat2AdvisoryLevel::Info => info!("{advisory}"),
     }
 }

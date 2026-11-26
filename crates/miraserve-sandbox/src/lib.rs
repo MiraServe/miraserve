@@ -4063,6 +4063,35 @@ fn config_needs_openat2(
     uses_file_cache || uses_workers || uses_h2_intask
 }
 
+/// Severity for a runtime `openat2(2)` refusal startup advisory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Openat2AdvisoryLevel {
+    /// No explicitly requested feature (`file-cache` with a non-zero budget, or non-`"shared"`
+    /// `workers`) is degraded; only the opportunistic Linux 5.12–6.11 in-task HTTP/2 mode falls
+    /// back to spawned streams.
+    Info,
+    /// An explicitly requested feature (`file-cache` with a non-zero budget, or non-`"shared"`
+    /// `workers`) is degraded by the `openat2(2)` refusal.
+    Warn,
+}
+
+/// Returns the runtime startup log level for an `openat2(2)` refusal advisory on `config`:
+/// [`Openat2AdvisoryLevel::Warn`] when the loaded configuration asks for a feature degraded by
+/// the refusal (any site with `file-cache` other than `"off"` while `server.limits.file-cache-bytes`
+/// is non-zero, or `server.workers` other than `"shared"`), and [`Openat2AdvisoryLevel::Info`]
+/// otherwise.
+#[must_use]
+pub fn openat2_refusal_advisory_level(config: &Config) -> Openat2AdvisoryLevel {
+    let uses_file_cache = config.server.limits.file_cache_bytes.as_bytes() > 0
+        && config.sites.iter().any(|s| s.file_cache.is_some());
+    let uses_workers = config.server.workers != Workers::Shared;
+    if uses_file_cache || uses_workers {
+        Openat2AdvisoryLevel::Warn
+    } else {
+        Openat2AdvisoryLevel::Info
+    }
+}
+
 #[cfg(test)]
 fn format_resolve_cached_unsupported_advisory(
     config: &Config,
@@ -5957,6 +5986,75 @@ site "tenant-static.test" {
             config_needs_openat2(&fc_cfg, true, false),
             "file-cache advisory condition must remain independent of H2 static work"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn openat2_refusal_advisory_level_warns_only_when_configured_feature_degraded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{Openat2AdvisoryLevel, openat2_refusal_advisory_level};
+
+        let tls = r#"tls { cert "/etc/miraserve/c.pem"; key "/etc/miraserve/k.pem" }"#;
+        let cases = [
+            (
+                "default H2 static",
+                format!(
+                    "server {{ listen \":443\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+                ),
+                Openat2AdvisoryLevel::Info,
+            ),
+            (
+                "explicit file-cache off",
+                format!(
+                    "server {{ listen \":443\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\"; file-cache \"off\" }}"
+                ),
+                Openat2AdvisoryLevel::Info,
+            ),
+            (
+                "file-cache with zero global budget",
+                format!(
+                    "server {{ listen \":443\"; {tls}; limits {{ file-cache-bytes \"0\" }} }}\nsite \"a.test\" {{ root \"/var/www/a\"; file-cache \"5s\" }}"
+                ),
+                Openat2AdvisoryLevel::Info,
+            ),
+            (
+                "explicit shared workers",
+                format!(
+                    "server {{ listen \":443\"; workers \"shared\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+                ),
+                Openat2AdvisoryLevel::Info,
+            ),
+            (
+                "file-cache enabled",
+                format!(
+                    "server {{ listen \":443\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\"; file-cache \"5s\" }}"
+                ),
+                Openat2AdvisoryLevel::Warn,
+            ),
+            (
+                "workers count",
+                format!(
+                    "server {{ listen \":443\"; workers 2; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+                ),
+                Openat2AdvisoryLevel::Warn,
+            ),
+            (
+                "workers auto",
+                format!(
+                    "server {{ listen \":443\"; workers \"auto\"; {tls} }}\nsite \"a.test\" {{ root \"/var/www/a\" }}"
+                ),
+                Openat2AdvisoryLevel::Warn,
+            ),
+        ];
+
+        for (label, kdl, expected) in cases {
+            let (cfg, _) = miraserve_config::parse_kdl("level.kdl", &kdl)?;
+            assert_eq!(
+                openat2_refusal_advisory_level(&cfg),
+                expected,
+                "case '{label}' produced unexpected advisory level"
+            );
+        }
         Ok(())
     }
 }
