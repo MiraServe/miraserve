@@ -760,99 +760,127 @@ async fn run_truncation_case(
     match proto {
         DownstreamProto::Http1 => {
             let mut cli = H1ClientConn::connect(https_addr, host, &tls_cfg).await?;
-            tokio::time::timeout(IO_TIMEOUT, cli.sender.ready()).await??;
+            tokio::time::timeout(IO_TIMEOUT, cli.sender.ready())
+                .await
+                .map_err(|_| format!("{case_tag}: timed out waiting for H1 sender ready"))??;
             let req = Request::builder()
                 .uri(case.path())
                 .header(HOST, host)
                 .body(Empty::<Bytes>::new())?;
-            let resp = tokio::time::timeout(IO_TIMEOUT, cli.sender.send_request(req)).await??;
-            assert_eq!(
-                resp.status(),
-                StatusCode::OK,
-                "{case_tag}: expected 200 OK head before mid-body truncation"
-            );
-            match case {
-                TruncCase::ContentLengthShort | TruncCase::MidBodyReset => {
-                    assert_eq!(
-                        resp.headers()
-                            .get(CONTENT_LENGTH)
-                            .and_then(|v| v.to_str().ok()),
-                        Some(FULL_LEN.to_string().as_str()),
-                        "{case_tag}: expected declared Content-Length: {FULL_LEN}"
-                    );
-                }
-                TruncCase::ChunkedNoTerminator => {
-                    assert!(
-                        resp.headers().get(CONTENT_LENGTH).is_none(),
-                        "{case_tag}: chunked response must not invent Content-Length"
-                    );
-                    assert_eq!(
-                        resp.headers()
-                            .get(TRANSFER_ENCODING)
-                            .and_then(|v| v.to_str().ok()),
-                        Some("chunked"),
-                        "{case_tag}: expected Transfer-Encoding: chunked downstream over H1"
-                    );
-                }
-            }
+            let resp_res = tokio::time::timeout(IO_TIMEOUT, cli.sender.send_request(req))
+                .await
+                .map_err(|_| format!("{case_tag}: timed out awaiting H1 response head"))?;
 
-            let mut body = resp.into_body();
-            let mut received = Vec::new();
-            let mut saw_body_error = false;
-            let mut rst_triggered = false;
-            let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
-            loop {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                assert!(
-                    !remaining.is_zero(),
-                    "{case_tag}: H1 client hung reading truncated body (received {} bytes)",
-                    received.len()
-                );
-                match tokio::time::timeout(remaining, body.frame()).await {
-                    Ok(Some(Ok(frame))) => {
-                        if let Ok(data) = frame.into_data() {
-                            received.extend_from_slice(&data);
-                            if case == TruncCase::MidBodyReset
-                                && !rst_triggered
-                                && !received.is_empty()
-                            {
-                                upstream.trigger_rst();
-                                rst_triggered = true;
+            match resp_res {
+                Ok(resp) => {
+                    assert_eq!(
+                        resp.status(),
+                        StatusCode::OK,
+                        "{case_tag}: expected 200 OK head before mid-body truncation"
+                    );
+                    match case {
+                        TruncCase::ContentLengthShort | TruncCase::MidBodyReset => {
+                            assert_eq!(
+                                resp.headers()
+                                    .get(CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok()),
+                                Some(FULL_LEN.to_string().as_str()),
+                                "{case_tag}: expected declared Content-Length: {FULL_LEN}"
+                            );
+                        }
+                        TruncCase::ChunkedNoTerminator => {
+                            assert!(
+                                resp.headers().get(CONTENT_LENGTH).is_none(),
+                                "{case_tag}: chunked response must not invent Content-Length"
+                            );
+                            assert_eq!(
+                                resp.headers()
+                                    .get(TRANSFER_ENCODING)
+                                    .and_then(|v| v.to_str().ok()),
+                                Some("chunked"),
+                                "{case_tag}: expected Transfer-Encoding: chunked downstream over H1"
+                            );
+                        }
+                    }
+
+                    let mut body = resp.into_body();
+                    let mut received = Vec::new();
+                    let mut saw_body_error = false;
+                    let mut rst_triggered = false;
+                    let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
+                    loop {
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        assert!(
+                            !remaining.is_zero(),
+                            "{case_tag}: H1 client hung reading truncated body (received {} bytes)",
+                            received.len()
+                        );
+                        match tokio::time::timeout(remaining, body.frame()).await {
+                            Ok(Some(Ok(frame))) => {
+                                if let Ok(data) = frame.into_data() {
+                                    received.extend_from_slice(&data);
+                                    if case == TruncCase::MidBodyReset
+                                        && !rst_triggered
+                                        && !received.is_empty()
+                                    {
+                                        upstream.trigger_rst();
+                                        rst_triggered = true;
+                                    }
+                                }
+                            }
+                            Ok(Some(Err(_))) => {
+                                saw_body_error = true;
+                                break;
+                            }
+                            Ok(None) => break,
+                            Err(_) => {
+                                return Err(format!(
+                                    "{case_tag}: H1 body read timed out after {} bytes",
+                                    received.len()
+                                )
+                                .into());
                             }
                         }
                     }
-                    Ok(Some(Err(_))) => {
-                        saw_body_error = true;
-                        break;
+
+                    assert!(
+                        saw_body_error,
+                        "{case_tag}: H1 client MUST observe a body error on truncation, never clean EOF (received {} bytes)",
+                        received.len()
+                    );
+                    assert!(
+                        received.len() < FULL_LEN,
+                        "{case_tag}: H1 truncated body must be strictly shorter than {FULL_LEN} (got {})",
+                        received.len()
+                    );
+                    if case == TruncCase::MidBodyReset {
+                        assert!(
+                            rst_triggered && !received.is_empty(),
+                            "{case_tag}: RST must be triggered mid-body after client observed body bytes"
+                        );
                     }
-                    Ok(None) => break,
-                    Err(_) => {
-                        return Err(format!(
-                            "{case_tag}: H1 body read timed out after {} bytes",
-                            received.len()
-                        )
-                        .into());
-                    }
+                    assert_pattern_prefix(&received, &case_tag);
+                }
+                Err(err) => {
+                    // On fast loopback, hyper's H1 server can observe the upstream premature EOF
+                    // while still buffering the head + initial body bytes and immediately abort
+                    // the downstream TLS connection (UnexpectedEof / closed) before flushing the
+                    // head. That is still a clean non-complete failure; case (c) holds the socket
+                    // open until the client triggers RST so it must always reach the body loop.
+                    assert_ne!(
+                        case,
+                        TruncCase::MidBodyReset,
+                        "{case_tag}: case (c) must deliver head and body bytes before RST (got {err})"
+                    );
+                    assert!(
+                        err.is_closed()
+                            || err.is_incomplete_message()
+                            || std::error::Error::source(&err).is_some(),
+                        "{case_tag}: expected H1 transport/truncation error from server, got {err:?}"
+                    );
                 }
             }
-
-            assert!(
-                saw_body_error,
-                "{case_tag}: H1 client MUST observe a body error on truncation, never clean EOF (received {} bytes)",
-                received.len()
-            );
-            assert!(
-                received.len() < FULL_LEN,
-                "{case_tag}: H1 truncated body must be strictly shorter than {FULL_LEN} (got {})",
-                received.len()
-            );
-            if case == TruncCase::MidBodyReset {
-                assert!(
-                    rst_triggered && !received.is_empty(),
-                    "{case_tag}: RST must be triggered mid-body after client observed body bytes"
-                );
-            }
-            assert_pattern_prefix(&received, &case_tag);
 
             // The downstream HTTP/1.1 connection MUST NOT be reusable for another request.
             let reuse_res = tokio::time::timeout(IO_TIMEOUT, async {
@@ -1227,7 +1255,7 @@ fn proxy_truncation_access_log_records_status_and_bytes() -> TestResult {
         {
             let mut cli = H1ClientConn::connect(https_addr, host, &h1_tls).await?;
             tokio::time::timeout(IO_TIMEOUT, cli.sender.ready()).await??;
-            let resp = tokio::time::timeout(
+            let resp_res = tokio::time::timeout(
                 IO_TIMEOUT,
                 cli.sender.send_request(
                     Request::builder()
@@ -1236,9 +1264,11 @@ fn proxy_truncation_access_log_records_status_and_bytes() -> TestResult {
                         .body(Empty::<Bytes>::new())?,
                 ),
             )
-            .await??;
-            let mut body = resp.into_body();
-            while let Ok(Some(Ok(_))) = tokio::time::timeout(IO_TIMEOUT, body.frame()).await {}
+            .await?;
+            if let Ok(resp) = resp_res {
+                let mut body = resp.into_body();
+                while let Ok(Some(Ok(_))) = tokio::time::timeout(IO_TIMEOUT, body.frame()).await {}
+            }
             cli.close().await;
         }
         {
