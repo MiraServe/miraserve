@@ -322,8 +322,9 @@ pub struct SandboxPolicy {
     pub pinned_read_only_paths: Vec<PinnedReadOnlyPath>,
     /// Exact Unix domain socket paths granted minimal `ReadFile | WriteFile` connect access.
     ///
-    /// On Linux, a wrong-type entry added directly to a supplied or edited policy has an empty
-    /// shadowed-class set and is skipped at Landlock rule installation.
+    /// On Linux, a wrong-type entry added directly to a supplied or edited policy (including one
+    /// removed from `socket_paths`, finalized, and later re-added) is not in the shadowed-class
+    /// set and gets no socket rule at Landlock rule installation.
     pub socket_paths: Vec<PathBuf>,
     /// Paths that only tenant sites (`owner-dir`) ask for (set by the caller from a consumer
     /// analysis). Such a grant that first appears at finalization and cannot be opened is left
@@ -354,8 +355,11 @@ pub struct SandboxPolicy {
     #[serde(skip)]
     socket_tree_paths: BTreeSet<PathBuf>,
     /// Socket-class spellings that shadowed an entry in `ro` or `rw` during class precedence in
-    /// [`Self::from_config_with_file`]. On Linux, a wrong-type non-`socket-tree` entry in this set
-    /// keeps the 0.1.5 socket-class rule with a warning so no other configured role loses access.
+    /// [`Self::from_config_with_file`], or matched the canonical rotating-log directory bound by
+    /// [`Self::bind_log_rotation_dir`]. Pruned by [`Self::finalize_grants`] whenever a spelling is
+    /// no longer in [`Self::socket_paths`]. On Linux, a wrong-type non-`socket-tree` entry in this
+    /// set keeps the 0.1.5 socket-class rule with a warning so no other configured grant loses
+    /// access.
     #[serde(skip)]
     socket_shadows_other_class: BTreeSet<PathBuf>,
 }
@@ -1183,6 +1187,11 @@ impl SandboxPolicy {
                 self.grant_states.remove(p);
             }
         }
+        // Keep shadowed-class provenance aligned with `socket_paths`: if a spelling was removed
+        // (and pruned from `grant_states`) or dropped above, re-adding it by hand later must treat
+        // it as a plain exact socket entry rather than a shadowed directory grant.
+        self.socket_shadows_other_class
+            .retain(|p| self.socket_paths.iter().any(|s| s == p));
         let failures = self.grant_failures();
         if failures.is_empty() {
             Ok(())
@@ -1675,6 +1684,15 @@ impl SandboxPolicy {
         self.read_write_paths = rw.into_iter().collect();
         let rp_state = open_grant(&real_parent, false);
         self.grant_states.insert(real_parent.clone(), rp_state);
+        // Log binding adds the canonical RW path and replaces its grant state after initial class
+        // precedence. If the same path key is in `socket_paths`, record the socket list's spelling
+        // so the Linux installer keeps the 0.1.5 socket-class rule on the replacement descriptor
+        // (followed by the pinned RW rule) and emits the shadow WARN instead of skipping it.
+        for sock_path in &self.socket_paths {
+            if sock_path == &real_parent {
+                self.socket_shadows_other_class.insert(sock_path.clone());
+            }
+        }
         self.read_only_paths.retain(|p| {
             !normalized_paths_equal(p, &real_parent) && !normalized_paths_equal(p, parent)
         });
@@ -4682,7 +4700,7 @@ mod linux {
 
     /// Every worker thread installs the same policy; report each missing-path notice once per
     /// process instead of once per thread.
-    fn first_time_reported(key: &str) -> bool {
+    pub(super) fn first_time_reported(key: &str) -> bool {
         static REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
             std::sync::Mutex::new(std::collections::BTreeSet::new());
         REPORTED
@@ -4887,7 +4905,7 @@ mod linux {
                             warn!(
                                 path = %display_path,
                                 found,
-                                "unix socket path '{display_path}' is not a socket (found {found}) and the same path is configured for another use: the 0.1.5 access rule is kept; give the socket its own path"
+                                "unix socket path '{display_path}' is not a socket (found {found}) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path"
                             );
                         }
                     } else {
@@ -4897,7 +4915,7 @@ mod linux {
                             warn!(
                                 path = %display_path,
                                 found,
-                                "exact unix socket path '{display_path}' is not a socket (found {found}): no Landlock rule installed for it; FastCGI or keyd requests to it will fail"
+                                "exact unix socket path '{display_path}' is not a socket (found {found}): no socket rule installed for it; FastCGI or keyd requests to it fail while it is not a socket"
                             );
                         }
                     }
@@ -7491,6 +7509,773 @@ site "clean.example.test" {{
             edited_assembled.sock_rules.is_empty(),
             "manually added wrong-type exact socket entry on edited policy must be skipped"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestCapturedEvent {
+        level: tracing::Level,
+        message: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[cfg(target_os = "linux")]
+    type TestEventSink = std::sync::Arc<std::sync::Mutex<Vec<TestCapturedEvent>>>;
+
+    #[cfg(target_os = "linux")]
+    std::thread_local! {
+        static TEST_EVENT_SINK: std::cell::RefCell<Option<TestEventSink>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestFieldVisitor {
+        message: String,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl tracing::field::Visit for TestFieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let rendered = format!("{value:?}");
+            if field.name() == "message" {
+                self.message = rendered;
+            } else {
+                self.fields.insert(field.name().to_owned(), rendered);
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_owned();
+            } else {
+                self.fields
+                    .insert(field.name().to_owned(), value.to_owned());
+            }
+        }
+    }
+
+    /// Single global test tracing router so parallel unit tests never race on `tracing-core`'s
+    /// `set_default` / `has_just_one` callsite interest cache (where an unsubscribed parallel test
+    /// thread can register a callsite with `Interest::never()` while only one scoped subscriber
+    /// exists on another thread).
+    #[cfg(target_os = "linux")]
+    struct TestGlobalEventRouter;
+
+    #[cfg(target_os = "linux")]
+    impl tracing::Subscriber for TestGlobalEventRouter {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::always()
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            TEST_EVENT_SINK.with(|slot| {
+                if let Some(sink) = slot.borrow().as_ref() {
+                    let mut visitor = TestFieldVisitor {
+                        message: String::new(),
+                        fields: std::collections::BTreeMap::new(),
+                    };
+                    event.record(&mut visitor);
+                    if let Ok(mut guard) = sink.lock() {
+                        guard.push(TestCapturedEvent {
+                            level: *event.metadata().level(),
+                            message: visitor.message,
+                            fields: visitor.fields,
+                        });
+                    }
+                }
+            });
+        }
+        fn enter(&self, _span: &tracing::span::Id) {}
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    struct TestEventCaptureGuard {
+        previous: Option<TestEventSink>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for TestEventCaptureGuard {
+        fn drop(&mut self) {
+            let prev = self.previous.take();
+            let _ = TEST_EVENT_SINK.try_with(|slot| {
+                *slot.borrow_mut() = prev;
+            });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_test_events(sink: TestEventSink) -> TestEventCaptureGuard {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(TestGlobalEventRouter);
+        });
+        let previous = TEST_EVENT_SINK.with(|slot| slot.borrow_mut().replace(sink));
+        TestEventCaptureGuard { previous }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn expected_linux_system_ro_paths_for_test() -> std::collections::BTreeSet<std::path::PathBuf> {
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        let mut ro_paths = BTreeSet::new();
+        for sys_ro in [
+            "/etc/ssl/certs",
+            "/etc/ssl/openssl.cnf",
+            "/etc/ssl/cert.pem",
+            "/etc/ca-certificates",
+            "/etc/ca-certificates.conf",
+            "/usr/share/ca-certificates",
+            "/usr/local/share/ca-certificates",
+            "/etc/pki/tls/certs",
+            "/etc/pki/tls/cert.pem",
+            "/etc/pki/ca-trust",
+            "/usr/share/pki/ca-trust-source",
+            "/usr/share/pki/trust",
+            "/var/lib/ca-certificates",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+        ] {
+            let p = PathBuf::from(sys_ro);
+            if p.exists() {
+                if let Ok(canon) = std::fs::canonicalize(&p)
+                    && canon != p
+                    && canon.is_file()
+                {
+                    ro_paths.insert(canon);
+                }
+                ro_paths.insert(p);
+            }
+        }
+        if Path::new("/etc/miraserve/auth").is_dir() {
+            ro_paths.insert(PathBuf::from("/etc/miraserve/auth"));
+        }
+        ro_paths
+    }
+
+    /// Audit 3 P1 #1 (white-box): existing directory `L`, `fastcgi-pass "unix:L"`, rotating log
+    /// file `L/server.log` bound via `bind_log_rotation_dir`, no `socket-tree`. Asserts exact
+    /// 0.1.5 rule-list parity against independent literals (socket-class rule on `L`'s replacement
+    /// descriptor followed by the pinned RW rule on `L`), plus exactly one shadow WARN and zero
+    /// skip WARNs across two installations (also tested with a trailing-slash spelling `unix:L/`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn assembled_landlock_rules_for_rotating_log_parent_as_exact_socket_match_015_and_warn()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{Arc, Mutex};
+
+        use landlock::{ABI, Access as _, AccessFs};
+        use rustix::fs::fstat;
+
+        let all_abi = AccessFs::from_all(ABI::V5);
+        let ro_dir_mask = (AccessFs::ReadFile | AccessFs::ReadDir) & all_abi;
+        let ro_file_mask = ro_dir_mask & AccessFs::ReadFile;
+        let writable_dir_mask = (AccessFs::ReadFile
+            | AccessFs::ReadDir
+            | AccessFs::WriteFile
+            | AccessFs::Truncate
+            | AccessFs::MakeReg
+            | AccessFs::MakeDir
+            | AccessFs::RemoveFile
+            | AccessFs::RemoveDir
+            | AccessFs::Refer)
+            & all_abi;
+        let sock_mask = (AccessFs::ReadFile | AccessFs::WriteFile) & all_abi;
+
+        for (tag, trailing_slash) in [("rlog", false), ("rlogs", true)] {
+            let base = short_socket_test_dir(tag)?;
+            let docroot = base.join("www");
+            let log_dir = base.join("logs");
+            let log_file = log_dir.join("server.log");
+            std::fs::create_dir_all(&docroot)?;
+            std::fs::create_dir_all(&log_dir)?;
+
+            let sock_ep_str = if trailing_slash {
+                format!("{}/", log_dir.display())
+            } else {
+                log_dir.display().to_string()
+            };
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "rlog.example.test" {{
+    root "{docroot}"
+    route "/app.php" {{
+        fastcgi-pass "unix:{sock_ep}"
+    }}
+}}
+"#,
+                docroot = kdl_escape_test_path(&docroot),
+                sock_ep = sock_ep_str.replace('\\', "\\\\").replace('"', "\\\""),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("rlog.kdl", &kdl)?;
+            // Exact CLI order: build initial policy first, then bind rotating log dir, then finalize.
+            let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+            policy.bind_log_rotation_dir(&log_file, &cfg, None, None, &[])?;
+            policy.finalize_grants()?;
+
+            // Independently construct the exact 0.1.5 ordered rule list:
+            // readonly_rules ++ writable_rules (empty because L is pinned) ++ sock_rules (L) ++
+            // pinned_read_write_dirs (L).
+            let mut expected_ro_paths = expected_linux_system_ro_paths_for_test();
+            expected_ro_paths.insert(docroot.clone());
+
+            let mut expected_rules: Vec<((u64, u64), landlock::BitFlags<AccessFs>)> = Vec::new();
+            for p in &expected_ro_paths {
+                let md = std::fs::metadata(p)?;
+                let mask = if md.is_dir() {
+                    ro_dir_mask
+                } else {
+                    ro_file_mask
+                };
+                expected_rules.push(((md.dev(), md.ino()), mask));
+            }
+            let log_md = std::fs::metadata(&log_dir)?;
+            let log_inode = (log_md.dev(), log_md.ino());
+            expected_rules.push((log_inode, sock_mask));
+            expected_rules.push((log_inode, writable_dir_mask));
+
+            let events = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+            for _ in 0..2 {
+                let _sub = capture_test_events(Arc::clone(&events));
+                let mut notes = Vec::new();
+                let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+                assert!(
+                    assembled.writable_rules.is_empty(),
+                    "rotating-log dir L is pinned so writable_rules must be empty"
+                );
+                assert_eq!(
+                    assembled.sock_rules.len(),
+                    1,
+                    "rotating-log dir L used as exact endpoint must keep its 0.1.5 socket-class rule"
+                );
+                assert_eq!(
+                    policy.pinned_read_write_dirs.len(),
+                    1,
+                    "rotating-log dir L must remain pinned"
+                );
+                let (sock_fd, _) = assembled
+                    .sock_rules
+                    .first()
+                    .copied()
+                    .ok_or("expected one sock_rule")?;
+                let pinned_rw = policy
+                    .pinned_read_write_dirs
+                    .first()
+                    .ok_or("expected one pinned_read_write_dir")?;
+                assert_ne!(
+                    sock_fd.as_raw_fd(),
+                    pinned_rw.file.as_raw_fd(),
+                    "socket-class rule must use the replacement grant_states descriptor, followed by the separate pinned handle"
+                );
+
+                let mut actual_rules: Vec<((u64, u64), landlock::BitFlags<AccessFs>)> = assembled
+                    .readonly_rules
+                    .into_iter()
+                    .chain(assembled.writable_rules)
+                    .chain(assembled.sock_rules)
+                    .map(|(fd, mask)| {
+                        let st = fstat(fd)?;
+                        #[allow(clippy::useless_conversion)]
+                        Ok(((u64::from(st.st_dev), u64::from(st.st_ino)), mask))
+                    })
+                    .collect::<Result<Vec<_>, rustix::io::Errno>>()?;
+                for pinned in &policy.pinned_read_write_dirs {
+                    let st = fstat(&*pinned.file)?;
+                    #[allow(clippy::useless_conversion)]
+                    actual_rules.push((
+                        (u64::from(st.st_dev), u64::from(st.st_ino)),
+                        writable_dir_mask,
+                    ));
+                }
+                for pinned in &policy.pinned_read_only_paths {
+                    let st = fstat(&*pinned.file)?;
+                    let mask = if pinned.is_dir {
+                        ro_dir_mask
+                    } else {
+                        ro_file_mask
+                    };
+                    #[allow(clippy::useless_conversion)]
+                    actual_rules.push(((u64::from(st.st_dev), u64::from(st.st_ino)), mask));
+                }
+
+                assert_eq!(
+                    actual_rules, expected_rules,
+                    "assembled + pinned Landlock rules for rotating-log parent L must match 0.1.5"
+                );
+                assert!(notes.is_empty(), "expected no notes, got {notes:?}");
+            }
+
+            let expected_warn = format!(
+                "unix socket path '{sock_ep_str}' is not a socket (found directory) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path"
+            );
+            let captured = events.lock().map_err(|_| "event capture lock poisoned")?;
+            let shadow_warns: Vec<&String> = captured
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn)
+                .map(|e| &e.message)
+                .collect();
+            assert_eq!(
+                shadow_warns.len(),
+                1,
+                "expected exactly 1 shadow WARN `{expected_warn}` across two calls, got {shadow_warns:?} (all: {:?})",
+                captured
+                    .iter()
+                    .map(|e| (&e.level, &e.message))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                captured
+                    .iter()
+                    .all(|e| !e.message.contains("no socket rule installed")
+                        && !e.message.contains("no Landlock rule installed")),
+                "rotating-log parent must emit shadow WARN, never skip WARN"
+            );
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        Ok(())
+    }
+
+    /// Audit 3 P1 #2 (intended behaviour): regular certificate file `C` configured as a TLS
+    /// certificate (whose parent directory is granted read-only) and also used as
+    /// `fastcgi-pass "unix:C"` gets NO leaf socket rule, keeps its parent's read-only rule, stays
+    /// readable (and not writable) under enforcing Landlock, and emits the skip WARN once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn cert_file_used_as_exact_socket_gets_no_leaf_rule_stays_readable_and_warns_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::fs::OpenOptions;
+        use std::io::ErrorKind;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::sync::{Arc, Mutex};
+
+        use landlock::{ABI, Access as _, AccessFs};
+        use rustix::fs::fstat;
+
+        let base = short_socket_test_dir("crt")?;
+        let docroot = base.join("www");
+        let cert_dir = base.join("tls").join("public");
+        let key_dir = base.join("tls").join("private");
+        let outside = base.join("outside");
+        let cert_file = cert_dir.join("site.pem");
+        let key_file = key_dir.join("site.key");
+        let outside_marker = outside.join("secret.txt");
+        std::fs::create_dir_all(&docroot)?;
+        std::fs::create_dir_all(&cert_dir)?;
+        std::fs::create_dir_all(&key_dir)?;
+        std::fs::create_dir_all(&outside)?;
+        std::fs::write(&cert_file, "CERT-PEM-PAYLOAD")?;
+        std::fs::write(&key_file, "KEY-PEM-PAYLOAD")?;
+        std::fs::write(&outside_marker, "OUTSIDE-SECRET")?;
+
+        let kdl = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "cert.example.test" {{
+    root "{docroot}"
+    tls {{
+        cert "{cert_file}"
+        key "{key_file}"
+    }}
+    route "/app.php" {{
+        fastcgi-pass "unix:{cert_file}"
+    }}
+}}
+"#,
+            docroot = kdl_escape_test_path(&docroot),
+            cert_file = kdl_escape_test_path(&cert_file),
+            key_file = kdl_escape_test_path(&key_file),
+        );
+        let (cfg, _) = miraserve_config::parse_kdl("cert-ep.kdl", &kdl)?;
+        let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+        policy.finalize_grants()?;
+
+        assert!(
+            policy.read_only_paths.contains(&cert_dir),
+            "certificate parent dir must be granted read-only"
+        );
+        assert!(
+            policy.socket_paths.contains(&cert_file),
+            "certificate path must sit in socket_paths"
+        );
+
+        let all_abi = AccessFs::from_all(ABI::V5);
+        let ro_dir_mask = (AccessFs::ReadFile | AccessFs::ReadDir) & all_abi;
+        let cert_dir_md = std::fs::metadata(&cert_dir)?;
+        let cert_dir_inode = (cert_dir_md.dev(), cert_dir_md.ino());
+
+        let events = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+        {
+            let _sub = capture_test_events(Arc::clone(&events));
+            let mut notes = Vec::new();
+            let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+            assert!(
+                assembled.sock_rules.is_empty(),
+                "regular certificate file C used as exact socket must get NO leaf socket rule"
+            );
+            let mut found_parent_ro = false;
+            for (fd, mask) in &assembled.readonly_rules {
+                let st = fstat(fd)?;
+                #[allow(clippy::useless_conversion)]
+                let id = (u64::from(st.st_dev), u64::from(st.st_ino));
+                if id == cert_dir_inode && *mask == ro_dir_mask {
+                    found_parent_ro = true;
+                    break;
+                }
+            }
+            assert!(
+                found_parent_ro,
+                "parent directory read-only rule must be present in assembled readonly_rules"
+            );
+            assert!(notes.is_empty(), "expected no notes, got {notes:?}");
+        }
+
+        // Enforce Landlock on two threads (both capturing WARNs): verify C stays readable via its
+        // parent's read-only rule, is NOT writable (no leaf socket WriteFile rule), outside is
+        // denied, and the skip WARN stays emitted once across all calls.
+        if crate::linux::probe_host_landlock_abi().is_some() {
+            for idx in 1..=2 {
+                let p = policy.clone();
+                let ev = Arc::clone(&events);
+                let cf = cert_file.clone();
+                let cd = cert_dir.clone();
+                let out = outside_marker.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    let _sub = capture_test_events(ev);
+                    let status = crate::apply_landlock_current_thread(&p)
+                        .map_err(|e| format!("thread {idx} apply_landlock: {e}"))?;
+                    if !matches!(
+                        status,
+                        crate::EnforcementStatus::Enforced
+                            | crate::EnforcementStatus::PartiallyEnforced
+                    ) {
+                        return Err(format!("thread {idx} expected enforcing Landlock: {status:?}"));
+                    }
+                    let got = std::fs::read_to_string(&cf)
+                        .map_err(|e| format!("thread {idx} reading cert C failed: {e}"))?;
+                    if got != "CERT-PEM-PAYLOAD" {
+                        return Err(format!("thread {idx} unexpected cert contents: {got:?}"));
+                    }
+                    std::fs::read_dir(&cd)
+                        .map_err(|e| format!("thread {idx} ReadDir on cert parent failed: {e}"))?;
+                    let write_err = OpenOptions::new().write(true).open(&cf).err().ok_or_else(
+                        || format!("thread {idx} cert C must NOT be writable under Landlock"),
+                    )?;
+                    if write_err.kind() != ErrorKind::PermissionDenied {
+                        return Err(format!(
+                            "thread {idx} expected PermissionDenied writing cert C, got {write_err:?}"
+                        ));
+                    }
+                    let out_err = std::fs::read_to_string(&out).err().ok_or_else(|| {
+                        format!("thread {idx} outside marker must be denied under Landlock")
+                    })?;
+                    if out_err.kind() != ErrorKind::PermissionDenied {
+                        return Err(format!(
+                            "thread {idx} expected PermissionDenied on outside marker, got {out_err:?}"
+                        ));
+                    }
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| "cert enforcement thread panicked")??;
+            }
+        }
+
+        let expected_warn = format!(
+            "exact unix socket path '{}' is not a socket (found regular file): no socket rule installed for it; FastCGI or keyd requests to it fail while it is not a socket",
+            cert_file.display()
+        );
+        let captured = events.lock().map_err(|_| "event capture lock poisoned")?;
+        let skip_warns: Vec<&String> = captured
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn)
+            .map(|e| &e.message)
+            .collect();
+        assert_eq!(
+            skip_warns.len(),
+            1,
+            "expected exactly 1 skip WARN `{expected_warn}`, got {skip_warns:?} (all: {:?})",
+            captured
+                .iter()
+                .map(|e| (&e.level, &e.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|e| !e.message.contains("0.1.5 access rule is kept")),
+            "regular cert file C must not emit shadow WARN"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    /// Audit 3 P2 (shadow set hygiene): when `finalize_grants` prunes a spelling from
+    /// `grant_states` because it was removed from every path list, it removes that spelling from
+    /// `socket_shadows_other_class` too; re-adding the directory by hand afterwards treats it as
+    /// a plain exact entry (skipped, skip WARN emitted instead of shadow WARN).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finalize_grants_prunes_shadow_set_when_socket_entry_removed_and_readded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Mutex};
+
+        let base = short_socket_test_dir("shh")?;
+        let dir_d = base.join("shared");
+        std::fs::create_dir_all(&dir_d)?;
+
+        let kdl = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "hygiene.example.test" {{
+    root "{dir_d}"
+    route "/app.php" {{
+        fastcgi-pass "unix:{dir_d}"
+    }}
+}}
+"#,
+            dir_d = kdl_escape_test_path(&dir_d),
+        );
+        let (cfg, _) = miraserve_config::parse_kdl("hygiene.kdl", &kdl)?;
+        let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+        policy.finalize_grants()?;
+
+        assert!(
+            policy.socket_shadows_other_class.contains(&dir_d),
+            "initial policy must record D in socket_shadows_other_class"
+        );
+        assert!(
+            !policy.read_only_paths.contains(&dir_d) && !policy.read_write_paths.contains(&dir_d),
+            "socket precedence must have removed D from RO/RW"
+        );
+
+        // Remove D from socket_paths and finalize: grant_states and shadow set must both drop D.
+        policy.socket_paths.retain(|p| p != &dir_d);
+        policy.finalize_grants()?;
+        assert!(
+            !policy.grant_states.contains_key(&dir_d),
+            "finalize_grants must prune D from grant_states"
+        );
+        assert!(
+            !policy.socket_shadows_other_class.contains(&dir_d),
+            "finalize_grants must prune D from socket_shadows_other_class"
+        );
+
+        // Re-add D by hand as a plain exact socket entry and finalize again.
+        policy.socket_paths.push(dir_d.clone());
+        policy.finalize_grants()?;
+        assert!(
+            !policy.socket_shadows_other_class.contains(&dir_d),
+            "re-added D must not regain shadowed-class provenance"
+        );
+
+        let events = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+        {
+            let _sub = capture_test_events(Arc::clone(&events));
+            let mut notes = Vec::new();
+            let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+            assert!(
+                assembled.sock_rules.is_empty(),
+                "re-added directory D must be treated as a plain exact entry with zero sock_rules"
+            );
+            assert!(notes.is_empty(), "expected no notes, got {notes:?}");
+        }
+
+        let expected_skip_warn = format!(
+            "exact unix socket path '{}' is not a socket (found directory): no socket rule installed for it; FastCGI or keyd requests to it fail while it is not a socket",
+            dir_d.display()
+        );
+        let captured = events.lock().map_err(|_| "event capture lock poisoned")?;
+        let skip_warns: Vec<&String> = captured
+            .iter()
+            .filter(|e| e.level == tracing::Level::WARN && e.message == expected_skip_warn)
+            .map(|e| &e.message)
+            .collect();
+        assert_eq!(
+            skip_warns.len(),
+            1,
+            "expected 1 skip WARN for re-added D, got {skip_warns:?} (all: {:?})",
+            captured
+                .iter()
+                .map(|e| (&e.level, &e.message))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|e| !e.message.contains("0.1.5 access rule is kept")),
+            "re-added D must not emit shadow WARN"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    /// Audit 3 P2 (Test D companion): verifies directly via crate-internal `first_time_reported`
+    /// that the missing-socket notice uses the exact literal deduplication key prefix `sock:`
+    /// (`sock:{z.sock}`), proving both directions (recorded after assembly AND suppressed when
+    /// pre-seeded with `sock:{z2.sock}`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn missing_socket_notice_uses_literal_sock_deduplication_key_prefix()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::{Arc, Mutex};
+
+        let base = short_socket_test_dir("ddk")?;
+        let docroot = base.join("www");
+        let bad_dir = base.join("pools").join("bad");
+        let late_child = bad_dir.join("late.sock");
+        let z1_sock = base.join("z1.sock");
+        let z2_sock = base.join("z2.sock");
+        std::fs::create_dir_all(&docroot)?;
+        std::fs::create_dir_all(&bad_dir)?;
+
+        let expected_warn_msg = "configured Landlock Unix socket path(s) do not exist at startup and cannot be granted until restart";
+
+        // Direction 1: assembling with `pools/bad` (dir), `pools/bad/late.sock` (absent), and
+        // `z1.sock` (absent) emits the WARN for ONLY `z1.sock` and records exact key `sock:{z1}`.
+        let kdl1 = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "ddk1.example.test" {{
+    root "{docroot}"
+    route "/bad.php" {{ fastcgi-pass "unix:{bad_dir}" }}
+    route "/late.php" {{ fastcgi-pass "unix:{late_child}" }}
+    route "/z.php" {{ fastcgi-pass "unix:{z1_sock}" }}
+}}
+"#,
+            docroot = kdl_escape_test_path(&docroot),
+            bad_dir = kdl_escape_test_path(&bad_dir),
+            late_child = kdl_escape_test_path(&late_child),
+            z1_sock = kdl_escape_test_path(&z1_sock),
+        );
+        let (cfg1, _) = miraserve_config::parse_kdl("ddk1.kdl", &kdl1)?;
+        let mut policy1 = crate::SandboxPolicy::from_config_with_file(&cfg1, None, None);
+        policy1.finalize_grants()?;
+
+        let events1 = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+        let mut notes1 = Vec::new();
+        {
+            let _sub = capture_test_events(Arc::clone(&events1));
+            let _assembled = crate::linux::assemble_landlock_rules(&policy1, &mut notes1)?;
+        }
+        let expected_note1 = format!(
+            "missing Landlock Unix socket path(s) omitted at startup (restart after creating): {}",
+            z1_sock.display()
+        );
+        assert_eq!(notes1, vec![expected_note1]);
+        {
+            let captured1 = events1.lock().map_err(|_| "event capture lock poisoned")?;
+            let warns1: Vec<&TestCapturedEvent> = captured1
+                .iter()
+                .filter(|e| e.level == tracing::Level::WARN && e.message == expected_warn_msg)
+                .collect();
+            assert_eq!(warns1.len(), 1, "expected 1 missing-socket WARN for z1");
+            let first1 = warns1.first().ok_or("expected missing-socket WARN")?;
+            assert_eq!(
+                first1.fields.get("missing_sockets").map(String::as_str),
+                Some(z1_sock.to_string_lossy().as_ref()),
+                "missing_sockets field must name ONLY z1.sock"
+            );
+        }
+        assert!(
+            !crate::linux::first_time_reported(&format!("sock:{}", z1_sock.display())),
+            "assembly must have recorded exact literal deduplication key `sock:<z1.sock>`"
+        );
+        assert!(
+            crate::linux::first_time_reported(&format!(
+                "sock:{}, {}",
+                late_child.display(),
+                z1_sock.display()
+            )),
+            "wrong 2-path key must NOT have been recorded"
+        );
+        assert!(
+            crate::linux::first_time_reported(&format!("missing:{}", z1_sock.display())),
+            "alternate prefix `missing:` must NOT have been recorded"
+        );
+
+        // Direction 2: pre-seeding exact literal key `sock:{z2}` suppresses the missing-socket
+        // WARN on assembly while leaving the report note intact.
+        assert!(
+            crate::linux::first_time_reported(&format!("sock:{}", z2_sock.display())),
+            "fresh z2 key must not be pre-existing"
+        );
+        let kdl2 = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "ddk2.example.test" {{
+    root "{docroot}"
+    route "/bad.php" {{ fastcgi-pass "unix:{bad_dir}" }}
+    route "/late.php" {{ fastcgi-pass "unix:{late_child}" }}
+    route "/z.php" {{ fastcgi-pass "unix:{z2_sock}" }}
+}}
+"#,
+            docroot = kdl_escape_test_path(&docroot),
+            bad_dir = kdl_escape_test_path(&bad_dir),
+            late_child = kdl_escape_test_path(&late_child),
+            z2_sock = kdl_escape_test_path(&z2_sock),
+        );
+        let (cfg2, _) = miraserve_config::parse_kdl("ddk2.kdl", &kdl2)?;
+        let mut policy2 = crate::SandboxPolicy::from_config_with_file(&cfg2, None, None);
+        policy2.finalize_grants()?;
+
+        let events2 = Arc::new(Mutex::new(Vec::<TestCapturedEvent>::new()));
+        let mut notes2 = Vec::new();
+        {
+            let _sub = capture_test_events(Arc::clone(&events2));
+            let _assembled = crate::linux::assemble_landlock_rules(&policy2, &mut notes2)?;
+        }
+        let expected_note2 = format!(
+            "missing Landlock Unix socket path(s) omitted at startup (restart after creating): {}",
+            z2_sock.display()
+        );
+        assert_eq!(notes2, vec![expected_note2]);
+        {
+            let captured2 = events2.lock().map_err(|_| "event capture lock poisoned")?;
+            assert!(
+                captured2
+                    .iter()
+                    .all(|e| !(e.level == tracing::Level::WARN && e.message == expected_warn_msg)),
+                "pre-seeding exact `sock:<z2.sock>` key must suppress the missing-socket WARN"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
         Ok(())

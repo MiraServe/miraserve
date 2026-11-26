@@ -1148,3 +1148,140 @@ site "shadow.example.test" {{
         &tmp.path,
     )
 }
+
+/// Audit 3 P1 #1 (black-box PARITY — must pass unmodified on literal 0.1.5 `074051e` AND on this
+/// branch): existing directory `L`, `fastcgi-pass "unix:L"`, rotating log file `L/server.log`
+/// bound via `bind_log_rotation_dir`, no `socket-tree`. Verifies exact 0.1.5 path lists, pinned RW
+/// handle, granted `(dev, ino)` identity, and kernel-enforced Landlock access on `L` (`ReadFile`,
+/// `WriteFile`, `ReadDir`, `MakeReg`, `RemoveFile`) while `docroot` stays read-only and ungranted
+/// paths stay denied.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn parity_rotating_log_parent_as_exact_socket_matches_015_policy_and_enforcement() -> TestResult {
+    if let Ok(scenario) = std::env::var(CHILD_ENV) {
+        assert_eq!(scenario, "rotating-log-parity");
+        let base = PathBuf::from(std::env::var(BASE_ENV)?);
+        let log_dir = base.join("logs");
+        let log_file = log_dir.join("server.log");
+        let docroot = base.join("www");
+        let outside = base.join("outside");
+
+        let kdl = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "rlog.example.test" {{
+    root "{docroot}"
+    route "/app.php" {{
+        fastcgi-pass "unix:{log_dir}"
+    }}
+}}
+"#,
+            docroot = kdl_escape_path(&docroot),
+            log_dir = kdl_escape_path(&log_dir),
+        );
+        let (cfg, _) = parse_kdl("rlog-parity.kdl", &kdl)?;
+
+        let mut expected_ro_set = expected_linux_system_ro_paths();
+        expected_ro_set.insert(docroot.clone());
+        let expected_read_only: Vec<PathBuf> = expected_ro_set.into_iter().collect();
+        let expected_read_write: Vec<PathBuf> = vec![log_dir.clone()];
+        let expected_socks: Vec<PathBuf> = vec![log_dir.clone()];
+
+        let mut policy = SandboxPolicy::from_config_with_file(&cfg, None, None);
+        policy.bind_log_rotation_dir(&log_file, &cfg, None, None, &[])?;
+        policy.finalize_grants()?;
+
+        assert_eq!(policy.read_only_paths, expected_read_only);
+        assert_eq!(policy.read_write_paths, expected_read_write);
+        assert_eq!(policy.socket_paths, expected_socks);
+        assert_eq!(policy.pinned_read_write_dirs.len(), 1);
+        let log_md = fs::metadata(&log_dir)?;
+        let expected_log_id = (log_md.dev(), log_md.ino());
+        assert_eq!(policy.granted_identity(&log_dir), Some(expected_log_id));
+        assert_eq!(
+            policy
+                .pinned_read_write_dirs
+                .first()
+                .map(|d| (d.path.as_path(), d.inode_identity())),
+            Some((log_dir.as_path(), expected_log_id))
+        );
+
+        let log_dir_c = log_dir;
+        let docroot_c = docroot;
+        let outside_c = outside;
+        std::thread::spawn(move || -> Result<(), String> {
+            let report = apply_sandbox(&policy).map_err(|e| format!("apply_sandbox: {e}"))?;
+            if !matches!(
+                report.landlock,
+                EnforcementStatus::Enforced | EnforcementStatus::PartiallyEnforced
+            ) {
+                return Err(format!(
+                    "expected enforcing Landlock, got {:?}",
+                    report.landlock
+                ));
+            }
+            // Rotating log dir L keeps full pinned RW access alongside the socket-class rule.
+            let rotated = log_dir_c.join("server.log.1");
+            fs::write(&rotated, b"ROTATED-OK")
+                .map_err(|e| format!("MakeReg/WriteFile in L failed: {e}"))?;
+            let body =
+                fs::read_to_string(&rotated).map_err(|e| format!("ReadFile in L failed: {e}"))?;
+            if body != "ROTATED-OK" {
+                return Err(format!("unexpected rotated log body: {body:?}"));
+            }
+            fs::read_dir(&log_dir_c).map_err(|e| format!("ReadDir in L failed: {e}"))?;
+            fs::remove_file(&rotated).map_err(|e| format!("RemoveFile in L failed: {e}"))?;
+
+            // Docroot stays RO-only.
+            fs::read_to_string(docroot_c.join("index.html"))
+                .map_err(|e| format!("docroot ReadFile failed: {e}"))?;
+            if OpenOptions::new()
+                .write(true)
+                .open(docroot_c.join("index.html"))
+                .err()
+                .map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("docroot must deny WriteFile".to_owned());
+            }
+            // Outside ungranted dir denied.
+            if fs::read_to_string(outside_c.join("marker.txt"))
+                .err()
+                .map(|e| e.kind())
+                != Some(ErrorKind::PermissionDenied)
+            {
+                return Err("outside dir must deny ReadFile".to_owned());
+            }
+            Ok(())
+        })
+        .join()
+        .map_err(|_| "rotating-log-parity thread panicked")??;
+        return Ok(());
+    }
+
+    if !kernel_enforces_landlock()? {
+        eprintln!(
+            "skipping parity_rotating_log_parent_as_exact_socket_matches_015_policy_and_enforcement: host kernel lacks Landlock LSM"
+        );
+        return Ok(());
+    }
+
+    let tmp = TempDir::new("rl")?;
+    let log_dir = tmp.path.join("logs");
+    let www = tmp.path.join("www");
+    let outside = tmp.path.join("outside");
+    fs::create_dir_all(&log_dir)?;
+    fs::create_dir_all(&www)?;
+    fs::create_dir_all(&outside)?;
+    fs::write(www.join("index.html"), "DOCROOT-OK")?;
+    fs::write(outside.join("marker.txt"), "OUTSIDE-SECRET")?;
+
+    run_child(
+        "parity_rotating_log_parent_as_exact_socket_matches_015_policy_and_enforcement",
+        "rotating-log-parity",
+        &tmp.path,
+    )
+}

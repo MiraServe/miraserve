@@ -380,7 +380,7 @@ site "b.example.test" {{
     })?;
 
     let expected_warn = format!(
-        "exact unix socket path '{}' is not a socket (found {expected_type_label}): no Landlock rule installed for it; FastCGI or keyd requests to it will fail",
+        "exact unix socket path '{}' is not a socket (found {expected_type_label}): no socket rule installed for it; FastCGI or keyd requests to it fail while it is not a socket",
         bad_ep.display()
     );
     let captured = events
@@ -724,8 +724,18 @@ site "late.example.test" {{
         .spawn()?;
 
     let child_stdout = child.stdout.take().ok_or("missing child stdout")?;
+    let child_stderr = child.stderr.take().ok_or("missing child stderr")?;
     let mut child_stdin = child.stdin.take().ok_or("missing child stdin")?;
     let mut reader = BufReader::new(child_stdout);
+
+    // Drain child stderr concurrently from spawn onwards so a verbose child can never fill the
+    // stderr pipe buffer and deadlock before `child.wait()`.
+    let stderr_drainer = std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut stderr = child_stderr;
+        let _ = stderr.read_to_string(&mut buf);
+        buf
+    });
 
     // Wait until the confined child signals Landlock is active (no sleep).
     let mut ready_line = String::new();
@@ -733,13 +743,11 @@ site "late.example.test" {{
         ready_line.clear();
         let n = reader.read_line(&mut ready_line)?;
         if n == 0 {
-            let out = child.wait_with_output()?;
-            return Err(format!(
-                "child exited before READY (status={}): stderr={}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            )
-            .into());
+            let status = child.wait()?;
+            let err_buf = stderr_drainer.join().unwrap_or_default();
+            return Err(
+                format!("child exited before READY (status={status}): stderr={err_buf}").into(),
+            );
         }
         if ready_line.trim() == "READY" {
             break;
@@ -747,8 +755,8 @@ site "late.example.test" {{
     }
 
     // Now bind the late FastCGI responder inside `socket-tree` from the unconfined parent using a
-    // non-blocking UnixListener paired with child-exit monitoring (no sleep-based timeout: if the
-    // child exits after `BOUND` without connecting, fail immediately instead of hanging in accept).
+    // non-blocking UnixListener paired with child-exit monitoring and a bounded poll count so
+    // neither an early exit nor a stalled child can hang the test indefinitely.
     let std_listener = std::os::unix::net::UnixListener::bind(&late_sock)?;
     std_listener.set_nonblocking(true)?;
 
@@ -770,58 +778,67 @@ site "late.example.test" {{
         .enable_all()
         .build()?;
     let responder_res: TestResult = rt.block_on(async {
+        const MAX_ACCEPT_POLLS: usize = 300;
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
         let listener = UnixListener::from_std(std_listener)?;
-        if let Some(status) = child.try_wait()? {
-            let mut err_buf = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                let _ = stderr.read_to_string(&mut err_buf);
-            }
-            return Err(format!(
-                "child exited before connecting to late socket (status={status}): stderr={err_buf}"
-            )
-            .into());
-        }
-        let mut stream = tokio::select! {
-            biased;
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                stream
-            }
-            _ = &mut eof_rx => {
-                let status = child.wait()?;
-                let mut err_buf = String::new();
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_string(&mut err_buf);
-                }
+        let mut accepted_stream = None;
+        for _ in 0..MAX_ACCEPT_POLLS {
+            if let Some(status) = child.try_wait()? {
                 return Err(format!(
-                    "child exited without connecting to late socket (status={status}): stderr={err_buf}"
+                    "child exited before connecting to late socket (status={status})"
                 )
                 .into());
             }
-        };
-        let req_id = loop {
-            let rec = read_record(&mut stream).await?;
-            if rec.record_type == RecordType::Stdin && rec.content.is_empty() {
-                break rec.request_id;
+            tokio::select! {
+                biased;
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted?;
+                    accepted_stream = Some(stream);
+                    break;
+                }
+                _ = &mut eof_rx => {
+                    return Err("child closed stdout without connecting to late socket".into());
+                }
+                () = tokio::time::sleep(POLL_INTERVAL) => {}
             }
+        }
+        let Some(mut stream) = accepted_stream else {
+            return Err(format!(
+                "timed out after {MAX_ACCEPT_POLLS} polls waiting for child to connect to late socket"
+            )
+            .into());
         };
-        let payload = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nLATE-SOCKET-OK";
-        write_stream_records(&mut stream, RecordType::Stdout, req_id, payload, true).await?;
-        let end = EndRequestBody {
-            app_status: 0,
-            protocol_status: 0,
-        };
-        write_record(&mut stream, RecordType::EndRequest, req_id, &end.encode()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let req_id = loop {
+                let rec = read_record(&mut stream).await?;
+                if rec.record_type == RecordType::Stdin && rec.content.is_empty() {
+                    break rec.request_id;
+                }
+            };
+            let payload = b"Status: 200 OK\r\nContent-Type: text/plain\r\n\r\nLATE-SOCKET-OK";
+            write_stream_records(&mut stream, RecordType::Stdout, req_id, payload, true).await?;
+            let end = EndRequestBody {
+                app_status: 0,
+                protocol_status: 0,
+            };
+            write_record(&mut stream, RecordType::EndRequest, req_id, &end.encode()).await?;
+            Ok::<(), Box<dyn std::error::Error>>(())
+        })
+        .await
+        .map_err(|_| "timed out exchanging FastCGI records on late socket")??;
         Ok(())
     });
 
+    if responder_res.is_err() && child.try_wait()?.is_none() {
+        let _ = child.kill();
+    }
     let status = child.wait()?;
     let _ = eof_watcher.join();
-    let mut err_buf = String::new();
-    if let Some(mut stderr) = child.stderr.take() {
-        stderr.read_to_string(&mut err_buf)?;
+    let err_buf = stderr_drainer.join().unwrap_or_default();
+    if let Err(err) = responder_res {
+        return Err(format!("{err} (child status={status}): stderr={err_buf}").into());
     }
-    responder_res?;
     if !status.success() {
         return Err(format!("child failed (status={status}): stderr={err_buf}").into());
     }
@@ -1005,7 +1022,7 @@ site "acme.example.test" {{
         .map_err(|_| "shadow thread 2 panicked")??;
 
         let expected_warn = format!(
-            "unix socket path '{}' is not a socket (found directory) and the same path is configured for another use: the 0.1.5 access rule is kept; give the socket its own path",
+            "unix socket path '{}' is not a socket (found directory) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path",
             shadow_dir.display()
         );
         let captured = events
@@ -1025,7 +1042,7 @@ site "acme.example.test" {{
         assert!(
             captured
                 .iter()
-                .all(|(_, msg)| !msg.contains("no Landlock rule installed")),
+                .all(|(_, msg)| !msg.contains("no socket rule installed")),
             "shadowed path must not emit the pure-skip WARN: {captured:?}"
         );
         return Ok(());
@@ -1248,7 +1265,7 @@ site "two.example.test" {{
         })?;
 
         let expected_warn = format!(
-            "unix socket path '{}' is not a socket (found directory) and the same path is configured for another use: the 0.1.5 access rule is kept; give the socket its own path",
+            "unix socket path '{}' is not a socket (found directory) and the same path is also configured as a directory grant: the 0.1.5 access rule is kept; give the socket its own path",
             site1_root.display()
         );
         let captured = events
@@ -1268,7 +1285,7 @@ site "two.example.test" {{
         assert!(
             captured
                 .iter()
-                .all(|(_, msg)| !msg.contains("no Landlock rule installed")),
+                .all(|(_, msg)| !msg.contains("no socket rule installed")),
             "shadowed site root must not emit pure-skip WARN: {captured:?}"
         );
         return Ok(());
