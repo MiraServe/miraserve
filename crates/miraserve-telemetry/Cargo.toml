@@ -1,0 +1,26 @@
+[package]
+name = "miraserve-telemetry"
+description = "Lock-free Prometheus metrics, OTLP/HTTP JSON export, and secret-redacting access/audit logs for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+miraserve-config.workspace = true
+miraserve-tls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

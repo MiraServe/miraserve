@@ -1,0 +1,4 @@
+{{status}} {{reason}}
+
+{{detail_plain}}
+Request ID: {{request_id}}

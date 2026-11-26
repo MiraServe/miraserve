@@ -1,0 +1,231 @@
+{
+  "400": {
+    "reason": "Bad Request",
+    "kind": "client",
+    "heading": "The request couldn’t be understood",
+    "explanation": "The server couldn’t read the request for <code>{{path}}</code>. It may be malformed or corrupted on the way.",
+    "tips": [
+      "Check the address and try again.",
+      "Clear your browser’s cache and cookies for this site.",
+      "If you sent a form, go back and submit it again."
+    ],
+    "actions": [
+      [
+        "Go to homepage",
+        "/"
+      ],
+      [
+        "Try again",
+        ""
+      ]
+    ]
+  },
+  "401": {
+    "reason": "Unauthorized",
+    "kind": "client",
+    "heading": "Please sign in to continue",
+    "explanation": "You need to sign in before you can open <code>{{path}}</code> on {{host}}.",
+    "tips": [
+      "Sign in, then try again.",
+      "If you are signed in, your session may have expired."
+    ],
+    "actions": [
+      [
+        "Sign in",
+        "{{login_url}}"
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "403": {
+    "reason": "Forbidden",
+    "kind": "client",
+    "heading": "You don’t have access to this page",
+    "explanation": "The server understood the request for <code>{{path}}</code> but is not allowed to show it to you.",
+    "tips": [
+      "If you should have access, sign in and try again.",
+      "Ask the site owner for permission, and include the request ID below."
+    ],
+    "actions": [
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "404": {
+    "reason": "Not Found",
+    "kind": "client",
+    "heading": "We can’t find that page",
+    "explanation": "There is nothing at <code>{{path}}</code> on {{host}}. The page may have moved or been deleted, or the link may have a typo.",
+    "tips": [
+      "Check the address for spelling mistakes.",
+      "Start again from the homepage.",
+      "If a link on another site brought you here, let that site know."
+    ],
+    "actions": [
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "405": {
+    "reason": "Method Not Allowed",
+    "kind": "client",
+    "heading": "That action isn’t allowed here",
+    "explanation": "<code>{{path}}</code> doesn’t accept {{method}} requests.",
+    "tips": [
+      "Go back and try the action again from the page.",
+      "Developers: check the Allow header for supported methods."
+    ],
+    "actions": [
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "408": {
+    "reason": "Request Timeout",
+    "kind": "client",
+    "heading": "The request took too long",
+    "explanation": "The server waited too long for your request to finish arriving, so it closed the connection.",
+    "tips": [
+      "Check your internet connection.",
+      "Try again."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "413": {
+    "reason": "Content Too Large",
+    "kind": "client",
+    "heading": "That upload is too large",
+    "explanation": "The file or form you sent is bigger than this site allows.",
+    "tips": [
+      "Make the file smaller, or split it into parts.",
+      "Ask the site owner what the upload limit is."
+    ],
+    "actions": [
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "429": {
+    "reason": "Too Many Requests",
+    "kind": "client",
+    "heading": "Slow down a little",
+    "explanation": "You sent a lot of requests in a short time, so this site is asking you to pause. Rate limits protect the site from overload and abuse.",
+    "tips": [
+      "Wait for the timer, then try again.",
+      "Avoid refreshing the page repeatedly.",
+      "Running a script or bot? Lower its request rate, or sign your requests with Web Bot Auth."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ],
+    "extra": "retry"
+  },
+  "500": {
+    "reason": "Internal Server Error",
+    "kind": "server",
+    "heading": "Something went wrong on our side",
+    "explanation": "The server hit an unexpected problem and couldn’t finish your request. For your security, no technical details are shown here; the site owner can find them in the server log using the request ID.",
+    "tips": [
+      "Refresh the page in a moment.",
+      "If the problem continues, contact the site owner and include the request ID."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ]
+  },
+  "502": {
+    "reason": "Bad Gateway",
+    "kind": "server",
+    "heading": "The site’s application isn’t responding",
+    "explanation": "MiraServe received your request, but the application behind this site could not be reached or sent back an invalid response. This is usually temporary.",
+    "tips": [
+      "Wait a minute, then refresh the page.",
+      "If it keeps happening, contact the site owner and include the request ID."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ],
+    "extra": "upstream_chain",
+    "upstream_state": "Invalid response"
+  },
+  "503": {
+    "reason": "Service Unavailable",
+    "kind": "server",
+    "heading": "This site is temporarily unavailable",
+    "explanation": "The site is down for maintenance or is too busy right now. Please try again shortly.",
+    "tips": [
+      "Try again in a few minutes.",
+      "Check the site’s social channels for updates."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ]
+    ],
+    "extra": "retry"
+  },
+  "504": {
+    "reason": "Gateway Timeout",
+    "kind": "server",
+    "heading": "The site took too long to respond",
+    "explanation": "MiraServe waited for the application behind this site, but it didn’t answer in time.",
+    "tips": [
+      "Wait a minute, then refresh the page.",
+      "If it keeps happening, contact the site owner and include the request ID."
+    ],
+    "actions": [
+      [
+        "Try again",
+        ""
+      ],
+      [
+        "Go to homepage",
+        "/"
+      ]
+    ],
+    "extra": "upstream_chain",
+    "upstream_state": "Timed out"
+  }
+}

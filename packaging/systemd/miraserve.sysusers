@@ -1,0 +1,4 @@
+# systemd-sysusers(5) configuration for MiraServe
+#Type Name           ID GECOS                                                  Home directory     Shell
+u     miraserve      -  "MiraServe HTTP/QUIC unprivileged service account"     /var/lib/miraserve /usr/sbin/nologin
+u     miraserve-keyd -  "MiraServe split-privilege TLS signing vault account"  /nonexistent       /usr/sbin/nologin

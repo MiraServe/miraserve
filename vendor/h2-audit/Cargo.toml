@@ -1,0 +1,12 @@
+[package]
+name = "miraserve-h2-audit"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Isolated registry-only manifest so cargo-deny checks RustSec advisories against crates.io h2 at the exact vendored version."
+
+# Keep isolated from the parent MiraServe workspace and its [patch.crates-io].
+[workspace]
+
+[dependencies]
+h2 = "=0.4.21"

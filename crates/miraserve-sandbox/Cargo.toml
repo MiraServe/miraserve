@@ -1,0 +1,32 @@
+[package]
+name = "miraserve-sandbox"
+description = "Cross-platform OS confinement (Linux Landlock LSM + seccomp-bpf) for MiraServe workers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enables hidden RAII override hooks used by cross-crate HTTP/2 integration tests (including
+# `--release` test builds). Disabled by default: never compiled into shipped binaries.
+test-h2-hooks = []
+
+[dependencies]
+miraserve-config.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+seccompiler.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true

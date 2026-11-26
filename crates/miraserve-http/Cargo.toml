@@ -1,0 +1,57 @@
+[package]
+name = "miraserve-http"
+description = "HTTP/1.1, HTTP/2 (hyper), and HTTP/3 (quinn/h3) server engine, site router, and security headers for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enables hidden RAII override/injection hooks used by cross-crate HTTP/2 integration tests
+# (including `--release` test builds). Disabled by default: never compiled into shipped binaries.
+test-h2-hooks = ["miraserve-static/test-h2-hooks", "miraserve-proxy/test-h2-hooks"]
+
+[dependencies]
+regex.workspace = true
+arc-swap.workspace = true
+aws-lc-rs.workspace = true
+bcrypt.workspace = true
+base64.workspace = true
+bytes.workspace = true
+h3.workspace = true
+futures-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+miraserve-ai.workspace = true
+miraserve-config.workspace = true
+miraserve-fastcgi.workspace = true
+miraserve-proxy.workspace = true
+miraserve-publish.workspace = true
+miraserve-security.workspace = true
+miraserve-static.workspace = true
+miraserve-telemetry.workspace = true
+miraserve-tls.workspace = true
+miraserve-wasm.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+socket2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The crate's own Linux tests call miraserve-static's test-only hooks. Without this, they are
+# present only when the whole workspace is built together (miraserve-core's dev-dependencies
+# enable the feature), and `cargo test -p miraserve-http` does not compile on Linux.
+miraserve-static = { workspace = true, features = ["test-h2-hooks"] }
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true

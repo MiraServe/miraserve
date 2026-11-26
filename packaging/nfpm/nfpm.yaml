@@ -1,0 +1,93 @@
+# nFPM v2 package definition for Linux .deb (Debian/Ubuntu) and .rpm (RHEL/Fedora/Alma/Rocky)
+# Render placeholders before invoking nfpm (nfpm v2.41 does not expand ${VAR} inside contents[].src):
+#   sed -e "s|\${MIRASERVE_VERSION}|0.1.5|g" \
+#       -e "s|\${MIRASERVE_ARCH}|amd64|g" \
+#       -e "s|\${MIRASERVE_BIN}|dist/bin/miraserve-x86_64-unknown-linux-gnu|g" \
+#       packaging/nfpm/nfpm.yaml > /tmp/nfpm-rendered.yaml && \
+#     nfpm package --config /tmp/nfpm-rendered.yaml --packager deb --target dist/
+name: "miraserve"
+arch: "${MIRASERVE_ARCH}"
+platform: "linux"
+version: "${MIRASERVE_VERSION}"
+version_schema: "semver"
+section: "httpd"
+priority: "optional"
+# No address until the project publishes one it reads: a package must not point at a
+# mailbox that does not exist (0.1.1 named a domain that does not resolve).
+maintainer: "MiraServe Authors"
+description: |
+  MiraServe — memory-safe, zero-trust, post-quantum HTTPS & AI-native web server.
+  Ships with TLS 1.3 + X25519MLKEM768 PQC hybrid key exchange, HTTP/1.1/2/3,
+  dual-stack IPv4+IPv6, cap-std static confinement, Linux Landlock/seccomp-bpf,
+  FastCGI PHP-FPM support, atomic signed AI site publishing, RFC 9421 Web Bot Auth,
+  MCP security gateway, split-privilege keyd, and Wasmtime wasi:http plugins.
+vendor: "MiraServe"
+homepage: "https://miraserve.org"
+license: "Apache-2.0 OR MIT"
+
+contents:
+  - src: "${MIRASERVE_BIN}"
+    dst: "/usr/bin/miraserve"
+    file_info:
+      mode: 0755
+
+  - src: "packaging/systemd/miraserve.service"
+    dst: "/usr/lib/systemd/system/miraserve.service"
+    file_info:
+      mode: 0644
+
+  - src: "packaging/systemd/miraserve-keyd.service"
+    dst: "/usr/lib/systemd/system/miraserve-keyd.service"
+    file_info:
+      mode: 0644
+
+  - src: "packaging/systemd/miraserve.sysusers"
+    dst: "/usr/lib/sysusers.d/miraserve.conf"
+    file_info:
+      mode: 0644
+
+  - src: "packaging/systemd/miraserve.tmpfiles"
+    dst: "/usr/lib/tmpfiles.d/miraserve.conf"
+    file_info:
+      mode: 0644
+
+  # R5-PKG-1: Ship the starter config as a read-only template under /usr/share/miraserve/
+  # instead of unpacking directly into /etc/miraserve/conf/miraserve.kdl, so postinstall can
+  # migrate legacy /etc/miraserve/miraserve.kdl on upgrades before falling back to the starter.
+  - src: "packaging/nfpm/miraserve.kdl"
+    dst: "/usr/share/miraserve/starter.kdl"
+    file_info:
+      mode: 0644
+
+  - src: "packaging/nfpm/index.html"
+    dst: "/var/www/miraserve/index.html"
+    type: "config|noreplace"
+    file_info:
+      owner: "root"
+      group: "root"
+      mode: 0644
+
+  - src: "examples/miraserve.kdl"
+    dst: "/usr/share/doc/miraserve/examples/miraserve.kdl"
+    file_info:
+      mode: 0644
+
+  - src: "LICENSE-APACHE"
+    dst: "/usr/share/doc/miraserve/LICENSE-APACHE"
+    file_info:
+      mode: 0644
+
+  - src: "LICENSE-MIT"
+    dst: "/usr/share/doc/miraserve/LICENSE-MIT"
+    file_info:
+      mode: 0644
+
+  - src: "vendor/h2/LICENSE"
+    dst: "/usr/share/doc/miraserve/LICENSE-h2-MIT"
+    file_info:
+      mode: 0644
+
+scripts:
+  postinstall: "packaging/systemd/postinstall.sh"
+  preremove: "packaging/systemd/preremove.sh"
+  postremove: "packaging/systemd/postremove.sh"

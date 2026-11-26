@@ -1,0 +1,39 @@
+[package]
+name = "miraserve-bin"
+description = "MiraServe CLI binary — memory-safe, post-quantum, AI-native web server & edge gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "miraserve"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+miette = { workspace = true, features = ["fancy"] }
+miraserve-config.workspace = true
+miraserve-core.workspace = true
+miraserve-migrate.workspace = true
+miraserve-publish.workspace = true
+miraserve-tls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+rustls-pki-types.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+seccompiler.workspace = true

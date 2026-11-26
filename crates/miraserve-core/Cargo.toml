@@ -1,0 +1,52 @@
+[package]
+name = "miraserve-core"
+description = "Network listeners (TCP/TLS + UDP/QUIC), connection supervisor, hot reload, and graceful drain for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+miraserve-config.workspace = true
+miraserve-http.workspace = true
+miraserve-sandbox.workspace = true
+miraserve-telemetry.workspace = true
+miraserve-tls.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+aws-lc-rs.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+miraserve-ai.workspace = true
+miraserve-fastcgi.workspace = true
+miraserve-http = { workspace = true, features = ["test-h2-hooks"] }
+miraserve-publish.workspace = true
+miraserve-sandbox = { workspace = true, features = ["test-h2-hooks"] }
+miraserve-static = { workspace = true, features = ["test-h2-hooks"] }
+rcgen.workspace = true
+rustls-pki-types.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+miraserve-static = { workspace = true, features = ["test-pool-counter"] }
+seccompiler.workspace = true

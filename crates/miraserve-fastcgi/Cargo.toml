@@ -1,0 +1,21 @@
+[package]
+name = "miraserve-fastcgi"
+description = "Pure-Rust async FastCGI v1.0 client for isolated PHP-FPM and WordPress hosting in MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+miraserve-config.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

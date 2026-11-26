@@ -1,0 +1,14 @@
+/target
+Cargo.lock.bak
+**/*.rs.bk
+*.pdb
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+!examples/*.pem
+/fuzz/artifacts
+/fuzz/corpus
+/fuzz/target
+/fuzz/Cargo.lock

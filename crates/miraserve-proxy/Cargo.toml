@@ -1,0 +1,37 @@
+[package]
+name = "miraserve-proxy"
+description = "Streaming reverse proxy pool with health checks, immediate SSE flush, WebSocket upgrade, and upstream mTLS for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enables hidden RAII observation hooks used by cross-crate worker-pool integration tests.
+# Disabled by default: never compiled into shipped binaries.
+test-h2-hooks = []
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-rustls.workspace = true
+hyper-util.workspace = true
+miraserve-config.workspace = true
+miraserve-security.workspace = true
+miraserve-tls.workspace = true
+rustls.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-service.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio-rustls.workspace = true

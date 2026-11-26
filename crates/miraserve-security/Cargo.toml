@@ -1,0 +1,23 @@
+[package]
+name = "miraserve-security"
+description = "HTTP anti-smuggling normalizer, H2/H3 flood guard, GCRA rate limiter, and site hardening presets for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+miraserve-config.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

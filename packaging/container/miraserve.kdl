@@ -1,0 +1,24 @@
+// MiraServe Default Rootless Distroless Container Configuration
+// Runs unprivileged as UID 65532:65532 on dual-stack IPv4+IPv6 :8443 (HTTPS H3/H2/H1) and :8080 (HTTP->HTTPS 308).
+// Override by mounting your own KDL file at /etc/miraserve/miraserve.kdl.
+
+server {
+    listen ":8443" protocols="h3,h2,h1"
+    listen ":8080" redirect-https=#true
+
+    tls {
+        min-version "1.3"
+        pqc-hybrid #true
+        key-isolation "in-process"
+    }
+
+    sandbox {
+        landlock #true
+        seccomp "strict"
+    }
+}
+
+site "localhost" {
+    security-headers "strict"
+    root "/var/www/html"
+}

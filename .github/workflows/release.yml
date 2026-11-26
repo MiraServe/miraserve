@@ -1,0 +1,628 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Dry-run version label (does not publish a GitHub Release)"
+        required: false
+        default: "v0.0.0-dryrun"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+  NFPM_VERSION: "2.49.0"
+  NFPM_LINUX_AMD64_SHA256: "2afaa5ffb5e3493402e31e7c67a5a1fb42133e3f66fc315ca0051934125561c7"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Archive, Supply-Chain & Panel Build Verification
+    runs-on: ubuntu-latest
+    outputs:
+      source_archive_sha256: ${{ steps.freeze-archive.outputs.sha256 }}
+    env:
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+      - name: Verify release tag is reachable from origin/main
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "ERROR: release tag commit $(git rev-parse HEAD) is not an ancestor of origin/main" >&2
+            exit 1
+          fi
+      - name: Generate and freeze canonical source archive once from tag/HEAD (before any compilation)
+        id: freeze-archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p src-dist src-work
+          ARCHIVE_NAME="miraserve-${TAG_NAME}-src.tar.gz"
+          SRC_ARCHIVE="src-dist/${ARCHIVE_NAME}"
+          git archive --format=tar.gz --prefix="miraserve-${TAG_NAME}/" HEAD -o "${SRC_ARCHIVE}"
+          (cd src-dist && sha256sum "${ARCHIVE_NAME}") > "src-dist/${ARCHIVE_NAME}.sha256"
+          SRC_SHA=$(awk '{print $1}' "src-dist/${ARCHIVE_NAME}.sha256")
+          if [[ ! "${SRC_SHA}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: unexpected source archive SHA-256 '${SRC_SHA}'" >&2
+            exit 1
+          fi
+          cat "src-dist/${ARCHIVE_NAME}.sha256"
+          echo "sha256=${SRC_SHA}" >> "${GITHUB_OUTPUT}"
+          tar -xzf "${SRC_ARCHIVE}" -C src-work
+          test -d "src-work/miraserve-${TAG_NAME}"
+          ENTRIES=$(find src-work -mindepth 1 -maxdepth 1 | wc -l | awk '{print $1}')
+          if [ "${ENTRIES}" -ne 1 ]; then
+            echo "ERROR: source archive extracted ${ENTRIES} top-level entries (expected 1)" >&2
+            exit 1
+          fi
+      - name: Upload frozen canonical source archive & digest (before any compilation)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: source-archive
+          path: |
+            src-dist/miraserve-${{ env.TAG_NAME }}-src.tar.gz
+            src-dist/miraserve-${{ env.TAG_NAME }}-src.tar.gz.sha256
+          if-no-files-found: error
+      - name: Verify Homebrew formula matches publishing repository and tag
+        env:
+          EXPECTED_SRC_SHA256: ${{ steps.freeze-archive.outputs.sha256 }}
+          PUBLISH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="src-work/miraserve-${TAG_NAME}"
+          FORMULA="${ROOT}/packaging/homebrew/miraserve.rb"
+          grep -Fq 'prefix.install "vendor/h2/LICENSE" => "LICENSE-h2-MIT"' "${FORMULA}"
+          test -f "${ROOT}/vendor/h2/LICENSE"
+          HOMEPAGE_LINE=$(sed -n 's/^[[:space:]]*homepage "\([^"]*\)"[[:space:]]*$/\1/p' "${FORMULA}")
+          URL_LINE=$(sed -n 's/^[[:space:]]*url "\([^"]*\)"[[:space:]]*$/\1/p' "${FORMULA}")
+          SHA_LINE=$(sed -n 's/^[[:space:]]*sha256 "\([^"]*\)"[[:space:]]*$/\1/p' "${FORMULA}")
+          HEAD_LINE=$(sed -n 's/^[[:space:]]*head "\([^"]*\)",.*$/\1/p' "${FORMULA}")
+          if [ -z "${HOMEPAGE_LINE}" ] || [ -z "${URL_LINE}" ] || [ -z "${SHA_LINE}" ] || [ -z "${HEAD_LINE}" ]; then
+            echo "ERROR: packaging/homebrew/miraserve.rb missing homepage, url, sha256, or head line" >&2
+            exit 1
+          fi
+          TEMPLATE_HOMEPAGE="https://github.com/REPLACE_WITH_GITHUB_REPOSITORY"
+          TEMPLATE_URL="https://github.com/REPLACE_WITH_GITHUB_REPOSITORY/releases/download/REPLACE_WITH_RELEASE_TAG/miraserve-REPLACE_WITH_RELEASE_TAG-src.tar.gz"
+          TEMPLATE_HEAD="https://github.com/REPLACE_WITH_GITHUB_REPOSITORY.git"
+          EXPECTED_HOMEPAGE="https://github.com/${PUBLISH_REPO}"
+          EXPECTED_RELEASE_URL="https://github.com/${PUBLISH_REPO}/releases/download/${TAG_NAME}/miraserve-${TAG_NAME}-src.tar.gz"
+          EXPECTED_TAG_URL="https://github.com/${PUBLISH_REPO}/archive/refs/tags/${TAG_NAME}.tar.gz"
+          EXPECTED_HEAD="https://github.com/${PUBLISH_REPO}.git"
+          if [ "${URL_LINE}" = "${TEMPLATE_URL}" ]; then
+            if [ "${HOMEPAGE_LINE}" != "${TEMPLATE_HOMEPAGE}" ]; then
+              echo "ERROR: template formula homepage '${HOMEPAGE_LINE}' != '${TEMPLATE_HOMEPAGE}'" >&2
+              exit 1
+            fi
+            if [ "${HEAD_LINE}" != "${TEMPLATE_HEAD}" ]; then
+              echo "ERROR: template formula head '${HEAD_LINE}' != '${TEMPLATE_HEAD}'" >&2
+              exit 1
+            fi
+            if [ "${SHA_LINE}" != "REPLACE_WITH_SOURCE_TARBALL_SHA256" ]; then
+              echo "ERROR: template formula must keep REPLACE_WITH_SOURCE_TARBALL_SHA256 (got '${SHA_LINE}')" >&2
+              exit 1
+            fi
+          elif [ "${URL_LINE}" = "${EXPECTED_RELEASE_URL}" ] || [ "${URL_LINE}" = "${EXPECTED_TAG_URL}" ]; then
+            if [ "${HOMEPAGE_LINE}" != "${EXPECTED_HOMEPAGE}" ]; then
+              echo "ERROR: formula homepage '${HOMEPAGE_LINE}' != '${EXPECTED_HOMEPAGE}'" >&2
+              exit 1
+            fi
+            if [ "${HEAD_LINE}" != "${EXPECTED_HEAD}" ]; then
+              echo "ERROR: formula head '${HEAD_LINE}' != '${EXPECTED_HEAD}'" >&2
+              exit 1
+            fi
+            if [ "${SHA_LINE}" != "${EXPECTED_SRC_SHA256}" ]; then
+              echo "ERROR: formula sha256 '${SHA_LINE}' != frozen source archive sha256 '${EXPECTED_SRC_SHA256}' for ${TAG_NAME}" >&2
+              exit 1
+            fi
+          else
+            echo "ERROR: formula url '${URL_LINE}' does not match publishing repository '${PUBLISH_REPO}' and tag '${TAG_NAME}'" >&2
+            exit 1
+          fi
+      - name: Verify vendor/h2 provenance on extracted archive (before compilation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "src-work/miraserve-${TAG_NAME}/scripts/verify-vendor-h2.sh"
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+      - name: Verify per-target Cargo h2 graph on extracted archive (before compilation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          "src-work/miraserve-${TAG_NAME}/scripts/verify-h2-graph.sh"
+      - name: Install pinned cargo-deny and audit extracted archive (before compilation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-deny --version 0.20.2
+          ROOT="src-work/miraserve-${TAG_NAME}"
+          cargo deny --locked --manifest-path "${ROOT}/Cargo.toml" --config "${ROOT}/deny.toml" check
+          "${ROOT}/scripts/audit-vendor-h2.sh"
+      - name: Provision alternate compatible h2 archive and run tamper suite on extracted archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="src-work/miraserve-${TAG_NAME}"
+          ACTIVE_MODE=$(sed -n 's/^H2_SOURCE_MODE=//p' "${ROOT}/vendor/h2-source.env")
+          ACTIVE_VER=$(sed -n 's/^H2_VERSION=//p' "${ROOT}/vendor/h2-source.env")
+          if [ "${ACTIVE_MODE}" = "vendored" ]; then
+            if [ "${ACTIVE_VER}" = "0.4.15" ]; then
+              ALT_VER="0.4.20"
+              ALT_SHA="7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+            else
+              ALT_VER="0.4.15"
+              ALT_SHA="6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+            fi
+            ALT_PATH="${RUNNER_TEMP}/h2-${ALT_VER}.crate"
+            curl -fsSL --proto '=https' --tlsv1.2 -o "${ALT_PATH}" \
+              "https://static.crates.io/crates/h2/h2-${ALT_VER}.crate"
+            printf '%s  %s\n' "${ALT_SHA}" "${ALT_PATH}" | sha256sum -c -
+            H2_ALT_CRATE_ARCHIVE="${ALT_PATH}" H2_REQUIRE_ALT_PIN=1 \
+              "${ROOT}/scripts/test-verify-vendor-h2.sh"
+          else
+            "${ROOT}/scripts/test-verify-vendor-h2.sh"
+          fi
+      - name: Run quality gates and exact panel build from extracted archive root
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "src-work/miraserve-${TAG_NAME}"
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo test --workspace --all-targets --locked
+          RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+          cargo +1.95.0 build --release --locked --bin miraserve
+          ./target/release/miraserve version
+      - name: Re-verify frozen source archive against recorded pre-compile digest
+        env:
+          EXPECTED_SRC_SHA256: ${{ steps.freeze-archive.outputs.sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_ARCHIVE="src-dist/miraserve-${TAG_NAME}-src.tar.gz"
+          ACTUAL_SHA=$(sha256sum "${SRC_ARCHIVE}" | awk '{print $1}')
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: source archive digest drifted during verify job (${ACTUAL_SHA} != ${EXPECTED_SRC_SHA256})" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: miraserve
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+            bin: miraserve
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin: miraserve
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin: miraserve
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: miraserve.exe
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      EXPECTED_SRC_SHA256: ${{ needs.verify.outputs.source_archive_sha256 }}
+    steps:
+      - name: Download verified source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: source-archive
+          path: src-dist
+      - name: Verify downloaded source archive against verify job output and extract (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SRC_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: missing or malformed verify job output source_archive_sha256" >&2
+            exit 1
+          fi
+          ARCHIVE="miraserve-${TAG_NAME}-src.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL_SHA=$(sha256sum "src-dist/${ARCHIVE}" | awk '{print $1}')
+          else
+            ACTUAL_SHA=$(shasum -a 256 "src-dist/${ARCHIVE}" | awk '{print $1}')
+          fi
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: downloaded source archive SHA-256 '${ACTUAL_SHA}' != verify job output '${EXPECTED_SRC_SHA256}'" >&2
+            exit 1
+          fi
+          mkdir -p src-work
+          tar -xzf "src-dist/${ARCHIVE}" -C src-work
+          test -d "src-work/miraserve-${TAG_NAME}"
+      - name: Verify downloaded source archive against verify job output and extract (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Archive = "miraserve-$env:TAG_NAME-src.tar.gz"
+          $Expected = $env:EXPECTED_SRC_SHA256.Trim().ToLowerInvariant()
+          if ($Expected -notmatch '^[0-9a-f]{64}$') {
+            throw "Missing or malformed verify job output source_archive_sha256: '$Expected'"
+          }
+          $Actual = (Get-FileHash -Algorithm SHA256 "src-dist/$Archive").Hash.ToLowerInvariant()
+          if ($Actual -ne $Expected) {
+            throw "Downloaded source archive SHA-256 mismatch against verify job output: expected $Expected, got $Actual"
+          }
+          New-Item -ItemType Directory -Force -Path src-work | Out-Null
+          tar -xzf "src-dist/$Archive" -C src-work
+          if (-not (Test-Path "src-work/miraserve-$env:TAG_NAME")) {
+            throw "Extracted source directory missing"
+          }
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Build release binary from verified archive (clean, uncached)
+        working-directory: src-work/miraserve-${{ env.TAG_NAME }}
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin miraserve
+      - name: Package release archive & digest (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "src-work/miraserve-${TAG_NAME}"
+          STAGE="dist/miraserve-${TAG_NAME}-${TARGET}"
+          mkdir -p "${STAGE}" dist/bin dist/digests
+          cp "target/${TARGET}/release/miraserve" "${STAGE}/miraserve"
+          cp "target/${TARGET}/release/miraserve" "dist/bin/miraserve-${TARGET}"
+          chmod 0755 "${STAGE}/miraserve" "dist/bin/miraserve-${TARGET}"
+          cp LICENSE-APACHE LICENSE-MIT README.md examples/miraserve.kdl "${STAGE}/"
+          cp vendor/h2/LICENSE "${STAGE}/LICENSE-h2-MIT"
+          ARCHIVE="miraserve-${TAG_NAME}-${TARGET}.tar.gz"
+          tar -C dist -czf "dist/${ARCHIVE}" "miraserve-${TAG_NAME}-${TARGET}"
+          rm -rf "${STAGE}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${ARCHIVE}") > "dist/digests/${TARGET}.sha256"
+          else
+            (cd dist && shasum -a 256 "${ARCHIVE}") > "dist/digests/${TARGET}.sha256"
+          fi
+      - name: Package release archive & digest (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location "src-work/miraserve-$env:TAG_NAME"
+          $Stage = "dist/miraserve-$env:TAG_NAME-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path $Stage, "dist/digests" | Out-Null
+          Copy-Item "target/$env:TARGET/release/miraserve.exe" "$Stage/miraserve.exe"
+          Copy-Item LICENSE-APACHE, LICENSE-MIT, README.md, examples/miraserve.kdl, packaging/windows/install-miraserve-service.ps1 $Stage
+          Copy-Item vendor/h2/LICENSE "$Stage/LICENSE-h2-MIT"
+          $Archive = "miraserve-$env:TAG_NAME-$env:TARGET.zip"
+          Compress-Archive -Path "$Stage/*" -DestinationPath "dist/$Archive" -Force
+          Remove-Item -Recurse -Force $Stage
+          $Hash = (Get-FileHash -Algorithm SHA256 "dist/$Archive").Hash.ToLowerInvariant()
+          "$Hash  $Archive" | Set-Content -NoNewline -Encoding ascii "dist/digests/$env:TARGET.sha256"
+          "`n" | Add-Content -NoNewline -Encoding ascii "dist/digests/$env:TARGET.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            src-work/miraserve-${{ env.TAG_NAME }}/dist/*.tar.gz
+            src-work/miraserve-${{ env.TAG_NAME }}/dist/*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: digest-${{ matrix.target }}
+          path: src-work/miraserve-${{ env.TAG_NAME }}/dist/digests/${{ matrix.target }}.sha256
+          if-no-files-found: error
+      - name: Upload Linux binary for .deb/.rpm packaging
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-bin-${{ matrix.target }}
+          path: src-work/miraserve-${{ env.TAG_NAME }}/dist/bin/miraserve-${{ matrix.target }}
+          if-no-files-found: error
+
+  linux-packages:
+    name: Build Linux .deb & .rpm (nFPM)
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      EXPECTED_SRC_SHA256: ${{ needs.verify.outputs.source_archive_sha256 }}
+    steps:
+      - name: Download verified source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: source-archive
+          path: src-dist
+      - name: Verify downloaded source archive against verify job output and extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SRC_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: missing or malformed verify job output source_archive_sha256" >&2
+            exit 1
+          fi
+          ARCHIVE="miraserve-${TAG_NAME}-src.tar.gz"
+          ACTUAL_SHA=$(sha256sum "src-dist/${ARCHIVE}" | awk '{print $1}')
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: downloaded source archive SHA-256 '${ACTUAL_SHA}' != verify job output '${EXPECTED_SRC_SHA256}'" >&2
+            exit 1
+          fi
+          mkdir -p src-work
+          tar -xzf "src-dist/${ARCHIVE}" -C src-work
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: linux-bin-*
+          path: src-work/miraserve-${{ env.TAG_NAME }}/dist/bin
+          merge-multiple: true
+      - name: Install verified nFPM binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_LINUX_AMD64_SHA256}  /tmp/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/nfpm.tar.gz -C /tmp nfpm
+          chmod 0755 /tmp/nfpm
+      - name: Package .deb and .rpm for amd64 & arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "src-work/miraserve-${TAG_NAME}"
+          VERSION="${TAG_NAME#v}"
+          mkdir -p dist/packages
+          chmod 0755 dist/bin/miraserve-* packaging/systemd/postinstall.sh packaging/systemd/preremove.sh packaging/systemd/postremove.sh
+          for spec in "amd64:x86_64-unknown-linux-gnu" "arm64:aarch64-unknown-linux-gnu"; do
+            ARCH="${spec%%:*}"
+            TRIPLE="${spec##*:}"
+            BIN_PATH="dist/bin/miraserve-${TRIPLE}"
+            # nfpm v2.41 does not expand ${VAR} inside contents[].src; render concrete values first.
+            sed \
+              -e "s|\${MIRASERVE_VERSION}|${VERSION}|g" \
+              -e "s|\${MIRASERVE_ARCH}|${ARCH}|g" \
+              -e "s|\${MIRASERVE_BIN}|${BIN_PATH}|g" \
+              packaging/nfpm/nfpm.yaml > /tmp/nfpm-rendered.yaml
+            for pkg in deb rpm; do
+              /tmp/nfpm package --config /tmp/nfpm-rendered.yaml --packager "${pkg}" --target dist/packages/
+            done
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-packages
+          path: src-work/miraserve-${{ env.TAG_NAME }}/dist/packages/*
+          if-no-files-found: error
+
+  sbom-sign-release:
+    name: SBOM, Checksums, Cosign, SLSA Build L2 Provenance & Publish
+    needs: [verify, build, linux-packages]
+    environment: release
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      EXPECTED_SRC_SHA256: ${{ needs.verify.outputs.source_archive_sha256 }}
+      PUBLISH_REPO: ${{ github.repository }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified source archive (not regenerated)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: source-archive
+          path: src-dist
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: digest-*
+          path: build-digests
+          merge-multiple: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: linux-packages
+          path: release-assets
+      - name: Verify downloaded binary and source archives against build digests and verify job output
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SRC_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: missing or malformed verify job output source_archive_sha256" >&2
+            exit 1
+          fi
+          cat build-digests/*.sha256 > /tmp/expected-archives.sha256
+          (cd release-assets && sha256sum -c /tmp/expected-archives.sha256)
+          SRC_ARCHIVE="miraserve-${TAG_NAME}-src.tar.gz"
+          ACTUAL_SHA=$(sha256sum "src-dist/${SRC_ARCHIVE}" | awk '{print $1}')
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: downloaded source archive SHA-256 '${ACTUAL_SHA}' != verify job output '${EXPECTED_SRC_SHA256}'" >&2
+            exit 1
+          fi
+          cp "src-dist/${SRC_ARCHIVE}" "release-assets/${SRC_ARCHIVE}"
+          mkdir -p src-work
+          tar -xzf "src-dist/${SRC_ARCHIVE}" -C src-work
+      - name: Stamp and verify release Homebrew formula against publishing repo and frozen source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC_ARCHIVE="miraserve-${TAG_NAME}-src.tar.gz"
+          SRC_FORMULA="src-work/miraserve-${TAG_NAME}/packaging/homebrew/miraserve.rb"
+          OUT_FORMULA="release-assets/miraserve.rb"
+          sed \
+            -e "s|REPLACE_WITH_GITHUB_REPOSITORY|${PUBLISH_REPO}|g" \
+            -e "s|REPLACE_WITH_RELEASE_TAG|${TAG_NAME}|g" \
+            -e "s|REPLACE_WITH_SOURCE_TARBALL_SHA256|${EXPECTED_SRC_SHA256}|g" \
+            "${SRC_FORMULA}" > "${OUT_FORMULA}"
+          if grep -F 'REPLACE_WITH_' "${OUT_FORMULA}" >/dev/null 2>&1; then
+            echo "ERROR: release-assets/miraserve.rb still contains unfilled placeholder" >&2
+            exit 1
+          fi
+          HOMEPAGE_LINE=$(sed -n 's/^[[:space:]]*homepage "\([^"]*\)"[[:space:]]*$/\1/p' "${OUT_FORMULA}")
+          URL_LINE=$(sed -n 's/^[[:space:]]*url "\([^"]*\)"[[:space:]]*$/\1/p' "${OUT_FORMULA}")
+          SHA_LINE=$(sed -n 's/^[[:space:]]*sha256 "\([^"]*\)"[[:space:]]*$/\1/p' "${OUT_FORMULA}")
+          HEAD_LINE=$(sed -n 's/^[[:space:]]*head "\([^"]*\)",.*$/\1/p' "${OUT_FORMULA}")
+          EXPECTED_HOMEPAGE="https://github.com/${PUBLISH_REPO}"
+          EXPECTED_URL="https://github.com/${PUBLISH_REPO}/releases/download/${TAG_NAME}/${SRC_ARCHIVE}"
+          EXPECTED_HEAD="https://github.com/${PUBLISH_REPO}.git"
+          if [ "${HOMEPAGE_LINE}" != "${EXPECTED_HOMEPAGE}" ]; then
+            echo "ERROR: release-assets/miraserve.rb homepage '${HOMEPAGE_LINE}' != '${EXPECTED_HOMEPAGE}'" >&2
+            exit 1
+          fi
+          if [ "${URL_LINE}" != "${EXPECTED_URL}" ]; then
+            echo "ERROR: release-assets/miraserve.rb url '${URL_LINE}' != '${EXPECTED_URL}'" >&2
+            exit 1
+          fi
+          if [ "${HEAD_LINE}" != "${EXPECTED_HEAD}" ]; then
+            echo "ERROR: release-assets/miraserve.rb head '${HEAD_LINE}' != '${EXPECTED_HEAD}'" >&2
+            exit 1
+          fi
+          if [ "${SHA_LINE}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: release-assets/miraserve.rb sha256 '${SHA_LINE}' != '${EXPECTED_SRC_SHA256}'" >&2
+            exit 1
+          fi
+      - name: Generate CycloneDX SBOM from verified archive Cargo.lock
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: src-work/miraserve-${{ env.TAG_NAME }}/Cargo.lock
+          format: cyclonedx-json
+          output-file: release-assets/miraserve-sbom.cdx.json
+          upload-artifact: false
+      - name: Generate SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Keyless Cosign sign SHA256SUMS.txt (Sigstore OIDC)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle release-assets/SHA256SUMS.txt.sigstore.json \
+            release-assets/SHA256SUMS.txt
+      - name: Generate SLSA Build Level 2 Provenance Attestations
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/*.deb
+            release-assets/*.rpm
+            release-assets/miraserve.rb
+            release-assets/miraserve-sbom.cdx.json
+            release-assets/SHA256SUMS.txt
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: release-assets/*
+
+  container:
+    name: Build & Attest Distroless OCI Image
+    needs: verify
+    environment: release
+    runs-on: ubuntu-latest
+    env:
+      TAG_NAME: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+      EXPECTED_SRC_SHA256: ${{ needs.verify.outputs.source_archive_sha256 }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download verified source archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: source-archive
+          path: src-dist
+      - name: Verify downloaded source archive against verify job output and extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SRC_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "ERROR: missing or malformed verify job output source_archive_sha256" >&2
+            exit 1
+          fi
+          ARCHIVE="miraserve-${TAG_NAME}-src.tar.gz"
+          ACTUAL_SHA=$(sha256sum "src-dist/${ARCHIVE}" | awk '{print $1}')
+          if [ "${ACTUAL_SHA}" != "${EXPECTED_SRC_SHA256}" ]; then
+            echo "ERROR: downloaded source archive SHA-256 '${ACTUAL_SHA}' != verify job output '${EXPECTED_SRC_SHA256}'" >&2
+            exit 1
+          fi
+          mkdir -p src-work
+          tar -xzf "src-dist/${ARCHIVE}" -C src-work
+      - uses: docker/setup-buildx-action@f7ce87c1d6bead3e36075b2ce75da1f6cc28aaca # v3.9.0
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract OCI metadata
+        id: meta
+        uses: docker/metadata-action@318604b99e75e41977312d83839a89be02ca4893 # v5.9.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Build & push rootless distroless OCI image from verified archive (uncached)
+        id: build-push
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: src-work/miraserve-${{ env.TAG_NAME }}
+          file: src-work/miraserve-${{ env.TAG_NAME }}/Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache: true
+          sbom: true
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - name: Keyless Cosign sign container image digest
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          IMAGE_DIGEST: ${{ steps.build-push.outputs.digest }}
+        run: cosign sign --yes "${IMAGE_NAME}@${IMAGE_DIGEST}"
+      - name: Attest OCI image SLSA Build Level 2 provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build-push.outputs.digest }}
+          push-to-registry: true

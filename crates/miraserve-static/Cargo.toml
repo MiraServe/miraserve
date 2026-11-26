@@ -1,0 +1,42 @@
+[package]
+name = "miraserve-static"
+description = "Kernel-confined (cap-std) static file server with ETag, Range, compression, and try-files for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Enables an atomic counter inside static blocking-pool fallback closures for integration tests.
+# Disabled by default: the shipped binary is built without it. A build that selects it (for
+# example `--all-features`) gets one atomic increment per instrumented blocking closure.
+test-pool-counter = []
+# Enables hidden RAII override/injection hooks used by cross-crate HTTP/2 integration tests
+# (including `--release` test builds). Disabled by default: never compiled into shipped binaries.
+test-h2-hooks = []
+
+[dependencies]
+brotli.workspace = true
+bytes.workspace = true
+cap-std.workspace = true
+flate2.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+httpdate.workspace = true
+mime_guess.workspace = true
+miraserve-config.workspace = true
+ruzstd.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true

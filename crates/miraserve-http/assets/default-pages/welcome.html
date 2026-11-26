@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Welcome to MiraServe</title>
+<style nonce="{{csp_nonce}}">
+:root{color-scheme:light dark;--bg:#FFFFFF;--fg:#0B1E3A;--sub:#4A5568;--line:#DCE3EC;--panel:#F4F6F9;--code:#003B8C;
+--pill-c-bg:#E8F3FF;--pill-c-fg:#003B8C;--pill-s-bg:#FFEDD5;--pill-s-fg:#7C2D12;--btn:#0062D9;--ok:#15803D;--ok-bg:#DCFCE7;--bad:#C2410C;--bad-bg:#FFEDD5;--track:#E8F3FF}
+@media (prefers-color-scheme:dark){:root{--bg:#0A1426;--fg:#FFFFFF;--sub:#CFE0F5;--line:#1C3256;--panel:#0F2440;--code:#7DD3FC;
+--pill-c-bg:#0F2F57;--pill-c-fg:#BFE3FF;--pill-s-bg:#4A2210;--pill-s-fg:#FDBA74;--ok:#4ADE80;--ok-bg:#0F3D2A;--bad:#FB923C;--bad-bg:#4A2210;--track:#0F2F57}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:48px 20px;background:var(--bg);color:var(--fg);
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif}
+main{width:100%;max-width:680px;display:flex;flex-direction:column;gap:22px}
+.pill{align-self:flex-start;border-radius:999px;padding:5px 12px;font-size:13px;font-weight:600}
+.pill.client{background:var(--pill-c-bg);color:var(--pill-c-fg)}.pill.server{background:var(--pill-s-bg);color:var(--pill-s-fg)}
+.code{font-size:clamp(88px,18vw,128px);line-height:.9;font-weight:800;letter-spacing:-.05em}
+h1{margin:0;font-size:clamp(26px,5vw,34px);line-height:1.2;font-weight:800;letter-spacing:-.02em}
+h2{margin:0;font-size:15px;font-weight:700}
+p{margin:0;font-size:17px;line-height:1.65;color:var(--sub)}
+ul{margin:8px 0 0;padding-left:20px;font-size:15px;line-height:1.75;color:var(--sub)}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+p code{font-size:15px;color:var(--code);overflow-wrap:anywhere}
+.actions{display:flex;flex-wrap:wrap;gap:12px}
+.btn{text-decoration:none;padding:13px 20px;border-radius:10px;font-weight:600;font-size:15px;min-height:44px;display:inline-flex;align-items:center}
+.btn.primary{background:var(--btn);color:#FFFFFF}.btn.secondary{border:1px solid var(--line);color:var(--fg);padding:12px 20px}
+.btn:focus-visible{outline:3px solid #00B9FA;outline-offset:2px}
+.details{background:var(--panel);border-radius:12px;padding:16px 18px;display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;font-size:13px}
+.details div{display:flex;flex-direction:column;gap:2px;min-width:0}.details span:first-child{font-family:inherit;color:var(--sub);font-size:12px}
+.details span:last-child{overflow-wrap:anywhere}
+footer{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding-top:18px;font-size:13px;color:var(--sub)}
+.mark-dark{display:none}@media (prefers-color-scheme:dark){.mark-light{display:none}.mark-dark{display:inline}}
+.box{border:1px solid var(--line);border-radius:12px;padding:16px 18px}
+.retry{display:flex;flex-direction:column;gap:10px}.retry-row{display:flex;justify-content:space-between;gap:12px;font-size:15px;font-weight:600}
+.track{height:8px;border-radius:4px;background:var(--track);overflow:hidden}.bar{height:100%;width:0;background:var(--btn);border-radius:4px;animation:wait var(--retry,30s) linear forwards}
+@keyframes wait{to{width:100%}}
+.chain{display:flex;align-items:flex-start;padding:20px 12px}.node{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center;font-size:15px;font-weight:700}
+.dot{width:48px;height:48px;border-radius:24px;display:flex;align-items:center;justify-content:center}.dot.ok{background:var(--ok-bg);color:var(--ok)}.dot.bad{background:var(--bad-bg);color:var(--bad)}
+.state{font-size:13px;font-weight:600}.state.ok{color:var(--ok)}.state.bad{color:var(--bad)}
+.link{flex:0 1 60px;height:2px;margin-top:24px}.link.ok{background:#22C55E}.link.bad{background:#F97316}
+@media (prefers-reduced-motion:reduce){.bar{animation:none;width:100%}}
+body{background:var(--panel)}
+.card{background:var(--bg);border:1px solid var(--line);border-radius:20px;padding:clamp(24px,5vw,48px);max-width:760px}
+.head{display:flex;align-items:center;gap:16px}.head .mark{width:72px;height:auto}
+.run{display:inline-flex;align-items:center;gap:8px;font-size:14px;font-weight:600;color:var(--ok)}.run i{width:10px;height:10px;border-radius:5px;background:#22C55E}
+.facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}.fact{border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:4px}
+.fact span:first-child{font-size:13px;color:var(--sub)}.fact span:last-child{font-weight:600;font-size:15px}
+pre{margin:0;background:#0B1E3A;color:#CFE0F5;border-radius:12px;padding:18px 20px;font-size:14px;line-height:1.75;overflow-x:auto}
+pre b{color:#00B9FA;font-weight:400}pre em{color:#F9A866;font-style:normal}
+a{color:#0062D9}@media (prefers-color-scheme:dark){a{color:#7DD3FC}}
+footer{border:0}
+</style>
+</head>
+<body>
+<main class="card">
+<div class="head"><svg class="mark mark-light" aria-hidden="true" viewBox="0 0 660.69 347.13" width="72" height="38"><g transform="translate(-29.31 -24) scale(1)"><defs><linearGradient id="ms-swoosh" gradientUnits="userSpaceOnUse" x1="40" y1="300" x2="320" y2="330"><stop offset="0" stop-color="#00B9FA"/><stop offset="1" stop-color="#0090EF"/></linearGradient><linearGradient id="ms-m" gradientUnits="userSpaceOnUse" x1="120" y1="320" x2="560" y2="60"><stop offset="0" stop-color="#003B8C"/><stop offset="0.3" stop-color="#0058CC"/><stop offset="0.55" stop-color="#0A8AE8"/><stop offset="0.78" stop-color="#00B9FA"/><stop offset="1" stop-color="#00B9FA"/></linearGradient><linearGradient id="ms-bars" gradientUnits="userSpaceOnUse" x1="330" y1="0" x2="690" y2="0"><stop offset="0" stop-color="#0058C8"/><stop offset="1" stop-color="#003B8C"/></linearGradient></defs><path fill="url(#ms-swoosh)" d="M106 224C58 246 24 282 30 318C38 358 104 376 176 370C232 365 284 346 322 316C276 336 226 347 176 347C116 347 74 330 70 302C66 276 80 248 106 224Z"/><path fill="url(#ms-m)" d="M103.73 305.8 174.73 59.8Q177.15 51.39 182.61 44.55Q188.07 37.71 195.73 33.48Q203.4 29.25 212.09 28.27Q220.79 27.3 229.2 29.73Q240.61 33.02 248.82 41.61L367.1 165.45L499.25 36.53L499.27 36.51C507.2 28.77 518.05 24 530 24C541.05 24 551.15 28.07 558.88 34.8C560.44 36.17 561.91 37.64 563.27 39.21C567.58 44.18 570.79 50.12 572.53 56.67L593.21 128C555.42 124.22 520.17 140.08 479.29 178.94L472.06 186L396.73 259.49Q396.56 259.66 396.39 259.82Q390.06 265.86 381.9 269.03Q373.74 272.19 364.99 271.99Q356.24 271.79 348.23 268.25Q340.23 264.72 334.18 258.39L238.05 157.74L188.27 330.2Z"/><path fill="url(#ms-bars)" d="M408.27 294H672C681.94 294 690 302.06 690 312V330C690 339.94 681.94 348 672 348H368.92C318.92 348 332 360 282 366C326 332 346.27 294 408.27 294ZM449.48 230.38Q458.07 222 470.07 222H672C681.94 222 690 230.06 690 240V258C690 267.94 681.94 276 672 276H402.72ZM523.28 158.38Q531.87 150 543.87 150H672C681.94 150 690 158.06 690 168V186C690 195.94 681.94 204 672 204H476.52ZM621.5 177C621.5 171.75 617.25 167.5 612 167.5C606.75 167.5 602.5 171.75 602.5 177C602.5 182.25 606.75 186.5 612 186.5C617.25 186.5 621.5 182.25 621.5 177ZM657.5 177C657.5 171.75 653.25 167.5 648 167.5C642.75 167.5 638.5 171.75 638.5 177C638.5 182.25 642.75 186.5 648 186.5C653.25 186.5 657.5 182.25 657.5 177ZM621.5 249C621.5 243.75 617.25 239.5 612 239.5C606.75 239.5 602.5 243.75 602.5 249C602.5 254.25 606.75 258.5 612 258.5C617.25 258.5 621.5 254.25 621.5 249ZM657.5 249C657.5 243.75 653.25 239.5 648 239.5C642.75 239.5 638.5 243.75 638.5 249C638.5 254.25 642.75 258.5 648 258.5C653.25 258.5 657.5 254.25 657.5 249ZM621.5 321C621.5 315.75 617.25 311.5 612 311.5C606.75 311.5 602.5 315.75 602.5 321C602.5 326.25 606.75 330.5 612 330.5C617.25 330.5 621.5 326.25 621.5 321ZM657.5 321C657.5 315.75 653.25 311.5 648 311.5C642.75 311.5 638.5 315.75 638.5 321C638.5 326.25 642.75 330.5 648 330.5C653.25 330.5 657.5 326.25 657.5 321Z"/></g></svg>
+<svg class="mark mark-dark" aria-hidden="true" viewBox="0 0 660.69 347.13" width="72" height="38"><g transform="translate(-29.31 -24) scale(1)"><path fill="#FFFFFF" d="M103.73 305.8 174.73 59.8Q177.15 51.39 182.61 44.55Q188.07 37.71 195.73 33.48Q203.4 29.25 212.09 28.27Q220.79 27.3 229.2 29.73Q240.61 33.02 248.82 41.61L367.1 165.45L499.25 36.53L499.27 36.51C507.2 28.77 518.05 24 530 24C541.05 24 551.15 28.07 558.88 34.8C560.44 36.17 561.91 37.64 563.27 39.21C567.58 44.18 570.79 50.12 572.53 56.67L593.21 128C555.42 124.22 520.17 140.08 479.29 178.94L472.06 186L396.73 259.49Q396.56 259.66 396.39 259.82Q390.06 265.86 381.9 269.03Q373.74 272.19 364.99 271.99Q356.24 271.79 348.23 268.25Q340.23 264.72 334.18 258.39L238.05 157.74L188.27 330.2ZM408.27 294H672C681.94 294 690 302.06 690 312V330C690 339.94 681.94 348 672 348H368.92C318.92 348 332 360 282 366C326 332 346.27 294 408.27 294ZM449.48 230.38Q458.07 222 470.07 222H672C681.94 222 690 230.06 690 240V258C690 267.94 681.94 276 672 276H402.72ZM523.28 158.38Q531.87 150 543.87 150H672C681.94 150 690 158.06 690 168V186C690 195.94 681.94 204 672 204H476.52ZM106 224C80 248 66 276 70 302C74 330 116 347 176 347C226 347 276 336 322 316C284 346 232 365 176 370C104 376 38 358 30 318C24 282 58 246 106 224ZM621.5 177C621.5 171.75 617.25 167.5 612 167.5C606.75 167.5 602.5 171.75 602.5 177C602.5 182.25 606.75 186.5 612 186.5C617.25 186.5 621.5 182.25 621.5 177ZM657.5 177C657.5 171.75 653.25 167.5 648 167.5C642.75 167.5 638.5 171.75 638.5 177C638.5 182.25 642.75 186.5 648 186.5C653.25 186.5 657.5 182.25 657.5 177ZM621.5 249C621.5 243.75 617.25 239.5 612 239.5C606.75 239.5 602.5 243.75 602.5 249C602.5 254.25 606.75 258.5 612 258.5C617.25 258.5 621.5 254.25 621.5 249ZM657.5 249C657.5 243.75 653.25 239.5 648 239.5C642.75 239.5 638.5 243.75 638.5 249C638.5 254.25 642.75 258.5 648 258.5C653.25 258.5 657.5 254.25 657.5 249ZM621.5 321C621.5 315.75 617.25 311.5 612 311.5C606.75 311.5 602.5 315.75 602.5 321C602.5 326.25 606.75 330.5 612 330.5C617.25 330.5 621.5 326.25 621.5 321ZM657.5 321C657.5 315.75 653.25 311.5 648 311.5C642.75 311.5 638.5 315.75 638.5 321C638.5 326.25 642.75 330.5 648 330.5C653.25 330.5 657.5 326.25 657.5 321Z"/></g></svg><div><span class="run"><i></i>Running</span><h1>MiraServe is up and serving</h1></div></div>
+<p>If you can read this, MiraServe is installed and answering requests for <b>{{host}}</b>. You are seeing this default page because no site is configured for this host yet.</p>
+<div class="facts">
+<div class="fact"><span>Connection</span><span>{{tls_summary}}</span></div>
+<div class="fact"><span>Protocol</span><span>{{protocol}}</span></div>
+<div class="fact"><span>Worker sandbox</span><span>{{sandbox_state}}</span></div>
+</div>
+<section>
+<h2>Next: point MiraServe at your site</h2>
+<pre class="mono"><b>site</b> <em>"{{host}}"</em> {
+    root <em>"/var/www/example"</em>
+    security-headers <em>"strict"</em>
+}</pre>
+<p>Then run <code>miraserve check --strict</code> and <code>miraserve reload</code>. Full guide at <a href="https://miraserve.org/docs">miraserve.org/docs</a>.</p>
+</section>
+<p><b>Visiting this site?</b> The owner hasn’t published it yet. Please check back later.</p>
+</main>
+<footer>Served by MiraServe</footer>
+</body>
+</html>

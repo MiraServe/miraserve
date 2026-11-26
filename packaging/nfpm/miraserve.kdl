@@ -1,0 +1,31 @@
+// MiraServe Default Linux Starter Configuration (strict TLS 1.3 + PQC + dual-stack IPv4+IPv6)
+// Post-install automatically generates a unique per-host self-signed starter certificate at
+// `/etc/miraserve/certs/starter.crt` + `starter.key` so `systemctl start miraserve` works immediately.
+// Replace with ACME or production certificates, then run:
+//   miraserve check --fs --strict /etc/miraserve/conf/miraserve.kdl && sudo systemctl reload miraserve
+// Full multi-site examples (WordPress, AI Publish, MCP Gateway):
+//   /usr/share/doc/miraserve/examples/miraserve.kdl
+
+server {
+    listen ":443" protocols="h3,h2,h1"
+    listen ":80" redirect-https=#true
+
+    tls {
+        min-version "1.3"
+        pqc-hybrid #true
+        key-isolation "in-process"
+        cert "/etc/miraserve/certs/starter.crt"
+        key "/etc/miraserve/certs/starter.key"
+    }
+
+    sandbox {
+        user "miraserve"
+        landlock #true
+        seccomp "strict"
+    }
+}
+
+site "localhost" {
+    security-headers "strict"
+    root "/var/www/miraserve"
+}

@@ -1,0 +1,47 @@
+[package]
+name = "miraserve-alloc-tests"
+description = "Dev-only end-to-end allocation-cost measuring harness for MiraServe"
+publish = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Mirrors `[workspace.lints]` except `unsafe_code = "deny"` (instead of `"forbid"`) ONLY so
+# `tests/proxy_alloc_cost.rs` can place `#[allow(unsafe_code)]` on its single
+# `unsafe impl GlobalAlloc` delegating to `std::alloc::System`. This crate is `publish = false`,
+# contains tests only (no library or binary targets), and is never depended on by any shipped crate.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+exit = "deny"
+module_name_repetitions = "allow"
+duration_suboptimal_units = "allow"
+
+[dev-dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+miraserve-config.workspace = true
+miraserve-core.workspace = true
+miraserve-telemetry.workspace = true
+miraserve-tls.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true

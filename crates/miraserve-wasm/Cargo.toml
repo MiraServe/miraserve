@@ -1,0 +1,25 @@
+[package]
+name = "miraserve-wasm"
+description = "Sandboxed Wasmtime wasi:http WebAssembly plugin runtime with fuel, memory, and capability isolation for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+miraserve-config.workspace = true
+miraserve-static.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wasmtime-wasi-http.workspace = true

@@ -1,0 +1,28 @@
+// MiraServe Local Development Configuration (Strict TLS 1.3 + PQC + H3/H2/H1)
+//
+// Validate strictly:
+//   cargo run --bin miraserve -- check --strict --dev-tls examples/dev-local.kdl
+//
+// Run locally with automatic self-signed ECDSA P-256 TLS certificate:
+//   cargo run --bin miraserve -- run examples/dev-local.kdl --dev-tls
+
+server {
+    listen "127.0.0.1:8443" protocols="h3,h2,h1"
+    listen "127.0.0.1:8080" redirect-https=#true
+
+    tls {
+        min-version "1.3"
+        pqc-hybrid #true
+        key-isolation "in-process"
+    }
+
+    sandbox {
+        landlock #true
+        seccomp "strict"
+    }
+}
+
+site "localhost" {
+    security-headers "strict"
+    root "www"
+}

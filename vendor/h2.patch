@@ -1,0 +1,37 @@
+--- a/src/codec/framed_write.rs
++++ b/src/codec/framed_write.rs
+@@ -75,6 +75,16 @@
+ /// A larger value in this scenario will reduce the number of small and
+ /// fragmented data being sent, and hereby improve the throughput.
+ const CHAIN_THRESHOLD_WITHOUT_VECTORED_IO: usize = 1024;
++
++/// MiraServe change: copy DATA payloads strictly below this limit into the
++/// 16 KiB encoder write buffer so ready small frames batch before flushing.
++/// Payloads of this size or larger stay on the chained path.
++const COPY_LIMIT: usize = 4096;
++
++const _: () = assert!(
++    CHAIN_THRESHOLD <= COPY_LIMIT && CHAIN_THRESHOLD_WITHOUT_VECTORED_IO <= COPY_LIMIT
++);
++const _: () = assert!(COPY_LIMIT + frame::HEADER_LEN <= DEFAULT_BUFFER_CAPACITY);
+ 
+ // TODO: Make generic
+ impl<T, B> FramedWrite<T, B>
+@@ -98,7 +108,7 @@
+                 last_data_frame: None,
+                 max_frame_size: frame::DEFAULT_MAX_FRAME_SIZE,
+                 chain_threshold,
+-                min_buffer_capacity: chain_threshold + frame::HEADER_LEN,
++                min_buffer_capacity: COPY_LIMIT + frame::HEADER_LEN,
+             },
+         }
+     }
+@@ -237,7 +247,7 @@
+                     return Err(PayloadTooBig);
+                 }
+ 
+-                if len >= self.chain_threshold {
++                if len >= COPY_LIMIT {
+                     let head = v.head();
+ 
+                     // Encode the frame head to the buffer

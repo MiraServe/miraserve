@@ -1,0 +1,40 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
+# WinGet singleton manifest template — updated automatically on tagged GitHub Releases.
+PackageIdentifier: MiraServe.MiraServe
+PackageVersion: 0.1.5
+PackageLocale: en-US
+Publisher: MiraServe Contributors
+PublisherUrl: https://github.com/miraserve/miraserve
+PublisherSupportUrl: https://github.com/miraserve/miraserve/issues
+PackageName: MiraServe
+PackageUrl: https://github.com/miraserve/miraserve
+License: Apache-2.0 OR MIT
+LicenseUrl: https://github.com/miraserve/miraserve/blob/main/LICENSE-APACHE
+ShortDescription: Memory-safe, zero-trust, post-quantum HTTPS and AI-native web server
+Description: >-
+  MiraServe is a memory-safe Rust web server and AI-native edge gateway with
+  TLS 1.3 + X25519MLKEM768 post-quantum hybrid key exchange, HTTP/1.1/2/3,
+  dual-stack IPv4+IPv6, cap-std static serving, FastCGI PHP-FPM support,
+  atomic signed AI website publishing, RFC 9421 Web Bot Auth, MCP gateway,
+  and Wasmtime wasi:http plugins.
+Moniker: miraserve
+Tags:
+  - http
+  - https
+  - http3
+  - post-quantum
+  - web-server
+  - reverse-proxy
+  - mcp
+  - rust
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    NestedInstallerType: portable
+    NestedInstallerFiles:
+      - RelativeFilePath: miraserve.exe
+        PortableCommandAlias: miraserve
+    InstallerUrl: https://github.com/miraserve/miraserve/releases/download/v0.1.5/miraserve-v0.1.5-x86_64-pc-windows-msvc.zip
+    InstallerSha256: REPLACE_WITH_RELEASE_SHA256
+ManifestType: singleton
+ManifestVersion: 1.6.0

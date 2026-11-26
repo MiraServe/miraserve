@@ -1,0 +1,15 @@
+doc-valid-idents = [
+    "MiraServe",
+    "FastCGI",
+    "OpenLiteSpeed",
+    "WordPress",
+    "Landlock",
+    "Slowloris",
+    "DoS",
+    "ETag",
+    "WebSocket",
+    "WebSockets",
+    "ClientHello",
+    "OpenMarket",
+    "..",
+]

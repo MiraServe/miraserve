@@ -1,0 +1,138 @@
+// MiraServe Reference Configuration
+// Validate with: miraserve check examples/miraserve.kdl
+
+server {
+    listen ":443" protocols="h3,h2,h1"
+    listen ":80" redirect-https=true
+
+    tls {
+        min-version "1.3"
+        pqc-hybrid true
+        key-isolation "in-process" // Use "split-daemon" with external/manual certs (ACME requires "in-process")
+        acme {
+            email "ops@example.com"
+            challenge "tls-alpn-01"
+            short-lived true
+        }
+    }
+
+    sandbox {
+        user "miraserve"
+        landlock true
+        seccomp "strict"
+    }
+
+    // One event loop per core instead of one shared runtime (Linux; takes effect on restart):
+    // workers "auto"
+
+    limits {
+        max-connections 16384
+        max-connections-per-ip 128
+        ipv6-prefix-conn-multiplier 4
+        // PHP answers above 32 MiB are streamed and hold a PHP worker for the download: how many
+        // one address may have at once (raise it for an office behind one address).
+        max-streamed-answers-per-ip 8
+        // ...and how many one PHP backend may have at once for all visitors together. Keep it
+        // below the pool's number of workers (PHP-FPM pm.max_children).
+        max-streamed-answers-per-backend 4
+        // Process-wide memory budget for sites that opt in to `file-cache` (default "64MiB";
+        // set 0 to disable static file caching everywhere):
+        // file-cache-bytes "64MiB"
+        // Behind Nginx, HAProxy, a load balancer, or a CDN, list exact front proxy `/32` or `/128`
+        // IPs so they are exempt from `max-connections-per-ip` and their `X-Forwarded-For` headers
+        // are trusted:
+        // trusted-proxies "127.0.0.1/32" "10.0.1.10/32"
+    }
+}
+
+// 1. Future Web: AI-Authored, Self-Updating Atomic Website (No CMS required)
+site "future.example.com" {
+    security-headers "strict"
+    rate-limit requests=600 per="1m" burst=150 key="client-ip"
+
+    bot-auth {
+        verify-rfc9421 true
+        allow-agent "verified-ai-agents" serve-markdown=true
+        on-unverified-ai-ua "throttle"
+    }
+
+    ai-publish {
+        storage "/var/lib/miraserve/releases/future"
+        site-id "future.example.com"
+        keep-versions 20
+        require-signature "ed25519:/etc/miraserve/deploy-agent.pub"
+        jwt-public-key "ed25519:/etc/miraserve/publish-jwt.pub"
+        jwt-issuer "https://auth.example.com"
+        preflight-checks "no-secrets" "csp-valid" "max-size=50MB"
+        mcp-endpoint "/_miraserve/publish" auth="oauth-jwt"
+    }
+}
+
+// 2. Transition Bridge: Legacy WordPress site running via isolated PHP-FPM
+site "legacy-blog.example.com" {
+    preset "wordpress-hardened"
+    // Uncomment only if legacy clients require TLS 1.2 (triggers W002 under `check --strict`):
+    // tls { compat-tls-1-2 true }
+    // Serve this site directly on the `redirect-https=true` HTTP/1.1 listener (e.g. before a
+    // certificate exists, or for a suspended 503 site); default is `http "redirect"`.
+    // Add `credentials=true` only if `basic-auth` must also work over plain HTTP (triggers W032):
+    // http "serve"
+    // http "serve" credentials=true
+
+    root "/var/www/wordpress"
+    // Opt-in in-memory static file cache (default off; 100ms to 60s, or "off"):
+    // file-cache "1s"
+
+    // Precompressed static siblings (`.zst`, `.br`, `.gz`) are disabled by default (`precompressed "off"`).
+    // Opt in per site (or inside a route `static { ... }` block) when a build step publishes ready-made siblings;
+    // on-the-fly compression is unaffected:
+    // precompressed "br" "gz"
+    // precompressed "all"
+
+    // Condition response header rules on final HTTP status codes (`200`-`599`) and/or classes (`2xx`-`5xx`).
+    // Unconditional site rules apply to every status; route rules apply only to answers produced by that route
+    // (a `try-files` fallback such as `/index.html` does not inherit an asset route's headers):
+    // headers {
+    //     set "cache-control" "no-cache"
+    // }
+    // route "/assets/*" {
+    //     try-files "{path}" "/index.html"
+    //     headers {
+    //         set "cache-control" "public, max-age=31536000, immutable" status="200 206 304"
+    //     }
+    // }
+
+    route "*.php" {
+        fastcgi-pass "unix:/run/php/php8.3-fpm.sock"
+    }
+
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.php?{query}"
+    }
+}
+
+// 3. AI Infrastructure: MCP Security Gateway + Zero-Buffer LLM Streaming Proxy
+site "ai.example.com" {
+    security-headers "strict"
+
+    route "/mcp/*" {
+        mcp-gateway upstream="https://10.0.1.20:8443" {
+            oauth-resource-metadata true
+            jwt-public-key "ed25519:/etc/miraserve/mcp-oauth.pub"
+            jwt-issuer "https://auth.example.com"
+            jwt-audience "https://ai.example.com"
+            allow-tools "docs_search" "catalog_read"
+            deny-tools "*_delete" "*_exec"
+            audit-log "structured-json"
+        }
+    }
+
+    route "/v1/*" {
+        reverse-proxy {
+            upstream "https://10.0.1.30:8000"
+            upstream "https://10.0.1.31:8000"
+            streaming-flush "immediate"
+            health-check path="/health" interval="5s"
+        }
+    }
+}

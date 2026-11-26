@@ -1,0 +1,19 @@
+# Ownership rules for supply-chain, vendored h2, verification scripts, and release gates.
+# Declares @tibeemts as code owner for these paths (including CODEOWNERS itself).
+# Actual merge enforcement requires enabling "Require review from Code Owners" in the
+# GitHub repository's branch-protection or ruleset settings (which this checkout cannot prove).
+
+/.github/CODEOWNERS @tibeemts
+/vendor/ @tibeemts
+/Cargo.toml @tibeemts
+/Cargo.lock @tibeemts
+/deny.toml @tibeemts
+/scripts/verify-vendor-h2.sh @tibeemts
+/scripts/verify-h2-graph.sh @tibeemts
+/scripts/audit-vendor-h2.sh @tibeemts
+/scripts/test-vendor-h2.sh @tibeemts
+/scripts/test-verify-vendor-h2.sh @tibeemts
+/scripts/h2-use-registry.sh @tibeemts
+/.github/workflows/release.yml @tibeemts
+/.github/workflows/ci.yml @tibeemts
+/packaging/homebrew/miraserve.rb @tibeemts

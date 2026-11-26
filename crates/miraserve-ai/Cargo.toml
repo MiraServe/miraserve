@@ -1,0 +1,32 @@
+[package]
+name = "miraserve-ai"
+description = "RFC 9421 Web Bot Auth, MCP Security Gateway (OAuth RFC 9728 + JSON-RPC tool RBAC + redacted audit), and llms.txt / Markdown negotiation for MiraServe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+aws-lc-rs.workspace = true
+base64.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+miraserve-config.workspace = true
+miraserve-proxy.workspace = true
+miraserve-security.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hyper.workspace = true
+hyper-util.workspace = true

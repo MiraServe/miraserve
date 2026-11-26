@@ -1,0 +1,13 @@
+# systemd-tmpfiles(5) configuration for MiraServe
+#Type Path                        Mode User           Group          Age Argument
+d     /run/miraserve              0750 miraserve      miraserve      -
+d     /run/miraserve-keyd         2750 miraserve-keyd miraserve      -
+d     /var/lib/miraserve          0750 miraserve      miraserve      -
+d     /var/lib/miraserve/acme     0700 miraserve      miraserve      -
+d     /var/lib/miraserve/releases 0750 miraserve      miraserve      -
+d     /etc/miraserve              0750 root           miraserve      -
+d     /etc/miraserve/conf         0750 root           miraserve      -
+d     /etc/miraserve/certs        0750 root           miraserve      -
+d     /etc/miraserve/auth         0750 root           miraserve      -
+d     /etc/miraserve/keys         0700 miraserve-keyd miraserve-keyd -
+d     /var/www/miraserve          0755 root           root           -

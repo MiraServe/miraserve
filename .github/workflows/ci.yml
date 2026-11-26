@@ -1,0 +1,169 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  schedule:
+    # Daily scheduled supply-chain & vendored h2 advisory gate (06:00 UTC);
+    # libFuzzer smoke check runs on Mondays within the same schedule.
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  msrv:
+    name: MSRV Check (Rust 1.95)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo check --workspace --all-targets --locked
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - run: cargo test --workspace --all-targets --locked
+      - run: cargo run --locked --bin miraserve -- check examples/miraserve.kdl
+      - run: cargo run --locked --bin miraserve -- check --strict --dev-tls --fs examples/dev-local.kdl
+      - name: Verify vendor/h2 provenance (Unix)
+        if: runner.os != 'Windows'
+        run: ./scripts/verify-vendor-h2.sh
+
+  docs:
+    name: Rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+
+  deny:
+    name: Supply-Chain Security (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+
+  vendor-h2:
+    name: Vendored h2 Provenance, Graph & Advisory Gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+      - name: Verify vendor/h2 archive provenance and patch
+        run: ./scripts/verify-vendor-h2.sh
+      - name: Verify Cargo dependency graph resolves vendored h2
+        run: ./scripts/verify-h2-graph.sh
+      - name: Install pinned cargo-deny for vendored h2 advisory gate
+        run: cargo install --locked cargo-deny --version 0.20.2
+      - name: Audit crates.io h2 advisories, DB revision, and upstream 0.4.x index
+        run: ./scripts/audit-vendor-h2.sh
+      - name: Provision alternate compatible h2 archive for different-pin switch test (3e)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTIVE_VER=$(sed -n 's/^H2_VERSION=//p' vendor/h2-source.env)
+          if [ "${ACTIVE_VER}" = "0.4.15" ]; then
+            ALT_VER="0.4.20"
+            ALT_SHA="7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+          else
+            ALT_VER="0.4.15"
+            ALT_SHA="6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+          fi
+          ALT_PATH="${RUNNER_TEMP}/h2-${ALT_VER}.crate"
+          curl -fsSL --proto '=https' --tlsv1.2 -o "${ALT_PATH}" \
+            "https://static.crates.io/crates/h2/h2-${ALT_VER}.crate"
+          printf '%s  %s\n' "${ALT_SHA}" "${ALT_PATH}" | sha256sum -c -
+          echo "H2_ALT_CRATE_ARCHIVE=${ALT_PATH}" >> "${GITHUB_ENV}"
+      - name: Run vendor/h2 tamper, per-target, emergency-switch, and upstream-signal tests
+        env:
+          H2_REQUIRE_ALT_PIN: "1"
+        run: ./scripts/test-verify-vendor-h2.sh
+
+  fuzz:
+    name: Fuzz Targets Check & Smoke Run (Threat Model T1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+        with:
+          workspaces: fuzz
+      - name: Verify fuzz targets compile cleanly
+        run: cargo check --manifest-path fuzz/Cargo.toml --bins
+      - name: Run bounded libFuzzer smoke tests (weekly Mondays / manual)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" -ne 1 ]; then
+            echo "Skipping weekly libFuzzer smoke run on non-Monday daily advisory schedule."
+            exit 0
+          fi
+          cargo install --locked cargo-fuzz --version 0.12.0
+          for target in fuzz_kdl_config fuzz_http_smuggling fuzz_fastcgi_codec fuzz_rfc9421_bot_auth fuzz_mcp_jsonrpc fuzz_telemetry_redact fuzz_migrate_parsers fuzz_publish_preflight; do
+            cargo fuzz run "$target" -- -max_total_time=30
+          done
+      - name: Upload fuzz crash artifacts on failure
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

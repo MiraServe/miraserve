@@ -1,0 +1,130 @@
+[workspace]
+resolver = "3"
+exclude = ["fuzz", "vendor/h2", "vendor/h2-audit"]
+members = [
+    "crates/miraserve-config",
+    "crates/miraserve-tls",
+    "crates/miraserve-security",
+    "crates/miraserve-static",
+    "crates/miraserve-proxy",
+    "crates/miraserve-fastcgi",
+    "crates/miraserve-publish",
+    "crates/miraserve-ai",
+    "crates/miraserve-wasm",
+    "crates/miraserve-telemetry",
+    "crates/miraserve-http",
+    "crates/miraserve-sandbox",
+    "crates/miraserve-core",
+    "crates/miraserve-migrate",
+    "crates/miraserve-bin",
+    "crates/miraserve-alloc-tests",
+]
+
+[workspace.package]
+version = "0.1.5"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/miraserve/miraserve"
+keywords = ["http", "https", "tls", "pqc", "mcp"]
+categories = ["network-programming", "web-programming::http-server"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unreachable_pub = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+exit = "deny"
+module_name_repetitions = "allow"
+# Pedantic in clippy 1.95 (the stated minimum toolchain) and off by default in newer releases;
+# allowed so both lint the same way.
+duration_suboptimal_units = "allow"
+
+[workspace.dependencies]
+arc-swap = "1.9.5"
+aws-lc-rs = "1.19.0"
+base64 = "0.22.1"
+brotli = { version = "9.1.3", default-features = false, features = ["std"] }
+bytes = "1.12.2"
+bcrypt = { version = "0.19.3", default-features = false, features = ["std"] }
+cap-std = "4.0.3"
+clap = { version = "4.6.8", features = ["derive", "wrap_help"] }
+flate2 = "1.1.11"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+futures-util = "0.3"
+tokio-util = "0.7"
+html5ever = "0.40.1"
+http = "1.5.0"
+http-body = "1.0.1"
+http-body-util = "0.1.5"
+httpdate = "1.0.3"
+hyper = { version = "1.12.0", features = ["full"] }
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "logging", "aws-lc-rs"] }
+hyper-util = { version = "0.1.21", features = ["full"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls", "rcgen", "time"] }
+kdl = { version = "6.7.1", features = ["v1-fallback"] }
+landlock = "0.4.7"
+miette = "7.6.0"
+mime_guess = "2.0.5"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode-perl", "unicode-case"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log", "bloom"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["pem", "aws_lc_rs"] }
+roxmltree = "0.21.2"
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "logging", "prefer-post-quantum", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
+rustls-pki-types = "1.16.0"
+ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "time", "fs", "process"] }
+seccompiler = "0.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.154", features = ["arbitrary_precision"] }
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+tower-service = "0.3.3"
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws_lc_rs", "logging", "tls12"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+wasmtime = { version = "48.0.10", default-features = false, features = ["cranelift", "component-model", "async", "runtime", "std", "wat"] }
+wasmtime-wasi = { version = "48.0.10", default-features = false, features = ["p2"] }
+wasmtime-wasi-http = { version = "48.0.10", default-features = false, features = ["p2"] }
+x509-parser = "0.18.1"
+winapi-util = "0.1.11"
+zeroize = "1.9.2"
+
+miraserve-config = { version = "0.1.5", path = "crates/miraserve-config" }
+miraserve-tls = { version = "0.1.5", path = "crates/miraserve-tls" }
+miraserve-security = { version = "0.1.5", path = "crates/miraserve-security" }
+miraserve-static = { version = "0.1.5", path = "crates/miraserve-static" }
+miraserve-proxy = { version = "0.1.5", path = "crates/miraserve-proxy" }
+miraserve-fastcgi = { version = "0.1.5", path = "crates/miraserve-fastcgi" }
+miraserve-publish = { version = "0.1.5", path = "crates/miraserve-publish" }
+miraserve-ai = { version = "0.1.5", path = "crates/miraserve-ai" }
+miraserve-wasm = { version = "0.1.5", path = "crates/miraserve-wasm" }
+miraserve-telemetry = { version = "0.1.5", path = "crates/miraserve-telemetry" }
+miraserve-http = { version = "0.1.5", path = "crates/miraserve-http" }
+miraserve-sandbox = { version = "0.1.5", path = "crates/miraserve-sandbox" }
+miraserve-core = { version = "0.1.5", path = "crates/miraserve-core" }
+miraserve-migrate = { version = "0.1.5", path = "crates/miraserve-migrate" }
+
+[profile.release]
+# Keep default `panic = "unwind"` for Wasmtime trap handling and Tokio per-connection task isolation.
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[patch.crates-io]
+h2 = { path = "vendor/h2" }
