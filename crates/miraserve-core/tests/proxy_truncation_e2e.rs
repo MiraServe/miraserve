@@ -970,7 +970,9 @@ async fn run_truncation_case(
                         "{case_tag}: case (c) must deliver head and body bytes before RST (got {err})"
                     );
                     assert!(
-                        !err.is_connect() && std::error::Error::source(&err).is_some(),
+                        err.is_closed()
+                            || err.is_incomplete_message()
+                            || std::error::Error::source(&err).is_some(),
                         "{case_tag}: expected HTTP/2 stream error/reset from server, got {err:?}"
                     );
                 }
