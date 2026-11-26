@@ -514,13 +514,22 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
     // Drop the preliminary policy (and every descriptor it opened) immediately after reading its
     // warnings so later `--fs` checks and the `--writable-set` startup pass hold no extra file
     // descriptors compared to `miraserve run` (Codex Round-3 P1 #1).
-    let sbx_warnings = {
+    let (sbx_warnings, sbx_exact_socket_rejections) = {
         let sbx_policy = SandboxPolicy::from_config_with_file(
             &policy_config,
             cfg_path_opt,
             args.acme_dir.as_deref(),
         );
-        sbx_policy.warnings
+        let exact_rejections: Vec<String> = if args.fs {
+            Vec::new()
+        } else {
+            sbx_policy
+                .exact_endpoint_rejections()
+                .values()
+                .cloned()
+                .collect()
+        };
+        (sbx_policy.warnings, exact_rejections)
     };
     for (n, w) in sbx_warnings.into_iter().enumerate() {
         // The configuration key is looked up for the first warnings only (bounded work).
@@ -539,6 +548,20 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
             ),
             label: None,
             location: loaded.location_for(&key_path),
+        });
+    }
+    for reason in sbx_exact_socket_rejections {
+        filtered_warnings.push(ConfigIssue {
+            code: "W017".to_owned(),
+            severity: Severity::Warning,
+            message: reason,
+            path: Some("server.sandbox".to_owned()),
+            help: Some(
+                "point fastcgi-pass / keyd-socket at a Unix domain socket path, not a directory or other file type"
+                    .to_owned(),
+            ),
+            label: None,
+            location: loaded.location_for("server.sandbox"),
         });
     }
 
@@ -1641,6 +1664,29 @@ fn check_client_ca_bundle(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn metadata_file_type_label(md: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt as _;
+    let ft = md.file_type();
+    if ft.is_dir() {
+        "directory"
+    } else if ft.is_file() {
+        "regular file"
+    } else if ft.is_fifo() {
+        "FIFO"
+    } else if ft.is_symlink() {
+        "symbolic link"
+    } else if ft.is_char_device() {
+        "character device"
+    } else if ft.is_block_device() {
+        "block device"
+    } else if ft.is_socket() {
+        "socket"
+    } else {
+        "unknown file type"
+    }
+}
+
 fn check_keyd_socket_accessible(
     errors: &mut Vec<ConfigIssue>,
     loaded: &LoadedConfig,
@@ -1665,16 +1711,23 @@ fn check_keyd_socket_accessible(
         use std::os::unix::fs::FileTypeExt as _;
         match fs::metadata(sock_path) {
             Ok(md) if md.file_type().is_socket() => {}
-            Ok(_) => {
-                push_fs_error(
-                    errors,
-                    loaded,
-                    key_path,
+            Ok(md) => {
+                #[cfg(target_os = "linux")]
+                let msg = format!(
+                    "server.tls.keyd-socket '{}' is not a Unix domain socket: exact unix endpoint '{}' is not a socket (found {})",
+                    sock_path.display(),
+                    sock_path.display(),
+                    metadata_file_type_label(&md),
+                );
+                #[cfg(not(target_os = "linux"))]
+                let msg = {
+                    let _ = md;
                     format!(
                         "server.tls.keyd-socket '{}' is not a Unix domain socket",
                         sock_path.display()
-                    ),
-                );
+                    )
+                };
+                push_fs_error(errors, loaded, key_path, msg);
                 return;
             }
             Err(err) => {
@@ -1800,7 +1853,21 @@ fn check_fastcgi_unix_socket_accessible(
         return false;
     };
     if !md.file_type().is_socket() {
-        // Existing non-socket path: belongs to start-up hardening, no new output here.
+        // On Linux, an existing non-socket exact Unix endpoint is rejected by the Landlock
+        // policy (quarantining sole tenant consumers as W026 or failing non-tenant sites as E301).
+        // Non-Linux platforms keep 0.1.5 behaviour (no output here).
+        #[cfg(target_os = "linux")]
+        {
+            push_fs_error(
+                errors,
+                loaded,
+                key_path,
+                format!(
+                    "site '{site_host}' FastCGI Unix socket: exact unix endpoint '{sock_path}' is not a socket (found {})",
+                    metadata_file_type_label(&md),
+                ),
+            );
+        }
         return false;
     }
     let effective_uid = rustix::process::geteuid();
