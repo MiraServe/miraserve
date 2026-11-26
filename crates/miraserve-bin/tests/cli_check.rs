@@ -9453,14 +9453,6 @@ site "php-ro.example" {{
         ),
     )?;
 
-    #[cfg(not(target_os = "linux"))]
-    let non_socket_route = format!(
-        "    route \"/file/*\" {{\n        fastcgi-pass \"unix:{}\"\n    }}\n",
-        regular_file.display()
-    );
-    #[cfg(target_os = "linux")]
-    let non_socket_route = String::new();
-
     let clean_cfg = conf_dir.join("clean.kdl");
     std::fs::write(
         &clean_cfg,
@@ -9477,7 +9469,10 @@ site "php-clean.example" {{
     route "/absent/*" {{
         fastcgi-pass "unix:{}"
     }}
-{non_socket_route}    route "/tcp/*" {{
+    route "/file/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/tcp/*" {{
         fastcgi-pass "tcp://127.0.0.1:9000"
     }}
 }}
@@ -9485,6 +9480,7 @@ site "php-clean.example" {{
             www_dir.display(),
             ok_sock.display(),
             absent_sock.display(),
+            regular_file.display()
         ),
     )?;
 
@@ -9501,33 +9497,17 @@ site "php-no-existing.example" {{
     route "/absent/*" {{
         fastcgi-pass "unix:{}"
     }}
-{non_socket_route}    route "/tcp/*" {{
+    route "/file/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/tcp/*" {{
         fastcgi-pass "tcp://127.0.0.1:9000"
     }}
 }}
 "#,
             www_dir.display(),
             absent_sock.display(),
-        ),
-    )?;
-
-    let regular_file_cfg = conf_dir.join("regular-file.kdl");
-    std::fs::write(
-        &regular_file_cfg,
-        format!(
-            r#"
-server {{
-    listen ":443"
-}}
-site "php-file.example" {{
-    root "{}"
-    route "/file/*" {{
-        fastcgi-pass "unix:{}"
-    }}
-}}
-"#,
-            www_dir.display(),
-            regular_file.display(),
+            regular_file.display()
         ),
     )?;
 
@@ -9602,51 +9582,6 @@ site "php-b.example" {{
                 .is_some_and(|s| s.contains("FastCGI Unix socket access")))),
         "absent/non-socket/tcp must emit no FastCGI socket access note: {no_existing_json}"
     );
-
-    // On Linux (`socket-typing`), an existing regular file at `fastcgi-pass "unix:..."` on a
-    // non-tenant site is refused with `E301` (typed reason), NEVER `W033` and NEVER a FastCGI
-    // socket access note.
-    #[cfg(target_os = "linux")]
-    {
-        let reg_out = Command::new(miraserve_bin())
-            .args(["check", "--fs", "--dev-tls", "--format", "json"])
-            .arg(&regular_file_cfg)
-            .output()?;
-        assert!(!reg_out.status.success());
-        let reg_json: serde_json::Value = serde_json::from_slice(&reg_out.stdout)?;
-        assert!(
-            reg_json
-                .get("errors")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|arr| arr.iter().any(|e| {
-                    e.get("code").and_then(serde_json::Value::as_str) == Some("E301")
-                        && e.get("message")
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|m| m.contains("is not a socket (found regular file)"))
-                })),
-            "expected E301 typed rejection for regular file on Linux: {reg_json}"
-        );
-        assert!(
-            reg_json
-                .get("warnings")
-                .and_then(serde_json::Value::as_array)
-                .is_none_or(|arr| arr
-                    .iter()
-                    .all(|w| w.get("code").and_then(serde_json::Value::as_str) != Some("W033"))),
-            "non-socket must not emit W033: {reg_json}"
-        );
-        assert!(
-            reg_json
-                .get("notes")
-                .and_then(serde_json::Value::as_array)
-                .is_none_or(|arr| arr.iter().all(|n| !n
-                    .as_str()
-                    .is_some_and(|s| s.contains("FastCGI Unix socket access")))),
-            "non-socket must not emit FastCGI socket access note: {reg_json}"
-        );
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = regular_file_cfg;
 
     let is_root = rustix::process::geteuid().is_root();
     if is_root {
@@ -11013,348 +10948,6 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
         "purge with nothing kept must emit no stderr, got: {}",
         String::from_utf8_lossy(&out8.stderr)
     );
-
-    let _ = std::fs::remove_dir_all(&base);
-    Ok(())
-}
-
-/// Oracle for 0.1.6 `socket-typing` inspection (Requirement 7):
-/// Tests `check`, `check --fs`, and `check --writable-set` (non-root AND root) for:
-/// 1. Tenant (`owner-dir`) site with a directory at its FastCGI path.
-/// 2. Non-tenant site with a directory at its FastCGI path.
-/// 3. Server-level `keyd-socket` path that is a directory.
-///
-/// Also verifies CLI `miraserve run --no-sandbox` and `miraserve run` refuse a server `keyd-socket`
-/// directory with the typed reason on Linux, while non-Linux preserves 0.1.5 behaviour.
-#[cfg(unix)]
-#[test]
-#[allow(clippy::too_many_lines)]
-fn socket_typing_check_fs_and_writable_set_inspection() -> TestResult {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let base = std::env::temp_dir().join(format!(
-        "miraserve-socktype-cli-{}-{nanos}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&base);
-    let conf_dir = base.join("conf");
-    let tenant_home = base.join("tenant");
-    let tenant_root = tenant_home.join("public_html");
-    let www = base.join("www");
-    let bad_fcgi_dir = base.join("bad-fcgi-dir");
-    let bad_keyd_dir = base.join("bad-keyd-dir");
-    std::fs::create_dir_all(&conf_dir)?;
-    std::fs::create_dir_all(&tenant_root)?;
-    std::fs::create_dir_all(&www)?;
-    std::fs::create_dir_all(&bad_fcgi_dir)?;
-    std::fs::create_dir_all(&bad_keyd_dir)?;
-
-    let canon_base = std::fs::canonicalize(&base)?;
-    let canon_tenant_home = std::fs::canonicalize(&tenant_home)?;
-    let canon_tenant_root = std::fs::canonicalize(&tenant_root)?;
-    let canon_www = std::fs::canonicalize(&www)?;
-    let canon_fcgi_dir = std::fs::canonicalize(&bad_fcgi_dir)?;
-    let canon_keyd_dir = std::fs::canonicalize(&bad_keyd_dir)?;
-
-    let cert_path = canon_base.join("tls/server.crt");
-    let key_path = canon_base.join("tls/server.key");
-    std::fs::create_dir_all(canon_base.join("tls"))?;
-    let gen_cert = Command::new(miraserve_bin())
-        .args([
-            "cert",
-            "generate-dev",
-            "--hosts",
-            "tenant.example.test,plain.example.test,keyd.example.test",
-            "--cert",
-        ])
-        .arg(&cert_path)
-        .arg("--key")
-        .arg(&key_path)
-        .output()?;
-    assert!(
-        gen_cert.status.success(),
-        "generate-dev failed: {}",
-        String::from_utf8_lossy(&gen_cert.stderr)
-    );
-
-    let tenant_cfg = conf_dir.join("tenant-fcgi-dir.kdl");
-    std::fs::write(
-        &tenant_cfg,
-        format!(
-            r#"
-server {{
-    listen "127.0.0.1:8443"
-    tls {{ cert "{}"; key "{}" }}
-}}
-site "tenant.example.test" {{
-    owner-dir "{}"
-    root "{}"
-    route "*.php" {{ fastcgi-pass "unix:{}" }}
-}}
-"#,
-            cert_path.display(),
-            key_path.display(),
-            canon_tenant_home.display(),
-            canon_tenant_root.display(),
-            canon_fcgi_dir.display(),
-        ),
-    )?;
-
-    let non_tenant_cfg = conf_dir.join("non-tenant-fcgi-dir.kdl");
-    std::fs::write(
-        &non_tenant_cfg,
-        format!(
-            r#"
-server {{
-    listen "127.0.0.1:8443"
-    tls {{ cert "{}"; key "{}" }}
-}}
-site "plain.example.test" {{
-    root "{}"
-    route "*.php" {{ fastcgi-pass "unix:{}" }}
-}}
-"#,
-            cert_path.display(),
-            key_path.display(),
-            canon_www.display(),
-            canon_fcgi_dir.display(),
-        ),
-    )?;
-
-    let keyd_cfg = conf_dir.join("keyd-dir.kdl");
-    std::fs::write(
-        &keyd_cfg,
-        format!(
-            r#"
-server {{
-    listen "127.0.0.1:8443"
-    tls {{
-        key-isolation "split-daemon"
-        keyd-socket "{}"
-        cert "{}"
-        key "{}"
-    }}
-}}
-site "keyd.example.test" {{
-    root "{}"
-}}
-"#,
-            canon_keyd_dir.display(),
-            cert_path.display(),
-            key_path.display(),
-            canon_www.display(),
-        ),
-    )?;
-
-    #[cfg(target_os = "linux")]
-    {
-        let expected_fcgi = format!(
-            "exact unix endpoint '{}' is not a socket (found directory)",
-            canon_fcgi_dir.display()
-        );
-        let expected_keyd = format!(
-            "exact unix endpoint '{}' is not a socket (found directory)",
-            canon_keyd_dir.display()
-        );
-
-        // --- 1. Tenant site with a directory at its FastCGI path ---
-        let t_plain = Command::new(miraserve_bin())
-            .arg("check")
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(
-            t_plain.status.success(),
-            "plain check on tenant dir should exit 0 (warning only): stderr={}",
-            String::from_utf8_lossy(&t_plain.stderr)
-        );
-        let t_plain_err = String::from_utf8_lossy(&t_plain.stderr);
-        assert!(
-            t_plain_err.contains("warning[W017]:") && t_plain_err.contains(&expected_fcgi),
-            "expected W017 with typed text in plain check, got:\n{t_plain_err}"
-        );
-        let t_plain_strict = Command::new(miraserve_bin())
-            .args(["check", "--strict"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(!t_plain_strict.status.success());
-
-        let t_fs = Command::new(miraserve_bin())
-            .args(["check", "--fs"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(
-            t_fs.status.success(),
-            "check --fs on tenant dir should exit 0 (W026): stderr={}",
-            String::from_utf8_lossy(&t_fs.stderr)
-        );
-        let t_fs_err = String::from_utf8_lossy(&t_fs.stderr);
-        let t_fs_out = String::from_utf8_lossy(&t_fs.stdout);
-        assert!(
-            t_fs_err.contains("warning[W026]:")
-                && t_fs_err.contains(&expected_fcgi)
-                && t_fs_err.contains("503 Service Unavailable"),
-            "expected W026 with typed text in check --fs, got:\n{t_fs_err}"
-        );
-        assert!(
-            !t_fs_err.contains("W033") && !t_fs_err.contains("W017"),
-            "check --fs should not emit W033 or duplicate W017, got:\n{t_fs_err}"
-        );
-        assert!(
-            !t_fs_out.contains("not tested because the check runs as root"),
-            "non-socket must not trigger W033 root note, got:\n{t_fs_out}"
-        );
-        let t_fs_strict = Command::new(miraserve_bin())
-            .args(["check", "--fs", "--strict"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(!t_fs_strict.status.success());
-
-        let t_writable = Command::new(miraserve_bin())
-            .args(["check", "--writable-set"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(
-            t_writable.status.success(),
-            "check --writable-set on tenant dir should exit 0 (quarantined superset): stderr={}",
-            String::from_utf8_lossy(&t_writable.stderr)
-        );
-        let t_writable_out = String::from_utf8(t_writable.stdout)?;
-        assert!(
-            !t_writable_out.contains(&format!("writable landlock {}", canon_fcgi_dir.display())),
-            "wrong-type exact endpoint MUST NEVER be printed as `writable landlock`: {t_writable_out}"
-        );
-        if t_writable_out.lines().next().is_some_and(|l| {
-            l.starts_with("landlock enforced ") || l.starts_with("landlock partial ")
-        }) {
-            assert!(
-                t_writable_out
-                    .lines()
-                    .any(|l| l == format!("writable-missing landlock {}", canon_fcgi_dir.display())),
-                "quarantined tenant socket candidate must appear as writable-missing: {t_writable_out}"
-            );
-        }
-
-        // --- 2. Non-tenant site with a directory at its FastCGI path ---
-        let nt_fs = Command::new(miraserve_bin())
-            .args(["check", "--fs"])
-            .arg(&non_tenant_cfg)
-            .output()?;
-        assert!(
-            !nt_fs.status.success(),
-            "check --fs on non-tenant FastCGI dir must fail with E301"
-        );
-        let nt_fs_err = String::from_utf8_lossy(&nt_fs.stderr);
-        assert!(
-            nt_fs_err.contains("error[E301]:") && nt_fs_err.contains(&expected_fcgi),
-            "expected E301 with typed text for non-tenant FastCGI dir, got:\n{nt_fs_err}"
-        );
-
-        let nt_writable = Command::new(miraserve_bin())
-            .args(["check", "--writable-set"])
-            .arg(&non_tenant_cfg)
-            .output()?;
-        assert!(!nt_writable.status.success());
-        assert_eq!(nt_writable.stdout, b"");
-        assert!(String::from_utf8_lossy(&nt_writable.stderr).contains(&expected_fcgi));
-
-        // --- 3. Server-level `keyd-socket` path that is a directory ---
-        let k_plain = Command::new(miraserve_bin())
-            .arg("check")
-            .arg(&keyd_cfg)
-            .output()?;
-        assert!(
-            k_plain.status.success(),
-            "plain check on keyd dir should exit 0 (W017): stderr={}",
-            String::from_utf8_lossy(&k_plain.stderr)
-        );
-        let k_plain_err = String::from_utf8_lossy(&k_plain.stderr);
-        assert!(
-            k_plain_err.contains("warning[W017]:") && k_plain_err.contains(&expected_keyd),
-            "expected W017 with typed text for keyd dir, got:\n{k_plain_err}"
-        );
-
-        let k_fs = Command::new(miraserve_bin())
-            .args(["check", "--fs"])
-            .arg(&keyd_cfg)
-            .output()?;
-        assert!(
-            !k_fs.status.success(),
-            "check --fs on keyd dir must exit non-zero"
-        );
-        let k_fs_err = String::from_utf8_lossy(&k_fs.stderr);
-        assert!(
-            k_fs_err.contains("error[E301]:") && k_fs_err.contains(&expected_keyd),
-            "expected E301 with typed text for keyd dir, got:\n{k_fs_err}"
-        );
-
-        let k_writable = Command::new(miraserve_bin())
-            .args(["check", "--writable-set"])
-            .arg(&keyd_cfg)
-            .output()?;
-        assert!(
-            !k_writable.status.success(),
-            "check --writable-set on keyd dir must fail"
-        );
-        assert!(
-            k_writable.stdout.is_empty(),
-            "failed check --writable-set must print empty stdout, got: {}",
-            String::from_utf8_lossy(&k_writable.stdout)
-        );
-        let k_writable_err = String::from_utf8_lossy(&k_writable.stderr);
-        assert!(
-            k_writable_err.contains(&expected_keyd),
-            "expected typed reason on stderr, got:\n{k_writable_err}"
-        );
-
-        for extra in [&[][..], &["--no-sandbox"][..]] {
-            let run_out = Command::new(miraserve_bin())
-                .arg("run")
-                .args(extra)
-                .arg(&keyd_cfg)
-                .output()?;
-            assert!(
-                !run_out.status.success(),
-                "miraserve run {extra:?} must refuse keyd directory"
-            );
-            let run_err = String::from_utf8_lossy(&run_out.stderr);
-            assert!(
-                run_err.contains(&expected_keyd),
-                "miraserve run {extra:?} must emit typed reason, got:\n{run_err}"
-            );
-        }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let t_plain = Command::new(miraserve_bin())
-            .args(["check", "--strict"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(
-            t_plain.status.success(),
-            "non-Linux plain check --strict must pass unchanged: stderr={}",
-            String::from_utf8_lossy(&t_plain.stderr)
-        );
-        let t_fs = Command::new(miraserve_bin())
-            .args(["check", "--fs", "--strict"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(
-            t_fs.status.success(),
-            "non-Linux check --fs --strict on tenant FastCGI dir must pass unchanged: stderr={}",
-            String::from_utf8_lossy(&t_fs.stderr)
-        );
-        let t_writable = Command::new(miraserve_bin())
-            .args(["check", "--writable-set"])
-            .arg(&tenant_cfg)
-            .output()?;
-        assert!(t_writable.status.success());
-        assert_eq!(
-            String::from_utf8(t_writable.stdout)?,
-            "landlock unavailable\n"
-        );
-    }
 
     let _ = std::fs::remove_dir_all(&base);
     Ok(())

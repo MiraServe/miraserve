@@ -209,15 +209,14 @@ enum GrantState {
         #[cfg(target_os = "linux")]
         fd: std::sync::Arc<std::os::fd::OwnedFd>,
         #[cfg(target_os = "linux")]
-        file_type: rustix::fs::FileType,
+        is_dir: bool,
     },
     /// Path did not exist at startup so Landlock omitted it; it cannot cover paths that appear
     /// later unless another installed ancestor covers them.
     AbsentAtStartup,
     /// The path exists (or could not be proven absent) but opening, inspecting or validating it
-    /// failed — e.g. `EMFILE`, `EACCES`, `ELOOP`, an I/O error, a `read-tree`/`socket-tree`
-    /// whose opened object resolves into a forbidden directory, or (on Linux) an exact Unix
-    /// endpoint whose opened descriptor is not a socket. Startup and reload refuse every
+    /// failed — e.g. `EMFILE`, `EACCES`, `ELOOP`, an I/O error, or a `read-tree`/`socket-tree`
+    /// whose opened object resolves into a forbidden directory. Startup and reload refuse every
     /// [`Self::Failed`] entry (quarantining sole tenant consumers); policy inspection
     /// (`check --writable-set`) fails closed on [`GrantFailureKind::PolicyRejection`] and
     /// [`GrantFailureKind::ResourceExhausted`], and reports [`GrantFailureKind::OpenError`] on
@@ -226,29 +225,6 @@ enum GrantState {
         reason: String,
         kind: GrantFailureKind,
     },
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_file_type_label(ft: rustix::fs::FileType) -> &'static str {
-    match ft {
-        rustix::fs::FileType::Directory => "directory",
-        rustix::fs::FileType::RegularFile => "regular file",
-        rustix::fs::FileType::Fifo => "FIFO",
-        rustix::fs::FileType::Symlink => "symbolic link",
-        rustix::fs::FileType::CharacterDevice => "character device",
-        rustix::fs::FileType::BlockDevice => "block device",
-        rustix::fs::FileType::Socket => "socket",
-        rustix::fs::FileType::Unknown => "unknown file type",
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn exact_endpoint_not_socket_reason(path: &Path, ft: rustix::fs::FileType) -> String {
-    format!(
-        "exact unix endpoint '{}' is not a socket (found {})",
-        sanitize_path_for_display(path),
-        linux_file_type_label(ft),
-    )
 }
 
 impl PartialEq for GrantState {
@@ -269,15 +245,15 @@ impl PartialEq for GrantState {
             (
                 Self::Installed {
                     identity: a_id,
-                    file_type: a_ft,
+                    is_dir: a_dir,
                     ..
                 },
                 Self::Installed {
                     identity: b_id,
-                    file_type: b_ft,
+                    is_dir: b_dir,
                     ..
                 },
-            ) => a_id == b_id && a_ft == b_ft,
+            ) => a_id == b_id && a_dir == b_dir,
             #[cfg(all(unix, not(target_os = "linux")))]
             (Self::Installed { identity: a_id }, Self::Installed { identity: b_id }) => {
                 a_id == b_id
@@ -352,21 +328,6 @@ pub struct SandboxPolicy {
     /// config validator's forbidden-tree rule before its descriptor is retained (Codex Round-10).
     #[serde(skip)]
     tree_paths: BTreeSet<PathBuf>,
-    /// Operator-configured `socket-tree` directories (the sole directory exception in
-    /// `socket_paths`, distinct from `read-tree` and exact Unix socket endpoints).
-    #[serde(skip)]
-    socket_tree_paths: BTreeSet<PathBuf>,
-    /// Exact Unix endpoint paths (`server.tls.keyd_socket` and `fastcgi-pass "unix:..."`), kept
-    /// distinct from `socket-tree` directories so exact-endpoint type checks and consumer
-    /// attribution do not conflate them with independently valid roles at the same spelling.
-    #[serde(skip)]
-    exact_socket_paths: BTreeSet<PathBuf>,
-    /// Linux-only typed rejections for exact Unix endpoint paths that resolved to a non-socket.
-    /// Kept separate from `grant_states` when another independently valid role (e.g. `read-tree`,
-    /// docroot, `ai-publish.storage`, `socket-tree`, or a rotating log directory) shares the same
-    /// spelling, so the other role retains its own grant state and is never overwritten.
-    #[serde(skip)]
-    exact_endpoint_rejections: BTreeMap<PathBuf, String>,
 }
 
 /// Audit report returned after applying a [`SandboxPolicy`].
@@ -415,8 +376,7 @@ impl SandboxPolicy {
     ) -> Self {
         let mut ro: BTreeSet<PathBuf> = BTreeSet::new();
         let mut rw: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut exact_socks: BTreeSet<PathBuf> = BTreeSet::new();
-        let mut socket_tree_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut socks: BTreeSet<PathBuf> = BTreeSet::new();
         let mut fallbacks: BTreeSet<PathBuf> = BTreeSet::new();
         let mut pinned_ro: Vec<PinnedReadOnlyPath> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
@@ -521,7 +481,7 @@ impl SandboxPolicy {
             && !sock.starts_with("tcp://")
         {
             let path_str = sock.strip_prefix("unix:").unwrap_or(sock);
-            insert_exact_path(&mut exact_socks, Path::new(path_str));
+            insert_exact_path(&mut socks, Path::new(path_str));
         }
 
         // R6-SBX-1: Track effective ACME state dir so no HTTP docroot overlapping it is granted RO.
@@ -727,7 +687,7 @@ impl SandboxPolicy {
                 match &route.handler {
                     RouteHandler::FastCgi(fcgi) => {
                         if let FastCgiTarget::Unix { path } = &fcgi.target {
-                            insert_exact_path(&mut exact_socks, Path::new(path));
+                            insert_exact_path(&mut socks, Path::new(path));
                         }
                     }
                     RouteHandler::ReverseProxy(rp) => {
@@ -785,7 +745,7 @@ impl SandboxPolicy {
             (&config.server.sandbox.read_trees, &mut ro, "read-tree"),
             (
                 &config.server.sandbox.socket_trees,
-                &mut socket_tree_paths,
+                &mut socks,
                 "socket-tree",
             ),
         ] {
@@ -796,80 +756,6 @@ impl SandboxPolicy {
                     let tp = PathBuf::from(tree.trim_end_matches('/'));
                     tree_paths.insert(tp.clone());
                     set.insert(tp);
-                }
-            }
-        }
-
-        let mut socks: BTreeSet<PathBuf> = socket_tree_paths.clone();
-        #[cfg(target_os = "linux")]
-        let mut preopened: BTreeMap<PathBuf, GrantState> = BTreeMap::new();
-        #[cfg(target_os = "linux")]
-        let mut exact_endpoint_rejections: BTreeMap<PathBuf, String> = BTreeMap::new();
-        #[cfg(not(target_os = "linux"))]
-        let exact_endpoint_rejections: BTreeMap<PathBuf, String> = BTreeMap::new();
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            socks.extend(exact_socks.iter().cloned());
-        }
-        #[cfg(target_os = "linux")]
-        {
-            for p in &exact_socks {
-                let has_other_role =
-                    ro.contains(p) || rw.contains(p) || socket_tree_paths.contains(p);
-                if has_other_role {
-                    // Open once and inspect the descriptor type: if it is not a socket, reject
-                    // ONLY the exact-endpoint role so the independently valid role at the same
-                    // spelling keeps its exact 0.1.5 rule and rights.
-                    match open_grant_linux_raw(p) {
-                        Ok((fd, identity, file_type))
-                            if file_type != rustix::fs::FileType::Socket =>
-                        {
-                            exact_endpoint_rejections
-                                .insert(p.clone(), exact_endpoint_not_socket_reason(p, file_type));
-                            let other_state = if tree_paths.contains(p) {
-                                drop(fd);
-                                open_validated_tree(
-                                    p,
-                                    identity,
-                                    file_type == rustix::fs::FileType::Directory,
-                                    |path: &Path| std::fs::canonicalize(path),
-                                )
-                            } else {
-                                GrantState::Installed {
-                                    identity,
-                                    fd: std::sync::Arc::new(fd),
-                                    file_type,
-                                }
-                            };
-                            preopened.insert(p.clone(), other_state);
-                        }
-                        Ok((fd, identity, file_type)) => {
-                            socks.insert(p.clone());
-                            let state = if tree_paths.contains(p) {
-                                drop(fd);
-                                open_validated_tree(
-                                    p,
-                                    identity,
-                                    file_type == rustix::fs::FileType::Directory,
-                                    |path: &Path| std::fs::canonicalize(path),
-                                )
-                            } else {
-                                GrantState::Installed {
-                                    identity,
-                                    fd: std::sync::Arc::new(fd),
-                                    file_type,
-                                }
-                            };
-                            preopened.insert(p.clone(), state);
-                        }
-                        Err(state) => {
-                            socks.insert(p.clone());
-                            preopened.insert(p.clone(), state);
-                        }
-                    }
-                } else {
-                    socks.insert(p.clone());
                 }
             }
         }
@@ -897,23 +783,7 @@ impl SandboxPolicy {
             .chain(read_write_paths.iter())
             .chain(socket_paths.iter())
         {
-            #[cfg(target_os = "linux")]
-            if let Some(pre) = preopened.remove(p) {
-                grant_states.insert(p.clone(), pre);
-                continue;
-            }
-            let require_socket = exact_socks.contains(p) && !socket_tree_paths.contains(p);
-            let state = open_grant(p, tree_paths.contains(p), require_socket);
-            #[cfg(target_os = "linux")]
-            if require_socket
-                && let GrantState::Failed {
-                    reason,
-                    kind: GrantFailureKind::PolicyRejection,
-                } = &state
-            {
-                exact_endpoint_rejections.insert(p.clone(), reason.clone());
-            }
-            grant_states.insert(p.clone(), state);
+            grant_states.insert(p.clone(), open_grant(p, tree_paths.contains(p)));
         }
 
         Self {
@@ -931,9 +801,6 @@ impl SandboxPolicy {
             warnings,
             grant_states,
             tree_paths,
-            socket_tree_paths,
-            exact_socket_paths: exact_socks,
-            exact_endpoint_rejections,
         }
     }
 
@@ -1016,12 +883,6 @@ impl SandboxPolicy {
                     resource_failed.push(format!("'{}': {reason}", sanitize_path_for_display(p)));
                 }
                 Some(_) => {}
-            }
-        }
-        for (p, reason) in &self.exact_endpoint_rejections {
-            let entry = format!("'{}': {reason}", sanitize_path_for_display(p));
-            if !policy_rejected.contains(&entry) {
-                policy_rejected.push(entry);
             }
         }
         if !resource_failed.is_empty() {
@@ -1153,19 +1014,8 @@ impl SandboxPolicy {
                     identity,
                     #[cfg(target_os = "linux")]
                     fd,
-                    #[cfg(target_os = "linux")]
-                    file_type,
+                    ..
                 }) => {
-                    #[cfg(target_os = "linux")]
-                    if !self.socket_tree_paths.contains(p)
-                        && *file_type != rustix::fs::FileType::Socket
-                    {
-                        return Err(SandboxError::Landlock(format!(
-                            "sandbox socket grant '{}' failed validation: {}",
-                            sanitize_path_for_display(p),
-                            exact_endpoint_not_socket_reason(p, *file_type)
-                        )));
-                    }
                     #[cfg(target_os = "linux")]
                     let path = derive_and_verify_pinned_path(p, fd.as_ref(), *identity)?;
                     #[cfg(all(unix, not(target_os = "linux")))]
@@ -1230,7 +1080,6 @@ impl SandboxPolicy {
     /// # Errors
     /// Returns [`SandboxError::Landlock`] listing every grant that could not be opened or whose
     /// opened object failed validation.
-    #[allow(clippy::too_many_lines)]
     pub fn finalize_grants(&mut self) -> Result<(), SandboxError> {
         // Codex Round-11 P2: the public path lists are the source of truth for access class.
         // A rotating-log pin whose directory is no longer requested read-write, or a tenant pin
@@ -1254,79 +1103,13 @@ impl SandboxPolicy {
             .cloned()
             .collect();
         self.grant_states.retain(|p, _| wanted.contains(p));
-        self.exact_socket_paths.retain(|p| wanted.contains(p));
-        self.exact_endpoint_rejections
-            .retain(|p, _| wanted.contains(p));
         let mut dropped_tenant_grants: Vec<PathBuf> = Vec::new();
         for p in &wanted {
             let previous = self.grant_states.get(p);
-            #[cfg(target_os = "linux")]
-            let is_exact_sock = (self.socket_paths.contains(p)
-                && !self.socket_tree_paths.contains(p))
-                || self.exact_socket_paths.contains(p);
-            #[cfg(target_os = "linux")]
-            let has_other_role = self.read_only_paths.contains(p)
-                || self.read_write_paths.contains(p)
-                || self.socket_tree_paths.contains(p);
-            #[cfg(target_os = "linux")]
-            {
-                if let Some(GrantState::Installed { file_type, .. }) = previous {
-                    if is_exact_sock && *file_type != rustix::fs::FileType::Socket {
-                        let reason = exact_endpoint_not_socket_reason(p, *file_type);
-                        self.exact_endpoint_rejections
-                            .insert(p.clone(), reason.clone());
-                        if !has_other_role {
-                            self.grant_states.insert(
-                                p.clone(),
-                                GrantState::Failed {
-                                    reason,
-                                    kind: GrantFailureKind::PolicyRejection,
-                                },
-                            );
-                        }
-                    }
-                    continue;
-                }
+            let keep = matches!(previous, Some(GrantState::Installed { .. }));
+            if !keep {
                 let was_absent = matches!(previous, Some(GrantState::AbsentAtStartup));
-                let mut state = if is_exact_sock && has_other_role {
-                    match open_grant_linux_raw(p) {
-                        Ok((fd, identity, file_type)) => {
-                            if file_type == rustix::fs::FileType::Socket {
-                                self.exact_endpoint_rejections.remove(p);
-                            } else if was_absent && self.tenant_only_paths.contains(p) {
-                                tracing::warn!(
-                                    path = %p.display(),
-                                    "read-only grant appeared but cannot be opened; left out of the sandbox (what needs it answers 503)"
-                                );
-                                self.exact_socket_paths.remove(p);
-                                self.exact_endpoint_rejections.remove(p);
-                            } else {
-                                self.exact_endpoint_rejections.insert(
-                                    p.clone(),
-                                    exact_endpoint_not_socket_reason(p, file_type),
-                                );
-                            }
-                            if self.tree_paths.contains(p) {
-                                drop(fd);
-                                open_validated_tree(
-                                    p,
-                                    identity,
-                                    file_type == rustix::fs::FileType::Directory,
-                                    |path: &Path| std::fs::canonicalize(path),
-                                )
-                            } else {
-                                GrantState::Installed {
-                                    identity,
-                                    fd: std::sync::Arc::new(fd),
-                                    file_type,
-                                }
-                            }
-                        }
-                        Err(err_state) => err_state,
-                    }
-                } else {
-                    open_grant(p, self.tree_paths.contains(p), is_exact_sock)
-                };
+                let mut state = open_grant(p, self.tree_paths.contains(p));
                 // A grant only tenant sites need that did not exist when the policy was built and
                 // cannot be opened now is treated as still absent: that tenant's site fails on
                 // its own instead of the whole start. Anything the server or another site needs
@@ -1340,45 +1123,9 @@ impl SandboxPolicy {
                         "read-only grant appeared but cannot be opened; left out of the sandbox (what needs it answers 503)"
                     );
                     state = GrantState::AbsentAtStartup;
-                    self.exact_endpoint_rejections.remove(p);
                     dropped_tenant_grants.push(p.clone());
-                } else if is_exact_sock && !has_other_role {
-                    if let GrantState::Failed {
-                        reason,
-                        kind: GrantFailureKind::PolicyRejection,
-                    } = &state
-                    {
-                        self.exact_endpoint_rejections
-                            .insert(p.clone(), reason.clone());
-                    } else {
-                        self.exact_endpoint_rejections.remove(p);
-                    }
                 }
                 self.grant_states.insert(p.clone(), state);
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                let keep = matches!(previous, Some(GrantState::Installed { .. }));
-                if !keep {
-                    let was_absent = matches!(previous, Some(GrantState::AbsentAtStartup));
-                    let mut state = open_grant(p, self.tree_paths.contains(p), false);
-                    // A grant only tenant sites need that did not exist when the policy was built and
-                    // cannot be opened now is treated as still absent: that tenant's site fails on
-                    // its own instead of the whole start. Anything the server or another site needs
-                    // still fails the start.
-                    if was_absent
-                        && self.tenant_only_paths.contains(p)
-                        && matches!(state, GrantState::Failed { .. })
-                    {
-                        tracing::warn!(
-                            path = %p.display(),
-                            "read-only grant appeared but cannot be opened; left out of the sandbox (what needs it answers 503)"
-                        );
-                        state = GrantState::AbsentAtStartup;
-                        dropped_tenant_grants.push(p.clone());
-                    }
-                    self.grant_states.insert(p.clone(), state);
-                }
             }
         }
         // An absent writable or socket grant cannot be installed at all; a tenant-only one that
@@ -1386,8 +1133,6 @@ impl SandboxPolicy {
         for p in &dropped_tenant_grants {
             self.read_write_paths.retain(|x| x != p);
             self.socket_paths.retain(|x| x != p);
-            self.exact_socket_paths.remove(p);
-            self.exact_endpoint_rejections.remove(p);
             if !self.read_only_paths.contains(p) {
                 self.grant_states.remove(p);
             }
@@ -1430,43 +1175,9 @@ impl SandboxPolicy {
     /// attributing a failure to whoever owns the path without parsing messages.
     #[must_use]
     pub fn grant_failure_paths(&self) -> Vec<PathBuf> {
-        let mut paths: BTreeSet<PathBuf> = self
-            .grant_states
-            .iter()
-            .filter(|(_, st)| matches!(st, GrantState::Failed { .. }))
-            .map(|(p, _)| p.clone())
-            .collect();
-        paths.extend(self.exact_endpoint_rejections.keys().cloned());
-        paths.into_iter().collect()
-    }
-
-    /// Exact Unix endpoint paths (`server.tls.keyd_socket` and `fastcgi-pass "unix:..."`)
-    /// requested by this policy, excluding `socket-tree` directories.
-    #[must_use]
-    pub fn exact_socket_paths(&self) -> &BTreeSet<PathBuf> {
-        &self.exact_socket_paths
-    }
-
-    /// Linux-only typed rejections for exact Unix endpoint paths that resolved to a non-socket.
-    /// Always empty on non-Linux platforms.
-    #[must_use]
-    pub fn exact_endpoint_rejections(&self) -> &BTreeMap<PathBuf, String> {
-        &self.exact_endpoint_rejections
-    }
-
-    /// Paths whose grant failed for a reason other than a Linux exact-endpoint type rejection
-    /// (for example `EACCES`, `ELOOP`, `ENOTDIR`, resource exhaustion, or `read-tree`/`socket-tree`
-    /// validation failure).
-    #[must_use]
-    pub fn non_exact_endpoint_grant_failure_paths(&self) -> Vec<PathBuf> {
         self.grant_states
             .iter()
-            .filter(|(p, st)| match st {
-                GrantState::Failed { reason, .. } => {
-                    self.exact_endpoint_rejections.get(*p) != Some(reason)
-                }
-                _ => false,
-            })
+            .filter(|(_, st)| matches!(st, GrantState::Failed { .. }))
             .map(|(p, _)| p.clone())
             .collect()
     }
@@ -1477,35 +1188,22 @@ impl SandboxPolicy {
     /// (Codex Round-11 P2).
     #[must_use]
     pub fn grant_failures(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .grant_states
+        self.grant_states
             .iter()
             .filter_map(|(p, st)| match st {
                 GrantState::Failed { reason, .. } => Some(format!("'{}': {reason}", p.display())),
                 _ => None,
             })
-            .collect();
-        for (p, reason) in &self.exact_endpoint_rejections {
-            let already = matches!(
-                self.grant_states.get(p),
-                Some(GrantState::Failed { reason: existing, .. }) if existing == reason
-            );
-            if !already {
-                out.push(format!("'{}': {reason}", p.display()));
-            }
-        }
-        out
+            .collect()
     }
 
     /// Returns only the grant failures caused by security/policy rejections (e.g. a forbidden
-    /// `read-tree`/`socket-tree` target, swap during validation, or non-socket exact Unix
-    /// endpoint on Linux), excluding OS open/stat failures (`EACCES`, `ELOOP`, `ENOTDIR`) so
-    /// `check --writable-set` can fail closed on policy rejections while reporting unopenable
-    /// candidates as `writable-missing`.
+    /// `read-tree`/`socket-tree` target or swap during validation), excluding OS open/stat
+    /// failures (`EACCES`, `ELOOP`, `ENOTDIR`) so `check --writable-set` can fail closed on
+    /// policy rejections while reporting unopenable candidates as `writable-missing`.
     #[must_use]
     pub fn policy_rejection_failures(&self) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .grant_states
+        self.grant_states
             .iter()
             .filter_map(|(p, st)| match st {
                 GrantState::Failed {
@@ -1514,20 +1212,7 @@ impl SandboxPolicy {
                 } => Some(format!("'{}': {reason}", sanitize_path_for_display(p))),
                 _ => None,
             })
-            .collect();
-        for (p, reason) in &self.exact_endpoint_rejections {
-            let already = matches!(
-                self.grant_states.get(p),
-                Some(GrantState::Failed {
-                    reason: existing,
-                    kind: GrantFailureKind::PolicyRejection,
-                }) if existing == reason
-            );
-            if !already {
-                out.push(format!("'{}': {reason}", sanitize_path_for_display(p)));
-            }
-        }
-        out
+            .collect()
     }
 
     /// Returns grant failures caused by OS descriptor or memory exhaustion (`EMFILE`, `ENFILE`,
@@ -1557,7 +1242,7 @@ impl SandboxPolicy {
         self.exact_file_fallbacks = fb.into_iter().collect();
         for p in &self.read_only_paths {
             if !self.grant_states.contains_key(p) {
-                let state = open_grant(p, self.tree_paths.contains(p), false);
+                let state = open_grant(p, self.tree_paths.contains(p));
                 self.grant_states.insert(p.clone(), state);
             }
         }
@@ -1942,38 +1627,7 @@ impl SandboxPolicy {
         let mut rw: BTreeSet<PathBuf> = self.read_write_paths.iter().cloned().collect();
         rw.insert(real_parent.clone());
         self.read_write_paths = rw.into_iter().collect();
-        let rp_state = open_grant(&real_parent, false, false);
-        #[cfg(target_os = "linux")]
-        {
-            let is_exact_sock = self.socket_paths.iter().any(|p| {
-                normalized_paths_equal(p, &real_parent) && !self.socket_tree_paths.contains(p)
-            }) || self
-                .exact_socket_paths
-                .iter()
-                .any(|p| normalized_paths_equal(p, &real_parent));
-            if is_exact_sock
-                && let GrantState::Installed { file_type, .. } = &rp_state
-                && *file_type != rustix::fs::FileType::Socket
-            {
-                let was_absent_tenant = matches!(
-                    self.grant_states.get(&real_parent),
-                    Some(GrantState::AbsentAtStartup)
-                ) && self.tenant_only_paths.contains(&real_parent);
-                if was_absent_tenant {
-                    self.socket_paths
-                        .retain(|x| !normalized_paths_equal(x, &real_parent));
-                    self.exact_socket_paths
-                        .retain(|x| !normalized_paths_equal(x, &real_parent));
-                    self.exact_endpoint_rejections
-                        .retain(|x, _| !normalized_paths_equal(x, &real_parent));
-                } else {
-                    self.exact_endpoint_rejections.insert(
-                        real_parent.clone(),
-                        exact_endpoint_not_socket_reason(&real_parent, *file_type),
-                    );
-                }
-            }
-        }
+        let rp_state = open_grant(&real_parent, false);
         self.grant_states.insert(real_parent.clone(), rp_state);
         self.read_only_paths.retain(|p| {
             !normalized_paths_equal(p, &real_parent) && !normalized_paths_equal(p, parent)
@@ -2457,49 +2111,6 @@ pub fn check_docroot_classification_resources(
     Ok(())
 }
 
-/// Opens one grant target on Linux with `O_PATH | O_CLOEXEC` and reads its `(st_dev, st_ino)` and
-/// full `FileType` from `fstat` on that exact descriptor (no second lookup, no extra descriptors).
-#[cfg(target_os = "linux")]
-fn open_grant_linux_raw(
-    path: &Path,
-) -> Result<(std::os::fd::OwnedFd, (u64, u64), rustix::fs::FileType), GrantState> {
-    use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, openat};
-    use rustix::io::Errno;
-    let fd = match openat(CWD, path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Err(GrantState::AbsentAtStartup),
-        Err(err) => {
-            let kind = if matches!(err, Errno::MFILE | Errno::NFILE | Errno::NOMEM) {
-                GrantFailureKind::ResourceExhausted
-            } else {
-                GrantFailureKind::OpenError
-            };
-            return Err(GrantState::Failed {
-                reason: format!("cannot open grant target: {}", std::io::Error::from(err)),
-                kind,
-            });
-        }
-    };
-    let st = match fstat(&fd) {
-        Ok(st) => st,
-        Err(err) => {
-            let kind = if matches!(err, Errno::MFILE | Errno::NFILE | Errno::NOMEM) {
-                GrantFailureKind::ResourceExhausted
-            } else {
-                GrantFailureKind::OpenError
-            };
-            return Err(GrantState::Failed {
-                reason: format!("cannot inspect grant target: {}", std::io::Error::from(err)),
-                kind,
-            });
-        }
-    };
-    #[allow(clippy::useless_conversion)]
-    let identity = (u64::from(st.st_dev), u64::from(st.st_ino));
-    let file_type = FileType::from_raw_mode(st.st_mode);
-    Ok((fd, identity, file_type))
-}
-
 /// Opens (and, for operator trees, validates) one grant target, returning the state that both
 /// reload coverage and Landlock installation will use (Codex Round-9/10/11).
 ///
@@ -2509,42 +2120,57 @@ fn open_grant_linux_raw(
 ///   resolved to a candidate location, the tree policy is applied to that location, and the
 ///   descriptor that is retained and installed is opened at that location without following any
 ///   link, so the granted object is exactly the object at the validated location.
-/// - On Linux, when `require_socket` is `true` (an exact Unix endpoint from `fastcgi-pass` or
-///   `server.tls.keyd-socket`, not a `socket-tree`), the opened descriptor's `fstat` type must be
-///   `FileType::Socket`; any other type is rejected with [`GrantFailureKind::PolicyRejection`] and
-///   no descriptor is retained.
-fn open_grant(path: &Path, is_tree: bool, require_socket: bool) -> GrantState {
+fn open_grant(path: &Path, is_tree: bool) -> GrantState {
     #[cfg(target_os = "linux")]
     {
-        use rustix::fs::FileType;
-        let (fd, identity, file_type) = match open_grant_linux_raw(path) {
-            Ok(opened) => opened,
-            Err(state) => return state,
+        use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, openat};
+        use rustix::io::Errno;
+        let fd = match openat(CWD, path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return GrantState::AbsentAtStartup,
+            Err(err) => {
+                let kind = if matches!(err, Errno::MFILE | Errno::NFILE | Errno::NOMEM) {
+                    GrantFailureKind::ResourceExhausted
+                } else {
+                    GrantFailureKind::OpenError
+                };
+                return GrantState::Failed {
+                    reason: format!("cannot open grant target: {}", std::io::Error::from(err)),
+                    kind,
+                };
+            }
         };
-        let is_dir = file_type == FileType::Directory;
+        let st = match fstat(&fd) {
+            Ok(st) => st,
+            Err(err) => {
+                let kind = if matches!(err, Errno::MFILE | Errno::NFILE | Errno::NOMEM) {
+                    GrantFailureKind::ResourceExhausted
+                } else {
+                    GrantFailureKind::OpenError
+                };
+                return GrantState::Failed {
+                    reason: format!("cannot inspect grant target: {}", std::io::Error::from(err)),
+                    kind,
+                };
+            }
+        };
+        #[allow(clippy::useless_conversion)]
+        let identity = (u64::from(st.st_dev), u64::from(st.st_ino));
+        let is_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory;
         if is_tree {
-            drop(fd);
             return open_validated_tree(path, identity, is_dir, |p: &Path| {
                 std::fs::canonicalize(p)
             });
         }
-        if require_socket && file_type != FileType::Socket {
-            drop(fd);
-            return GrantState::Failed {
-                reason: exact_endpoint_not_socket_reason(path, file_type),
-                kind: GrantFailureKind::PolicyRejection,
-            };
-        }
         GrantState::Installed {
             identity,
             fd: std::sync::Arc::new(fd),
-            file_type,
+            is_dir,
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let _ = require_socket;
         match std::fs::metadata(path) {
             Ok(md) => {
                 let identity = (md.dev(), md.ino());
@@ -2571,7 +2197,7 @@ fn open_grant(path: &Path, is_tree: bool, require_socket: bool) -> GrantState {
     }
     #[cfg(not(unix))]
     {
-        let _ = (is_tree, require_socket);
+        let _ = is_tree;
         match std::fs::metadata(path) {
             Ok(_) => GrantState::Installed {},
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => GrantState::AbsentAtStartup,
@@ -2656,7 +2282,7 @@ fn open_validated_tree(
         GrantState::Installed {
             identity: (dev, ino),
             fd: std::sync::Arc::new(std::os::fd::OwnedFd::from(file)),
-            file_type: rustix::fs::FileType::Directory,
+            is_dir: true,
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -5000,10 +4626,7 @@ mod linux {
                 && path.starts_with(tree)
                 && matches!(
                     policy.grant_states.get(tree),
-                    Some(super::GrantState::Installed {
-                        file_type: rustix::fs::FileType::Directory,
-                        ..
-                    })
+                    Some(super::GrantState::Installed { is_dir: true, .. })
                 )
         })
     }
@@ -5018,18 +4641,11 @@ mod linux {
             .map_or(true, |mut seen| seen.insert(key.to_owned()))
     }
 
-    pub(super) struct PreparedLandlockRules<'a> {
-        pub(super) rules: Vec<(&'a std::os::fd::OwnedFd, BitFlags<AccessFs>)>,
-        pub(super) read_only_access: BitFlags<AccessFs>,
-        pub(super) read_write_access: BitFlags<AccessFs>,
-        pub(super) all_abi: BitFlags<AccessFs>,
-    }
-
     #[allow(clippy::too_many_lines)]
-    pub(super) fn prepare_landlock_rules<'a>(
-        policy: &'a SandboxPolicy,
+    pub(crate) fn apply_landlock(
+        policy: &SandboxPolicy,
         notes: &mut Vec<String>,
-    ) -> Result<PreparedLandlockRules<'a>, SandboxError> {
+    ) -> Result<EnforcementStatus, SandboxError> {
         let abi = LANDLOCK_TARGET_ABI;
         let all_abi = AccessFs::from_all(abi);
         // Strip Execute and device/FIFO/symlink-creation rights from data and socket rules.
@@ -5084,12 +4700,6 @@ mod linux {
                 Some(_) => {}
             }
         }
-        for (p, reason) in &policy.exact_endpoint_rejections {
-            let entry = format!("'{}': {reason}", p.display());
-            if !failed.contains(&entry) {
-                failed.push(entry);
-            }
-        }
         if !unfinalized.is_empty() {
             return Err(SandboxError::Landlock(format!(
                 "sandbox policy path(s) were added after construction without finalization: {}; call SandboxPolicy::finalize_grants() before installing the policy",
@@ -5141,8 +4751,8 @@ mod linux {
                 continue;
             }
             match policy.grant_states.get(p) {
-                Some(super::GrantState::Installed { fd, file_type, .. }) => {
-                    let access = if *file_type == rustix::fs::FileType::Directory {
+                Some(super::GrantState::Installed { fd, is_dir, .. }) => {
+                    let access = if *is_dir {
                         read_write_access
                     } else {
                         read_write_file_access
@@ -5171,8 +4781,8 @@ mod linux {
                 continue;
             }
             match policy.grant_states.get(p) {
-                Some(super::GrantState::Installed { fd, file_type, .. }) => {
-                    let access = if *file_type == rustix::fs::FileType::Directory {
+                Some(super::GrantState::Installed { fd, is_dir, .. }) => {
+                    let access = if *is_dir {
                         read_only_access
                     } else {
                         read_file_access
@@ -5205,20 +4815,7 @@ mod linux {
         let mut missing_socks: Vec<String> = Vec::new();
         for p in &policy.socket_paths {
             match policy.grant_states.get(p) {
-                Some(super::GrantState::Installed { fd, file_type, .. }) => {
-                    if policy.socket_tree_paths.contains(p) {
-                        if *file_type != rustix::fs::FileType::Directory {
-                            return Err(SandboxError::Landlock(format!(
-                                "sandbox socket-tree '{}' is not a directory (found {})",
-                                super::sanitize_path_for_display(p),
-                                super::linux_file_type_label(*file_type),
-                            )));
-                        }
-                    } else if *file_type != rustix::fs::FileType::Socket {
-                        return Err(SandboxError::Landlock(
-                            super::exact_endpoint_not_socket_reason(p, *file_type),
-                        ));
-                    }
+                Some(super::GrantState::Installed { fd, .. }) => {
                     sock_rules.push((fd.as_ref(), sock_access));
                 }
                 Some(super::GrantState::AbsentAtStartup | super::GrantState::Failed { .. })
@@ -5244,43 +4841,22 @@ mod linux {
             ));
         }
 
-        let mut rules =
-            Vec::with_capacity(readonly_rules.len() + writable_rules.len() + sock_rules.len());
-        rules.extend(readonly_rules);
-        rules.extend(writable_rules);
-        rules.extend(sock_rules);
-
-        Ok(PreparedLandlockRules {
-            rules,
-            read_only_access,
-            read_write_access,
-            all_abi,
-        })
-    }
-
-    pub(crate) fn apply_landlock(
-        policy: &SandboxPolicy,
-        notes: &mut Vec<String>,
-    ) -> Result<EnforcementStatus, SandboxError> {
-        let prepared = prepare_landlock_rules(policy, notes)?;
-
         let mut ruleset = Ruleset::default()
-            .handle_access(prepared.all_abi)
+            .handle_access(all_abi)
             .map_err(|err| SandboxError::Landlock(err.to_string()))?
             .create()
             .map_err(|err| SandboxError::Landlock(err.to_string()))?;
-        for (fd, access) in prepared.rules {
+        for (fd, access) in readonly_rules
+            .into_iter()
+            .chain(writable_rules)
+            .chain(sock_rules)
+        {
             ruleset = ruleset
                 .add_rule(PathBeneath::new(fd, access))
                 .map_err(|err| SandboxError::Landlock(err.to_string()))?;
         }
 
-        let ruleset = add_pinned_rules(
-            ruleset,
-            policy,
-            prepared.read_write_access,
-            prepared.read_only_access,
-        )?;
+        let ruleset = add_pinned_rules(ruleset, policy, read_write_access, read_only_access)?;
 
         let status = ruleset
             .restrict_self()
@@ -7364,237 +6940,6 @@ site "app.example.com" {
                 crate::EnforcementStatus::UnsupportedPlatform
             );
         }
-        Ok(())
-    }
-
-    /// Pins Linux exact-endpoint `GrantState` descriptor types, exact descriptor count, requested
-    /// path lists/order, and the installer's last-line-of-defence guard for directly injected
-    /// non-socket descriptors (`Directory`, `RegularFile`, `Fifo`) in `socket_paths`.
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn linux_socket_typing_grant_state_descriptor_count_and_installer_guard_whitebox()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use std::os::unix::net::UnixListener;
-
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let base = std::env::temp_dir().join(format!("ms-wb-{}-{:x}", std::process::id(), nanos));
-        let _ = std::fs::remove_dir_all(&base);
-        let www = base.join("www");
-        let acme = base.join("acme");
-        let sock_tree = base.join("sock-tree");
-        let sock_dir = base.join("socks");
-        let reg_file = base.join("plain.txt");
-        let fifo = base.join("pipe");
-        std::fs::create_dir_all(&www)?;
-        std::fs::create_dir_all(&acme)?;
-        std::fs::create_dir_all(&sock_tree)?;
-        std::fs::create_dir_all(&sock_dir)?;
-        std::fs::write(&reg_file, b"hello")?;
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            rustix::fs::FileType::Fifo,
-            rustix::fs::Mode::from_raw_mode(0o600),
-            0,
-        )?;
-        let real_sock = sock_dir.join("live.sock");
-        let _listener = UnixListener::bind(&real_sock)?;
-        let absent_sock = sock_dir.join("absent.sock");
-
-        // 1. Clean config with real socket, absent socket, socket-tree, docroot, ACME dir:
-        //    pin exact lists, order, recorded `FileType`s, and exact retained descriptor count.
-        let kdl = format!(
-            r#"
-server {{
-    listen "127.0.0.1:8443"
-    tls {{ acme {{ email "ops@example.com" }} }}
-    sandbox {{ landlock #true; seccomp "off"; socket-tree "{}" }}
-}}
-site "wb.example.test" {{
-    root "{}"
-    route "/live/*" {{ fastcgi-pass "unix:{}" }}
-    route "/absent/*" {{ fastcgi-pass "unix:{}" }}
-}}
-"#,
-            sock_tree.display(),
-            www.display(),
-            real_sock.display(),
-            absent_sock.display(),
-        );
-        let (cfg, _) = miraserve_config::parse_kdl("wb.kdl", &kdl)?;
-        let policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, Some(&acme));
-        assert!(
-            policy.grant_failures().is_empty(),
-            "unexpected grant failures: {:?}",
-            policy.grant_failures()
-        );
-        assert_eq!(policy.read_write_paths, vec![acme.clone()]);
-        let mut expected_socks = vec![sock_tree.clone(), real_sock.clone(), absent_sock.clone()];
-        expected_socks.sort();
-        assert_eq!(policy.socket_paths, expected_socks);
-
-        // Verify exact recorded FileTypes from the single `fstat` on each descriptor.
-        assert!(matches!(
-            policy.grant_states.get(&www),
-            Some(crate::GrantState::Installed {
-                file_type: rustix::fs::FileType::Directory,
-                ..
-            })
-        ));
-        assert!(matches!(
-            policy.grant_states.get(&acme),
-            Some(crate::GrantState::Installed {
-                file_type: rustix::fs::FileType::Directory,
-                ..
-            })
-        ));
-        assert!(matches!(
-            policy.grant_states.get(&sock_tree),
-            Some(crate::GrantState::Installed {
-                file_type: rustix::fs::FileType::Directory,
-                ..
-            })
-        ));
-        assert!(matches!(
-            policy.grant_states.get(&real_sock),
-            Some(crate::GrantState::Installed {
-                file_type: rustix::fs::FileType::Socket,
-                ..
-            })
-        ));
-        assert!(matches!(
-            policy.grant_states.get(&absent_sock),
-            Some(crate::GrantState::AbsentAtStartup)
-        ));
-        // Total `grant_states` entries == total paths across all 3 lists (no extra entries/fds).
-        let total_listed = policy.read_only_paths.len()
-            + policy.read_write_paths.len()
-            + policy.socket_paths.len();
-        assert_eq!(policy.grant_states.len(), total_listed);
-        let installed_fds = policy
-            .grant_states
-            .values()
-            .filter(|st| matches!(st, crate::GrantState::Installed { .. }))
-            .count();
-        let existing_listed = policy
-            .read_only_paths
-            .iter()
-            .chain(policy.read_write_paths.iter())
-            .chain(policy.socket_paths.iter())
-            .filter(|p| p.exists())
-            .count();
-        assert_eq!(
-            installed_fds, existing_listed,
-            "must hold exactly one descriptor per existing grant and zero extra descriptors"
-        );
-
-        // Pin exact Landlock rule order (RO -> RW -> Socket) and exact AccessFs masks on the
-        // prepared ruleset list (Requirement 6 parity: identical to 0.1.5).
-        let mut notes = Vec::new();
-        let prepared = crate::linux::prepare_landlock_rules(&policy, &mut notes)?;
-        let expected_read_only_dir =
-            (landlock::AccessFs::ReadFile | landlock::AccessFs::ReadDir) & prepared.all_abi;
-        let expected_read_only_file = expected_read_only_dir & landlock::AccessFs::ReadFile;
-        let expected_read_write_dir = (landlock::AccessFs::ReadFile
-            | landlock::AccessFs::ReadDir
-            | landlock::AccessFs::WriteFile
-            | landlock::AccessFs::Truncate
-            | landlock::AccessFs::MakeReg
-            | landlock::AccessFs::MakeDir
-            | landlock::AccessFs::RemoveFile
-            | landlock::AccessFs::RemoveDir
-            | landlock::AccessFs::Refer)
-            & prepared.all_abi;
-        let expected_sock =
-            (landlock::AccessFs::ReadFile | landlock::AccessFs::WriteFile) & prepared.all_abi;
-
-        let mut expected_order_and_masks: Vec<(
-            (u64, u64),
-            landlock::BitFlags<landlock::AccessFs>,
-        )> = Vec::new();
-        for p in &policy.read_only_paths {
-            if let Some(crate::GrantState::Installed {
-                identity,
-                file_type,
-                ..
-            }) = policy.grant_states.get(p)
-            {
-                let mask = if *file_type == rustix::fs::FileType::Directory {
-                    expected_read_only_dir
-                } else {
-                    expected_read_only_file
-                };
-                expected_order_and_masks.push((*identity, mask));
-            }
-        }
-        for p in &policy.read_write_paths {
-            if let Some(crate::GrantState::Installed { identity, .. }) = policy.grant_states.get(p)
-            {
-                expected_order_and_masks.push((*identity, expected_read_write_dir));
-            }
-        }
-        for p in &policy.socket_paths {
-            if let Some(crate::GrantState::Installed { identity, .. }) = policy.grant_states.get(p)
-            {
-                expected_order_and_masks.push((*identity, expected_sock));
-            }
-        }
-        let actual_order_and_masks: Vec<((u64, u64), landlock::BitFlags<landlock::AccessFs>)> =
-            prepared
-                .rules
-                .iter()
-                .map(|(fd, mask)| {
-                    let st = rustix::fs::fstat(*fd)
-                        .map_err(|e| format!("fstat prepared rule fd failed: {e}"))?;
-                    #[allow(clippy::useless_conversion)]
-                    Ok::<_, String>(((u64::from(st.st_dev), u64::from(st.st_ino)), *mask))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(
-            actual_order_and_masks, expected_order_and_masks,
-            "Landlock rule order and AccessFs masks must match 0.1.5 exactly"
-        );
-
-        // 2. White-box installer guard: hand-built policies where `socket_paths` contains a
-        //    directly injected `Installed` descriptor for a directory, regular file, or FIFO
-        //    (with `exact_endpoint_rejections` empty so ONLY the socket-loop guard fires!)
-        //    MUST return `Err(SandboxError::Landlock)` with the typed message before committing.
-        for (bad_path, expected_label) in [
-            (&www, "directory"),
-            (&reg_file, "regular file"),
-            (&fifo, "FIFO"),
-        ] {
-            let mut forged = policy.clone();
-            let raw_state = crate::open_grant(bad_path, false, false);
-            assert!(
-                matches!(raw_state, crate::GrantState::Installed { .. }),
-                "expected raw Installed state for {expected_label}"
-            );
-            forged.grant_states.insert(bad_path.clone(), raw_state);
-            if !forged.socket_paths.contains(bad_path) {
-                forged.socket_paths.push(bad_path.clone());
-            }
-            forged.exact_endpoint_rejections.clear();
-            let expected_msg = format!(
-                "exact unix endpoint '{}' is not a socket (found {expected_label})",
-                bad_path.display()
-            );
-            let res = std::thread::spawn(move || crate::apply_landlock_current_thread(&forged))
-                .join()
-                .map_err(|_| "forged installer thread panicked")?;
-            let err = res
-                .err()
-                .ok_or_else(|| format!("forged {expected_label} in socket_paths must fail"))?;
-            assert!(
-                err.to_string().contains(&expected_msg),
-                "expected '{expected_msg}', got: {err}"
-            );
-        }
-
-        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 }

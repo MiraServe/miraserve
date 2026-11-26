@@ -760,15 +760,6 @@ impl MiraServeServer {
                 store.swap(tenant_checked);
                 initial_config = store.snapshot();
             }
-            // Refuse any unquarantined (server-level or non-tenant) exact Unix endpoint whose
-            // opened descriptor is not a socket before TLS/keyd or router startup touches it,
-            // preserving the typed sandbox error instead of masking it behind a socket connect error.
-            if !policy.exact_endpoint_rejections().is_empty() {
-                return Err(CoreError::Sandbox(SandboxError::Landlock(format!(
-                    "cannot finalize sandbox grants: {}",
-                    policy.grant_failures().join("; ")
-                ))));
-            }
             Some(policy)
         } else {
             None
@@ -1755,12 +1746,13 @@ impl RunningServer {
             // Codex Round-11 P2: a candidate grant that startup would refuse must be refused
             // here too, even when an existing ancestor grant would make it look "covered".
             // Genuinely missing optional trees are not failures.
-            if !next_policy.grant_failure_paths().is_empty() {
-                match quarantine_sole_tenant_policy_failures(
-                    &mut next_cfg,
-                    &policy_only,
-                    &next_policy,
-                ) {
+            let failed: Vec<WantedGrant> = next_policy
+                .grant_failure_paths()
+                .into_iter()
+                .map(|path| (None, path))
+                .collect();
+            if !failed.is_empty() {
+                match quarantine_sole_tenant_consumers(&mut next_cfg, &policy_only, &failed) {
                     Ok(true) => continue,
                     _ => {
                         return Err(CoreError::Sandbox(SandboxError::Landlock(format!(
@@ -3718,104 +3710,6 @@ pub fn quarantine_sole_tenant_consumers(
     Ok(!tenants.is_empty())
 }
 
-/// Quarantines tenant sites that are the sole consumers of every failing grant in `policy`,
-/// attributing Linux exact-endpoint type rejections strictly to consumers of the exact-endpoint
-/// role so a healthy server tree or sibling site sharing the same spelling keeps its grant.
-fn quarantine_sole_tenant_policy_failures(
-    cfg: &mut Config,
-    build: &dyn Fn(&Config) -> SandboxPolicy,
-    policy: &SandboxPolicy,
-) -> Result<bool, ()> {
-    let exact_rejections = policy.exact_endpoint_rejections();
-    let ordinary_failed: Vec<WantedGrant> = policy
-        .non_exact_endpoint_grant_failure_paths()
-        .into_iter()
-        .map(|path| (None, path))
-        .collect();
-    if exact_rejections.is_empty() {
-        return quarantine_sole_tenant_consumers(cfg, build, &ordinary_failed).map_err(|_| ());
-    }
-
-    let mut tenants: std::collections::BTreeMap<usize, Option<String>> =
-        std::collections::BTreeMap::new();
-
-    if !ordinary_failed.is_empty() {
-        for (_, consumers, server_needs) in grant_consumers(cfg, build, &ordinary_failed) {
-            let all_tenant = !consumers.is_empty()
-                && consumers.iter().all(|index| {
-                    cfg.sites
-                        .get(*index)
-                        .is_some_and(|site| site.owner_dir.is_some())
-                });
-            if server_needs || !all_tenant {
-                return Err(());
-            }
-            for index in consumers {
-                tenants.entry(index).or_insert(None);
-            }
-        }
-    }
-
-    let mut no_sites = cfg.clone();
-    no_sites.sites.clear();
-    let server_exact = build(&no_sites).exact_socket_paths().clone();
-    let mut site_exact: Vec<(usize, std::collections::BTreeSet<std::path::PathBuf>)> =
-        Vec::with_capacity(cfg.sites.len());
-    for (index, site) in cfg.sites.iter().enumerate() {
-        let mut one = no_sites.clone();
-        one.sites.push(site.clone());
-        let one_exact: std::collections::BTreeSet<std::path::PathBuf> = build(&one)
-            .exact_socket_paths()
-            .difference(&server_exact)
-            .cloned()
-            .collect();
-        site_exact.push((index, one_exact));
-    }
-
-    for (path, reason) in exact_rejections {
-        if server_exact.contains(path) {
-            return Err(());
-        }
-        let consumers: Vec<usize> = site_exact
-            .iter()
-            .filter(|(_, exacts)| exacts.contains(path))
-            .map(|(index, _)| *index)
-            .collect();
-        let all_tenant = !consumers.is_empty()
-            && consumers.iter().all(|index| {
-                cfg.sites
-                    .get(*index)
-                    .is_some_and(|site| site.owner_dir.is_some())
-            });
-        if !all_tenant {
-            return Err(());
-        }
-        for index in consumers {
-            tenants
-                .entry(index)
-                .and_modify(|existing| {
-                    if existing.is_none() {
-                        *existing = Some(reason.clone());
-                    }
-                })
-                .or_insert_with(|| Some(reason.clone()));
-        }
-    }
-
-    for (index, typed_reason) in &tenants {
-        if let Some(site) = cfg.sites.get_mut(*index) {
-            let msg = match typed_reason {
-                Some(reason) => format!(
-                    "a sandbox grant this site needs failed ({reason}); restart MiraServe after fixing it"
-                ),
-                None => "a sandbox grant this site needs failed or is outside the startup policy; restart MiraServe after fixing it".to_owned(),
-            };
-            quarantine_site(site, msg);
-        }
-    }
-    Ok(!tenants.is_empty())
-}
-
 /// Builds the startup sandbox policy for `cfg`: tenant sites that are the only consumers of a
 /// failing grant are quarantined and the policy is rebuilt; the paths only tenant sites need are
 /// recorded in the policy, so a late failure on one of them at finalization stays local. Grant
@@ -3826,9 +3720,14 @@ pub fn prepare_startup_policy(
 ) -> SandboxPolicy {
     let mut policy = build(cfg);
     for _ in 0..cfg.sites.len() {
-        if policy.grant_failure_paths().is_empty()
+        let failed: Vec<WantedGrant> = policy
+            .grant_failure_paths()
+            .into_iter()
+            .map(|path| (None, path))
+            .collect();
+        if failed.is_empty()
             || !matches!(
-                quarantine_sole_tenant_policy_failures(cfg, build, &policy),
+                quarantine_sole_tenant_consumers(cfg, build, &failed),
                 Ok(true)
             )
         {
