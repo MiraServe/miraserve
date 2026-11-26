@@ -10004,14 +10004,14 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
+    const SYS_FACCESSAT2: i64 = 439;
+    const LINUX_EPERM: u32 = 1;
+    const LINUX_ENOSYS: u32 = 38;
+
     if rustix::process::geteuid().is_root() {
         // Root skips faccessat and emits the root note (tested in the test above).
         return Ok(());
     }
-
-    const SYS_FACCESSAT2: i64 = 439;
-    const LINUX_EPERM: u32 = 1;
-    const LINUX_ENOSYS: u32 = 38;
 
     let arch = TargetArch::try_from(std::env::consts::ARCH)?;
     let sys_faccessat: i64 = match arch {
@@ -10245,48 +10245,6 @@ fn check_fs_fastcgi_unix_socket_never_calls_faccessat2_and_handles_indeterminate
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_validates_try_files_fallback_unless_extension_and_dump_normalized() -> TestResult {
-    let run_stdin = |kdl: &str, extra: &[&str]| -> Result<std::process::Output, std::io::Error> {
-        let mut child = Command::new(miraserve_bin())
-            .arg("check")
-            .args(extra)
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(kdl.as_bytes())?;
-        }
-        child.wait_with_output()
-    };
-
-    // 0. Exact byte-for-byte 0.1.5 serialization parity for a 0.1.5 configuration (omitted
-    //    `fallback-unless-extension` vs explicit `#false` vs pinned literal 0.1.5 JSON bytes).
-    //    Uses `protocols="h1"` so no kernel-dependent HTTP/2 openat2 note can alter the envelope.
-    let kdl_015 = r#"
-server {
-    listen ":443" protocols="h1"
-    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
-}
-site "spa.example.test" {
-    root "/var/www/spa"
-    route "/*" {
-        try-files "{path}" "{path}/" "/index.html"
-    }
-}
-"#;
-    let kdl_explicit_false = r#"
-server {
-    listen ":443" protocols="h1"
-    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
-}
-site "spa.example.test" {
-    root "/var/www/spa"
-    route "/*" {
-        try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=#false
-    }
-}
-"#;
     const EXPECTED_015_JSON_BYTES: &[u8] = concat!(
         "{\n",
         "  \"valid\": true,\n",
@@ -10384,6 +10342,49 @@ site "spa.example.test" {
         "}\n"
     )
     .as_bytes();
+
+    let run_stdin = |kdl: &str, extra: &[&str]| -> Result<std::process::Output, std::io::Error> {
+        let mut child = Command::new(miraserve_bin())
+            .arg("check")
+            .args(extra)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(kdl.as_bytes())?;
+        }
+        child.wait_with_output()
+    };
+
+    // 0. Exact byte-for-byte 0.1.5 serialization parity for a 0.1.5 configuration (omitted
+    //    `fallback-unless-extension` vs explicit `#false` vs pinned literal 0.1.5 JSON bytes).
+    //    Uses `protocols="h1"` so no kernel-dependent HTTP/2 openat2 note can alter the envelope.
+    let kdl_015 = r#"
+server {
+    listen ":443" protocols="h1"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "spa.example.test" {
+    root "/var/www/spa"
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.html"
+    }
+}
+"#;
+    let kdl_explicit_false = r#"
+server {
+    listen ":443" protocols="h1"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "spa.example.test" {
+    root "/var/www/spa"
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=#false
+    }
+}
+"#;
     let out_015 = run_stdin(
         kdl_015,
         &["--strict", "--format", "json", "--dump-normalized"],

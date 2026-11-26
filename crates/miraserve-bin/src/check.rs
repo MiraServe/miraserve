@@ -1951,8 +1951,8 @@ fn check_fastcgi_unix_socket_accessible_with<F>(
     sock_path: &str,
     real_uid: u32,
     effective_uid: u32,
-    real_gid: u32,
-    effective_gid: u32,
+    real_group: u32,
+    effective_group: u32,
     probe: F,
 ) where
     F: FnOnce(&Path) -> Result<(), rustix::io::Errno>,
@@ -1975,7 +1975,7 @@ fn check_fastcgi_unix_socket_accessible_with<F>(
                          reached (type and owner unknown); the socket must be reachable (search \
                          permission on its parent directories) and requires read and write \
                          permission on the socket for the account running the check \
-                         (uid/gid {effective_uid}/{effective_gid}): {io_err}",
+                         (uid/gid {effective_uid}/{effective_group}): {io_err}",
                     ),
                     path: Some(key_path.to_owned()),
                     help: Some(
@@ -2009,7 +2009,7 @@ fn check_fastcgi_unix_socket_accessible_with<F>(
         }
         return;
     }
-    if real_uid != effective_uid || real_gid != effective_gid {
+    if real_uid != effective_uid || real_group != effective_group {
         notes.skipped_ids_differ = true;
         return;
     }
@@ -2030,7 +2030,7 @@ fn check_fastcgi_unix_socket_accessible_with<F>(
                     "site '{site_host}' FastCGI Unix socket '{sock_path}' \
                      (owner {owner_uid}:{owner_group}, mode {sock_mode:04o}) requires read and \
                      write permission on the socket for the account running the check \
-                     (uid/gid {effective_uid}/{effective_gid}): {err}",
+                     (uid/gid {effective_uid}/{effective_group}): {err}",
                 ),
                 path: Some(key_path.to_owned()),
                 help: Some(
@@ -2910,6 +2910,7 @@ mod writable_set_unit_tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fastcgi_socket_probe_handles_ids_differ_root_eacces_and_indeterminate_errors()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::os::unix::fs::PermissionsExt as _;
@@ -3001,7 +3002,7 @@ mod writable_set_unit_tests {
                 },
             );
             assert!(!probe_called);
-            assert!(issues.is_empty());
+            assert!(issues.is_empty(), "root must emit no issues: {issues:?}");
             let lines = notes.into_note_lines();
             assert_eq!(lines.len(), 1);
             assert!(lines.first().is_some_and(|l| l.contains("root (euid 0)")));
@@ -3035,7 +3036,11 @@ mod writable_set_unit_tests {
                 issue.message
             );
             assert!(!issue.message.contains("cannot be opened"));
-            assert!(notes.into_note_lines().is_empty());
+            let note_lines = notes.into_note_lines();
+            assert!(
+                note_lines.is_empty(),
+                "EACCES must emit no indeterminate note: {note_lines:?}"
+            );
         }
 
         // 4. Non-EACCES errors (EPERM, ENOSYS, EINVAL) -> INDETERMINATE note naming the error, NO W033.
