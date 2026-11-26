@@ -10,7 +10,7 @@ PackageName: MiraServe
 PackageUrl: https://github.com/miraserve/miraserve
 License: Apache-2.0 OR MIT
 LicenseUrl: https://github.com/miraserve/miraserve/blob/main/LICENSE-APACHE
-ShortDescription: Memory-safe, zero-trust, post-quantum HTTPS and AI-native web server
+ShortDescription: Web server and edge gateway in memory-safe Rust with post-quantum HTTPS
 Description: >-
   MiraServe is a memory-safe Rust web server and AI-native edge gateway with
   TLS 1.3 + X25519MLKEM768 post-quantum hybrid key exchange, HTTP/1.1/2/3,

@@ -9950,3 +9950,45 @@ site "bad.example.test" {
 
     Ok(())
 }
+
+/// Oracle for 0.1.6 Item 4: CLI `--help` and packaging descriptions omit the unsupported
+/// "zero-trust" claim and use the agreed description wording.
+#[test]
+fn cli_help_and_packaging_descriptions_replace_zero_trust_wording() -> TestResult {
+    const EXPECTED: &str =
+        "Web server and edge gateway in memory-safe Rust with post-quantum HTTPS";
+
+    let help = Command::new(miraserve_bin()).arg("--help").output()?;
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_stdout.contains(EXPECTED),
+        "expected `miraserve --help` to contain `{EXPECTED}`, got:\n{help_stdout}"
+    );
+    assert!(
+        !help_stdout.to_ascii_lowercase().contains("zero-trust"),
+        "`miraserve --help` must not contain zero-trust:\n{help_stdout}"
+    );
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    for rel in [
+        "crates/miraserve-bin/src/main.rs",
+        "packaging/nfpm/nfpm.yaml",
+        "packaging/homebrew/miraserve.rb",
+        "packaging/windows/winget-manifest.yaml",
+        "Containerfile",
+    ] {
+        let text = std::fs::read_to_string(root.join(rel))?;
+        assert!(
+            text.contains(EXPECTED),
+            "expected `{rel}` to contain `{EXPECTED}`"
+        );
+        assert!(
+            !text.to_ascii_lowercase().contains("zero-trust"),
+            "`{rel}` must not contain zero-trust"
+        );
+    }
+    Ok(())
+}

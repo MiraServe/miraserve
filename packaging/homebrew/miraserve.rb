@@ -6,7 +6,7 @@
 # `miraserve-<tag>-src.tar.gz` SHA-256; never point this formula at pre-fork
 # v0.1.3 or another repository).
 class Miraserve < Formula
-  desc "Memory-safe, zero-trust, post-quantum HTTPS & AI-native web server"
+  desc "Web server and edge gateway in memory-safe Rust with post-quantum HTTPS"
   homepage "https://github.com/REPLACE_WITH_GITHUB_REPOSITORY"
   url "https://github.com/REPLACE_WITH_GITHUB_REPOSITORY/releases/download/REPLACE_WITH_RELEASE_TAG/miraserve-REPLACE_WITH_RELEASE_TAG-src.tar.gz"
   sha256 "REPLACE_WITH_SOURCE_TARBALL_SHA256"

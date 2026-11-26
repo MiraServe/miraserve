@@ -32,7 +32,7 @@ RUN cargo build --release --locked --bin miraserve \
 FROM gcr.io/distroless/cc-debian12:nonroot
 
 LABEL org.opencontainers.image.title="MiraServe" \
-      org.opencontainers.image.description="Memory-safe, zero-trust, post-quantum HTTPS & AI-native web server" \
+      org.opencontainers.image.description="Web server and edge gateway in memory-safe Rust with post-quantum HTTPS" \
       org.opencontainers.image.url="https://github.com/miraserve/miraserve" \
       org.opencontainers.image.source="https://github.com/miraserve/miraserve" \
       org.opencontainers.image.licenses="Apache-2.0 OR MIT"

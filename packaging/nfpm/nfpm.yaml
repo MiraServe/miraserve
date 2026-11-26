@@ -16,7 +16,7 @@ priority: "optional"
 # mailbox that does not exist (0.1.1 named a domain that does not resolve).
 maintainer: "MiraServe Authors"
 description: |
-  MiraServe — memory-safe, zero-trust, post-quantum HTTPS & AI-native web server.
+  Web server and edge gateway in memory-safe Rust with post-quantum HTTPS.
   Ships with TLS 1.3 + X25519MLKEM768 PQC hybrid key exchange, HTTP/1.1/2/3,
   dual-stack IPv4+IPv6, cap-std static confinement, Linux Landlock/seccomp-bpf,
   FastCGI PHP-FPM support, atomic signed AI site publishing, RFC 9421 Web Bot Auth,

@@ -22,12 +22,12 @@ use crate::publish::{PublishArgs, run_publish};
 use crate::run::{ReloadArgs, RunArgs, run_reload, run_server};
 use crate::service::{ServiceArgs, run_service};
 
-/// MiraServe — memory-safe, zero-trust, post-quantum HTTPS & AI-native web server.
+/// Web server and edge gateway in memory-safe Rust with post-quantum HTTPS.
 #[derive(Debug, Parser)]
 #[command(
     name = "miraserve",
     version,
-    about = "Memory-safe, zero-trust, post-quantum HTTPS & AI-native web server",
+    about = "Web server and edge gateway in memory-safe Rust with post-quantum HTTPS",
     long_about = None,
     propagate_version = true
 )]
