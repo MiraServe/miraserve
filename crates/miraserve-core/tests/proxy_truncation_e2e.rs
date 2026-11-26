@@ -5,11 +5,11 @@
 //! Cases covered for every `(protocol, runtime_mode)` combination:
 //! - (a) Upstream answers `Content-Length: 100000`, sends `10000` bytes, and closes cleanly (FIN).
 //! - (b) Upstream answers `Transfer-Encoding: chunked`, sends two chunks, and closes without the
-//!       terminating `0\r\n\r\n` chunk.
+//!   terminating `0\r\n\r\n` chunk.
 //! - (c) Upstream sends the `200 OK` head and initial body bytes, waits for the client to observe
-//!       the head and mid-body bytes, then resets the connection (`SO_LINGER 0`) mid-body.
+//!   the head and mid-body bytes, then resets the connection (`SO_LINGER 0`) mid-body.
 //! - (d) Control: complete `100000`-byte bodies (`Content-Length` and chunked) arrive intact with
-//!       clean end-of-stream.
+//!   clean end-of-stream.
 //!
 //! Assertions for (a)-(c):
 //! - Client NEVER observes a complete response:
@@ -141,6 +141,7 @@ struct RawTruncUpstream {
 }
 
 impl RawTruncUpstream {
+    #[allow(clippy::too_many_lines)]
     async fn start() -> Result<Self, std::io::Error> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
@@ -674,28 +675,36 @@ async fn run_control_case(proto: DownstreamProto, mode: RuntimeMode) -> TestResu
     match proto {
         DownstreamProto::Http1 => {
             let mut cli = H1ClientConn::connect(https_addr, host, &tls_cfg).await?;
-            let body_cl = cli
+            let fixed_body = cli
                 .get_complete_body(host, "/api/ok-cl", Some(FULL_LEN))
                 .await?;
-            assert_eq!(body_cl.len(), FULL_LEN, "{tag}: control CL length");
-            assert_pattern_prefix(&body_cl, &format!("{tag} CL"));
+            assert_eq!(fixed_body.len(), FULL_LEN, "{tag}: control CL length");
+            assert_pattern_prefix(&fixed_body, &format!("{tag} CL"));
 
-            let body_ch = cli.get_complete_body(host, "/api/ok-chunked", None).await?;
-            assert_eq!(body_ch.len(), FULL_LEN, "{tag}: control chunked length");
-            assert_pattern_prefix(&body_ch, &format!("{tag} chunked"));
+            let chunked_body = cli.get_complete_body(host, "/api/ok-chunked", None).await?;
+            assert_eq!(
+                chunked_body.len(),
+                FULL_LEN,
+                "{tag}: control chunked length"
+            );
+            assert_pattern_prefix(&chunked_body, &format!("{tag} chunked"));
             cli.close().await;
         }
         DownstreamProto::Http2 => {
             let mut cli = H2ClientConn::connect(https_addr, host, &tls_cfg).await?;
-            let body_cl = cli
+            let fixed_body = cli
                 .get_complete_body(host, "/api/ok-cl", Some(FULL_LEN))
                 .await?;
-            assert_eq!(body_cl.len(), FULL_LEN, "{tag}: control CL length");
-            assert_pattern_prefix(&body_cl, &format!("{tag} CL"));
+            assert_eq!(fixed_body.len(), FULL_LEN, "{tag}: control CL length");
+            assert_pattern_prefix(&fixed_body, &format!("{tag} CL"));
 
-            let body_ch = cli.get_complete_body(host, "/api/ok-chunked", None).await?;
-            assert_eq!(body_ch.len(), FULL_LEN, "{tag}: control chunked length");
-            assert_pattern_prefix(&body_ch, &format!("{tag} chunked"));
+            let chunked_body = cli.get_complete_body(host, "/api/ok-chunked", None).await?;
+            assert_eq!(
+                chunked_body.len(),
+                FULL_LEN,
+                "{tag}: control chunked length"
+            );
+            assert_pattern_prefix(&chunked_body, &format!("{tag} chunked"));
             cli.close().await;
         }
     }

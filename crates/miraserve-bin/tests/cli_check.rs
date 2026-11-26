@@ -10971,6 +10971,19 @@ fn check_fs_json_w033_path_pin_carries_site_and_route_indices() -> TestResult {
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::UnixListener;
 
+    struct Cleanup {
+        base: PathBuf,
+        socks: [PathBuf; 2],
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for s in &self.socks {
+                let _ = std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
     if rustix::process::geteuid().is_root() {
         eprintln!(
             "skipping check_fs_json_w033_path_pin_carries_site_and_route_indices: running as root"
@@ -10996,18 +11009,6 @@ fn check_fs_json_w033_path_pin_carries_site_and_route_indices() -> TestResult {
     std::fs::set_permissions(&sock0, std::fs::Permissions::from_mode(0o000))?;
     std::fs::set_permissions(&sock1, std::fs::Permissions::from_mode(0o000))?;
 
-    struct Cleanup {
-        base: PathBuf,
-        socks: [PathBuf; 2],
-    }
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            for s in &self.socks {
-                let _ = std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o600));
-            }
-            let _ = std::fs::remove_dir_all(&self.base);
-        }
-    }
     let _cleanup = Cleanup {
         base: base.clone(),
         socks: [sock0.clone(), sock1.clone()],
