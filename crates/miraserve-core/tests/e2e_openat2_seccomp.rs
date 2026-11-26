@@ -899,6 +899,7 @@ impl tracing::Subscriber for CapturingSubscriber {
     fn exit(&self, _span: &tracing::span::Id) {}
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_openat2_level_child(mode: &str) -> TestResult {
     let _kernel_guard = miraserve_sandbox::test_advisory_kernel_in_range_override_guard(Some(true));
     let events = Arc::new(std::sync::Mutex::new(Vec::<(tracing::Level, String)>::new()));
