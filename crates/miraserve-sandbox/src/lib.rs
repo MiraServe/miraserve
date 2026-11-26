@@ -210,6 +210,8 @@ enum GrantState {
         fd: std::sync::Arc<std::os::fd::OwnedFd>,
         #[cfg(target_os = "linux")]
         is_dir: bool,
+        #[cfg(target_os = "linux")]
+        file_type: rustix::fs::FileType,
     },
     /// Path did not exist at startup so Landlock omitted it; it cannot cover paths that appear
     /// later unless another installed ancestor covers them.
@@ -225,6 +227,20 @@ enum GrantState {
         reason: String,
         kind: GrantFailureKind,
     },
+}
+
+#[cfg(target_os = "linux")]
+const fn linux_file_type_label(ft: rustix::fs::FileType) -> &'static str {
+    match ft {
+        rustix::fs::FileType::Directory => "directory",
+        rustix::fs::FileType::RegularFile => "regular file",
+        rustix::fs::FileType::Fifo => "FIFO",
+        rustix::fs::FileType::Symlink => "symbolic link",
+        rustix::fs::FileType::CharacterDevice => "character device",
+        rustix::fs::FileType::BlockDevice => "block device",
+        rustix::fs::FileType::Socket => "socket",
+        rustix::fs::FileType::Unknown => "unknown file type",
+    }
 }
 
 impl PartialEq for GrantState {
@@ -246,14 +262,16 @@ impl PartialEq for GrantState {
                 Self::Installed {
                     identity: a_id,
                     is_dir: a_dir,
+                    file_type: a_ft,
                     ..
                 },
                 Self::Installed {
                     identity: b_id,
                     is_dir: b_dir,
+                    file_type: b_ft,
                     ..
                 },
-            ) => a_id == b_id && a_dir == b_dir,
+            ) => a_id == b_id && a_dir == b_dir && a_ft == b_ft,
             #[cfg(all(unix, not(target_os = "linux")))]
             (Self::Installed { identity: a_id }, Self::Installed { identity: b_id }) => {
                 a_id == b_id
@@ -328,6 +346,10 @@ pub struct SandboxPolicy {
     /// config validator's forbidden-tree rule before its descriptor is retained (Codex Round-10).
     #[serde(skip)]
     tree_paths: BTreeSet<PathBuf>,
+    /// Subset of `tree_paths` configured specifically as `socket-tree` (the sole directory
+    /// exception for Linux Landlock socket-class rules).
+    #[serde(skip)]
+    socket_tree_paths: BTreeSet<PathBuf>,
 }
 
 /// Audit report returned after applying a [`SandboxPolicy`].
@@ -381,6 +403,7 @@ impl SandboxPolicy {
         let mut pinned_ro: Vec<PinnedReadOnlyPath> = Vec::new();
         let mut warnings: Vec<String> = Vec::new();
         let mut tree_paths: BTreeSet<PathBuf> = BTreeSet::new();
+        let mut socket_tree_paths: BTreeSet<PathBuf> = BTreeSet::new();
 
         // System TLS trust anchors & DNS resolver needed for outbound HTTPS/ACME/proxy.
         // R3-SBX-3: Grant only public certificate directories/files — NEVER `/etc/ssl` or
@@ -741,12 +764,18 @@ impl SandboxPolicy {
         // Landlock policy, which cannot be extended after startup. Config validation has
         // rejected trees that touch system, secret or MiraServe state directories; a tree that
         // fails that check here (a config built in code) is skipped with a warning.
-        for (trees, set, kind) in [
-            (&config.server.sandbox.read_trees, &mut ro, "read-tree"),
+        for (trees, set, kind, is_socket_tree) in [
+            (
+                &config.server.sandbox.read_trees,
+                &mut ro,
+                "read-tree",
+                false,
+            ),
             (
                 &config.server.sandbox.socket_trees,
                 &mut socks,
                 "socket-tree",
+                true,
             ),
         ] {
             for tree in trees {
@@ -755,6 +784,9 @@ impl SandboxPolicy {
                 } else {
                     let tp = PathBuf::from(tree.trim_end_matches('/'));
                     tree_paths.insert(tp.clone());
+                    if is_socket_tree {
+                        socket_tree_paths.insert(tp.clone());
+                    }
                     set.insert(tp);
                 }
             }
@@ -801,6 +833,7 @@ impl SandboxPolicy {
             warnings,
             grant_states,
             tree_paths,
+            socket_tree_paths,
         }
     }
 
@@ -2156,7 +2189,8 @@ fn open_grant(path: &Path, is_tree: bool) -> GrantState {
         };
         #[allow(clippy::useless_conversion)]
         let identity = (u64::from(st.st_dev), u64::from(st.st_ino));
-        let is_dir = FileType::from_raw_mode(st.st_mode) == FileType::Directory;
+        let file_type = FileType::from_raw_mode(st.st_mode);
+        let is_dir = file_type == FileType::Directory;
         if is_tree {
             return open_validated_tree(path, identity, is_dir, |p: &Path| {
                 std::fs::canonicalize(p)
@@ -2166,6 +2200,7 @@ fn open_grant(path: &Path, is_tree: bool) -> GrantState {
             identity,
             fd: std::sync::Arc::new(fd),
             is_dir,
+            file_type,
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -2283,6 +2318,7 @@ fn open_validated_tree(
             identity: (dev, ino),
             fd: std::sync::Arc::new(std::os::fd::OwnedFd::from(file)),
             is_dir: true,
+            file_type: rustix::fs::FileType::Directory,
         }
     }
     #[cfg(not(target_os = "linux"))]
@@ -4631,6 +4667,22 @@ mod linux {
         })
     }
 
+    /// Whether `path` lies strictly inside an installed configured `socket-tree` directory.
+    fn covered_by_installed_socket_tree(policy: &SandboxPolicy, path: &std::path::Path) -> bool {
+        policy.socket_paths.iter().any(|tree| {
+            tree != path
+                && path.starts_with(tree)
+                && policy.socket_tree_paths.contains(tree)
+                && matches!(
+                    policy.grant_states.get(tree),
+                    Some(super::GrantState::Installed {
+                        file_type: rustix::fs::FileType::Directory,
+                        ..
+                    })
+                )
+        })
+    }
+
     /// Every worker thread installs the same policy; report each missing-path notice once per
     /// process instead of once per thread.
     fn first_time_reported(key: &str) -> bool {
@@ -4641,11 +4693,20 @@ mod linux {
             .map_or(true, |mut seen| seen.insert(key.to_owned()))
     }
 
+    pub(super) struct AssembledLandlockRules<'a> {
+        pub(super) all_abi: BitFlags<AccessFs>,
+        pub(super) read_only_access: BitFlags<AccessFs>,
+        pub(super) read_write_access: BitFlags<AccessFs>,
+        pub(super) readonly_rules: Vec<(&'a std::os::fd::OwnedFd, BitFlags<AccessFs>)>,
+        pub(super) writable_rules: Vec<(&'a std::os::fd::OwnedFd, BitFlags<AccessFs>)>,
+        pub(super) sock_rules: Vec<(&'a std::os::fd::OwnedFd, BitFlags<AccessFs>)>,
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn apply_landlock(
-        policy: &SandboxPolicy,
+    pub(super) fn assemble_landlock_rules<'a>(
+        policy: &'a SandboxPolicy,
         notes: &mut Vec<String>,
-    ) -> Result<EnforcementStatus, SandboxError> {
+    ) -> Result<AssembledLandlockRules<'a>, SandboxError> {
         let abi = LANDLOCK_TARGET_ABI;
         let all_abi = AccessFs::from_all(abi);
         // Strip Execute and device/FIFO/symlink-creation rights from data and socket rules.
@@ -4815,14 +4876,29 @@ mod linux {
         let mut missing_socks: Vec<String> = Vec::new();
         for p in &policy.socket_paths {
             match policy.grant_states.get(p) {
-                Some(super::GrantState::Installed { fd, .. }) => {
-                    sock_rules.push((fd.as_ref(), sock_access));
+                Some(super::GrantState::Installed { fd, file_type, .. }) => {
+                    if *file_type == rustix::fs::FileType::Socket
+                        || (*file_type == rustix::fs::FileType::Directory
+                            && policy.socket_tree_paths.contains(p))
+                    {
+                        sock_rules.push((fd.as_ref(), sock_access));
+                    } else {
+                        let display_path = super::sanitize_path_for_display(p);
+                        let found = super::linux_file_type_label(*file_type);
+                        if first_time_reported(&format!("sock-not-socket:{}", p.display())) {
+                            warn!(
+                                path = %display_path,
+                                found,
+                                "exact unix socket path '{display_path}' is not a socket (found {found}): no Landlock rule installed for it; FastCGI or keyd requests to it will fail"
+                            );
+                        }
+                    }
                 }
                 Some(super::GrantState::AbsentAtStartup | super::GrantState::Failed { .. })
                 | None => {
                     // A socket that does not exist yet but lies inside an installed tree (a
                     // `socket-tree`) is reachable as soon as it is created: nothing to warn about.
-                    if !covered_by_installed_tree(policy, p, &policy.socket_paths) {
+                    if !covered_by_installed_socket_tree(policy, p) {
                         missing_socks.push(p.display().to_string());
                     }
                 }
@@ -4840,6 +4916,29 @@ mod linux {
                 "missing Landlock Unix socket path(s) omitted at startup (restart after creating): {joined}"
             ));
         }
+
+        Ok(AssembledLandlockRules {
+            all_abi,
+            read_only_access,
+            read_write_access,
+            readonly_rules,
+            writable_rules,
+            sock_rules,
+        })
+    }
+
+    pub(crate) fn apply_landlock(
+        policy: &SandboxPolicy,
+        notes: &mut Vec<String>,
+    ) -> Result<EnforcementStatus, SandboxError> {
+        let AssembledLandlockRules {
+            all_abi,
+            read_only_access,
+            read_write_access,
+            readonly_rules,
+            writable_rules,
+            sock_rules,
+        } = assemble_landlock_rules(policy, notes)?;
 
         let mut ruleset = Ruleset::default()
             .handle_access(all_abi)
@@ -6940,6 +7039,190 @@ site "app.example.com" {
                 crate::EnforcementStatus::UnsupportedPlatform
             );
         }
+        Ok(())
+    }
+
+    /// White-box companion to Test 4 (PARITY): calls `linux::assemble_landlock_rules` directly on
+    /// a fixture with a `socket-tree`, one real exact socket, one absent exact socket, and two
+    /// `read-tree`s, and asserts the exact ordered `(canonical_path, AccessFs)` rule list against
+    /// an independently constructed expected sequence (never derived from `policy`), plus verifies
+    /// that a directory at an exact FastCGI path is omitted from `sock_rules`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn assembled_landlock_rule_list_and_masks_match_015_and_omit_non_socket_exact_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::BTreeSet;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::net::UnixListener;
+        use std::path::{Path, PathBuf};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use landlock::{ABI, Access as _, AccessFs};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let raw_base = std::env::temp_dir().join(format!(
+            "miraserve-rule-list-masks-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&raw_base)?;
+        let base = std::fs::canonicalize(&raw_base)?;
+        let rt1 = base.join("a_rt1");
+        let docroot = base.join("b_docroot");
+        let rt2 = base.join("c_rt2");
+        let absent_sock = base.join("d_absent.sock");
+        let real_sock = base.join("e_real.sock");
+        let sock_tree = base.join("f_stree");
+        std::fs::create_dir_all(&rt1)?;
+        std::fs::create_dir_all(&docroot)?;
+        std::fs::create_dir_all(&rt2)?;
+        std::fs::create_dir_all(&sock_tree)?;
+        let _listener = UnixListener::bind(&real_sock)?;
+
+        let kdl = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{
+        landlock #true
+        seccomp "off"
+        read-tree "{rt1}" "{rt2}"
+        socket-tree "{sock_tree}"
+    }}
+}}
+site "masks.example.test" {{
+    root "{docroot}"
+    route "/real.php" {{
+        fastcgi-pass "unix:{real_sock}"
+    }}
+    route "/absent.php" {{
+        fastcgi-pass "unix:{absent_sock}"
+    }}
+}}
+"#,
+            rt1 = rt1.display(),
+            rt2 = rt2.display(),
+            sock_tree = sock_tree.display(),
+            docroot = docroot.display(),
+            real_sock = real_sock.display(),
+            absent_sock = absent_sock.display(),
+        );
+        let (cfg, _) = miraserve_config::parse_kdl("masks.kdl", &kdl)?;
+        let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+        policy.finalize_grants()?;
+
+        let all_abi = AccessFs::from_all(ABI::V5);
+        let ro_dir_mask = (AccessFs::ReadFile | AccessFs::ReadDir) & all_abi;
+        let ro_file_mask = ro_dir_mask & AccessFs::ReadFile;
+        let sock_mask = (AccessFs::ReadFile | AccessFs::WriteFile) & all_abi;
+
+        // Independently construct the exact expected ordered `(canonical_path, mask)` rule list.
+        let mut expected_ro_paths = BTreeSet::new();
+        for sys_ro in [
+            "/etc/ssl/certs",
+            "/etc/ssl/openssl.cnf",
+            "/etc/ssl/cert.pem",
+            "/etc/ca-certificates",
+            "/etc/ca-certificates.conf",
+            "/usr/share/ca-certificates",
+            "/usr/local/share/ca-certificates",
+            "/etc/pki/tls/certs",
+            "/etc/pki/tls/cert.pem",
+            "/etc/pki/ca-trust",
+            "/usr/share/pki/ca-trust-source",
+            "/usr/share/pki/trust",
+            "/var/lib/ca-certificates",
+            "/etc/resolv.conf",
+            "/etc/hosts",
+        ] {
+            let p = PathBuf::from(sys_ro);
+            if p.exists() {
+                if let Ok(canon) = std::fs::canonicalize(&p)
+                    && canon != p
+                    && canon.is_file()
+                {
+                    expected_ro_paths.insert(canon);
+                }
+                expected_ro_paths.insert(p);
+            }
+        }
+        if Path::new("/etc/miraserve/auth").is_dir() {
+            expected_ro_paths.insert(PathBuf::from("/etc/miraserve/auth"));
+        }
+        expected_ro_paths.insert(rt1.clone());
+        expected_ro_paths.insert(docroot.clone());
+        expected_ro_paths.insert(rt2.clone());
+
+        let mut expected_rules: Vec<(PathBuf, landlock::BitFlags<AccessFs>)> = Vec::new();
+        for p in &expected_ro_paths {
+            let canon = std::fs::canonicalize(p)?;
+            let mask = if std::fs::metadata(p)?.is_dir() {
+                ro_dir_mask
+            } else {
+                ro_file_mask
+            };
+            expected_rules.push((canon, mask));
+        }
+        expected_rules.push((std::fs::canonicalize(&real_sock)?, sock_mask));
+        expected_rules.push((std::fs::canonicalize(&sock_tree)?, sock_mask));
+
+        let mut notes = Vec::new();
+        let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+        let actual_rules: Vec<(PathBuf, landlock::BitFlags<AccessFs>)> = assembled
+            .readonly_rules
+            .into_iter()
+            .chain(assembled.writable_rules)
+            .chain(assembled.sock_rules)
+            .map(|(fd, mask)| {
+                let target = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+                Ok((target, mask))
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?;
+
+        assert_eq!(
+            actual_rules, expected_rules,
+            "assembled Landlock rule list with masks in order must match 0.1.5 exactly"
+        );
+        assert_eq!(
+            notes,
+            vec![format!(
+                "missing Landlock Unix socket path(s) omitted at startup (restart after creating): {}",
+                absent_sock.display()
+            )]
+        );
+
+        // Also confirm a directory at an exact FastCGI path is omitted from `sock_rules`.
+        let bad_dir = base.join("g_bad_dir");
+        std::fs::create_dir_all(&bad_dir)?;
+        let bad_kdl = format!(
+            r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{ landlock #true; seccomp "off" }}
+}}
+site "bad.example.test" {{
+    root "{docroot}"
+    route "/bad.php" {{
+        fastcgi-pass "unix:{bad_dir}"
+    }}
+}}
+"#,
+            docroot = docroot.display(),
+            bad_dir = bad_dir.display(),
+        );
+        let (bad_cfg, _) = miraserve_config::parse_kdl("bad.kdl", &bad_kdl)?;
+        let mut bad_policy = crate::SandboxPolicy::from_config_with_file(&bad_cfg, None, None);
+        bad_policy.finalize_grants()?;
+        let mut bad_notes = Vec::new();
+        let bad_assembled = crate::linux::assemble_landlock_rules(&bad_policy, &mut bad_notes)?;
+        assert!(
+            bad_assembled.sock_rules.is_empty(),
+            "exact directory socket entry must produce zero sock_rules"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
         Ok(())
     }
 }
