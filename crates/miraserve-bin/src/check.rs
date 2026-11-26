@@ -544,16 +544,20 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
 
     // CFG-6, R4-PKG-2, R5-CHK-1, R7-CHK-1 & R7-SBX-2: Optional `--fs` disk readability,
     // symlink/overlap docroot confinement (`E301`), & PEM/pair/keyd verification.
-    let (fs_errors, classified_for_notes): (Vec<ConfigIssue>, Option<Config>) = if args.fs {
-        let (issues, _, classified) = collect_filesystem_issues_classified(
+    let (fs_errors, classified_for_notes, skipped_fastcgi_socket_access_as_root): (
+        Vec<ConfigIssue>,
+        Option<Config>,
+        bool,
+    ) = if args.fs {
+        let (issues, _, classified, skipped_as_root) = collect_filesystem_issues_classified(
             loaded,
             cfg_path_opt,
             args.acme_dir.as_deref(),
             args.keyd_auth_secret_file.as_deref(),
         );
-        (issues, Some(classified))
+        (issues, Some(classified), skipped_as_root)
     } else {
-        (Vec::new(), None)
+        (Vec::new(), None, false)
     };
 
     // `--fs` findings that the server tolerates at runtime are warnings, not errors.
@@ -616,6 +620,12 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
         notes.extend(collect_precompressed_fs_notes(classified));
     }
     notes.extend(collect_file_cache_notes(&loaded.config));
+    if skipped_fastcgi_socket_access_as_root {
+        notes.push(
+            "FastCGI Unix socket access for the service account was not tested because the check runs as root (euid 0)"
+                .to_owned(),
+        );
+    }
     let config_for_advisory = classified_for_notes.as_ref().unwrap_or(&loaded.config);
     if let Some(note) = miraserve_core::openat2_refused_advisory(config_for_advisory) {
         notes.push(note);
@@ -670,7 +680,15 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                 for extra_warn in filtered_warnings.iter().filter(|w| {
                     matches!(
                         w.code.as_str(),
-                        "W017" | "W023" | "W024" | "W026" | "W027" | "W028" | "W029" | "W030"
+                        "W017"
+                            | "W023"
+                            | "W024"
+                            | "W026"
+                            | "W027"
+                            | "W028"
+                            | "W029"
+                            | "W030"
+                            | "W033"
                     )
                 }) {
                     if args.writable_set {
@@ -684,6 +702,16 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             "warning[{}]: {}",
                             extra_warn.code, extra_warn.message
                         );
+                    }
+                    if extra_warn.code == "W033"
+                        && let Some(help) = &extra_warn.help
+                    {
+                        if args.writable_set {
+                            let _ = SanitizingLineWriter::new(&mut stderr)
+                                .write_line(&format!("  help: {help}"));
+                        } else {
+                            let _ = writeln!(stderr, "  help: {help}");
+                        }
                     }
                 }
                 for fs_err in &fs_errors {
@@ -1751,13 +1779,85 @@ pub(crate) fn quarantined_site_reports(classified: &Config) -> Vec<QuarantinedSi
         .collect()
 }
 
+/// Checks whether an existing exact FastCGI Unix socket can be opened (read + write) by the
+/// checking account's effective credentials without connecting to it (`W033`).
+///
+/// Returns `true` when the check runs as root (effective UID 0) and an existing Unix socket was
+/// encountered, so `miraserve check --fs` emits one plain note per run instead of warning.
+#[cfg(unix)]
+fn check_fastcgi_unix_socket_accessible(
+    errors: &mut Vec<ConfigIssue>,
+    loaded: &LoadedConfig,
+    key_path: &str,
+    site_host: &str,
+    sock_path: &str,
+) -> bool {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+    let p = Path::new(sock_path);
+    let Ok(md) = fs::metadata(p) else {
+        // Absent path (or unstatable): behaves identically to 0.1.5 (no new output).
+        return false;
+    };
+    if !md.file_type().is_socket() {
+        // Existing non-socket path: belongs to start-up hardening, no new output here.
+        return false;
+    }
+    let effective_uid = rustix::process::geteuid();
+    if effective_uid.is_root() {
+        return true;
+    }
+    if let Err(err @ (rustix::io::Errno::ACCESS | rustix::io::Errno::PERM)) = rustix::fs::accessat(
+        rustix::fs::CWD,
+        p,
+        rustix::fs::Access::READ_OK | rustix::fs::Access::WRITE_OK,
+        rustix::fs::AtFlags::EACCESS,
+    ) {
+        let effective_group = rustix::process::getegid();
+        let owner_uid = md.uid();
+        let owner_group = md.gid();
+        let sock_mode = md.mode() & 0o7777;
+        errors.push(ConfigIssue {
+            code: "W033".to_owned(),
+            severity: Severity::Warning,
+            message: format!(
+                "site '{site_host}' FastCGI Unix socket '{sock_path}' \
+                 (owner {owner_uid}:{owner_group}, mode {sock_mode:04o}) cannot be opened by the \
+                 checking account (euid {}, egid {}): {err}",
+                effective_uid.as_raw(),
+                effective_group.as_raw(),
+            ),
+            path: Some(key_path.to_owned()),
+            help: Some(
+                "set `listen.group` of the pool to the server's group, or add the server \
+                 account to the socket's group"
+                    .to_owned(),
+            ),
+            label: None,
+            location: loaded.location_for(key_path),
+        });
+    }
+    false
+}
+
+#[cfg(not(unix))]
+const fn check_fastcgi_unix_socket_accessible(
+    _errors: &mut Vec<ConfigIssue>,
+    _loaded: &LoadedConfig,
+    _key_path: &str,
+    _site_host: &str,
+    _sock_path: &str,
+) -> bool {
+    false
+}
+
 pub(crate) fn collect_filesystem_issues_and_quarantined(
     loaded: &LoadedConfig,
     config_path: Option<&Path>,
     acme_dir: Option<&Path>,
     keyd_auth_secret_file: Option<&Path>,
 ) -> (Vec<ConfigIssue>, Vec<QuarantinedSiteReport>) {
-    let (issues, quarantined, _) =
+    let (issues, quarantined, _, _) =
         collect_filesystem_issues_classified(loaded, config_path, acme_dir, keyd_auth_secret_file);
     (issues, quarantined)
 }
@@ -1768,9 +1868,10 @@ fn collect_filesystem_issues_classified(
     config_path: Option<&Path>,
     acme_dir: Option<&Path>,
     keyd_auth_secret_file: Option<&Path>,
-) -> (Vec<ConfigIssue>, Vec<QuarantinedSiteReport>, Config) {
+) -> (Vec<ConfigIssue>, Vec<QuarantinedSiteReport>, Config, bool) {
     let config = &loaded.config;
     let mut errors = Vec::new();
+    let mut skipped_fastcgi_socket_access_as_root = false;
     let is_split = config.server.tls.key_isolation == KeyIsolation::SplitDaemon;
     let provider = miraserve_tls::build_crypto_provider(config.server.tls.pqc_hybrid);
 
@@ -2342,9 +2443,21 @@ fn collect_filesystem_issues_classified(
                         );
                     }
                 }
+                RouteHandler::FastCgi(fcgi) => {
+                    if let FastCgiTarget::Unix { path } = &fcgi.target
+                        && check_fastcgi_unix_socket_accessible(
+                            &mut errors,
+                            loaded,
+                            &format!("{route_prefix}.fastcgi-pass"),
+                            host,
+                            path,
+                        )
+                    {
+                        skipped_fastcgi_socket_access_as_root = true;
+                    }
+                }
                 RouteHandler::Static(_)
                 | RouteHandler::TryFiles(_)
-                | RouteHandler::FastCgi(_)
                 | RouteHandler::Redirect(_)
                 | RouteHandler::Respond(_) => {}
             }
@@ -2372,7 +2485,12 @@ fn collect_filesystem_issues_classified(
         }
     }
     errors.extend(server_wide_errors);
-    (errors, quarantined, classified)
+    (
+        errors,
+        quarantined,
+        classified,
+        skipped_fastcgi_socket_access_as_root,
+    )
 }
 
 fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {

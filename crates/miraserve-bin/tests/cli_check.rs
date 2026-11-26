@@ -9373,3 +9373,430 @@ fn plain_service_generate_matches_74a8243_bytes_for_all_targets_and_codex_inputs
 
     Ok(())
 }
+
+/// Oracle for 0.1.6 Item 2: `miraserve check --fs` warns (`W033`) when an existing exact FastCGI
+/// Unix socket cannot be opened (read+write) by the checking account's effective credentials, prints
+/// one plain note (not a warning) when running as root with existing sockets, ignores absent paths,
+/// non-sockets, and TCP targets, never calls `connect()`, and never makes `reload --config` fail.
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn check_fs_fastcgi_unix_socket_access_w033_and_root_note() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // Keep socket paths short for macOS 104-byte sun_path limit.
+    let base = PathBuf::from(format!("/tmp/ms-w033-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let conf_dir = base.join("c");
+    let www_dir = base.join("www");
+    std::fs::create_dir_all(&conf_dir)?;
+    std::fs::create_dir_all(&www_dir)?;
+
+    let ok_sock = base.join("ok.sock");
+    let bad_sock = base.join("bad.sock");
+    let ro_sock = base.join("ro.sock");
+    let absent_sock = base.join("absent.sock");
+    let regular_file = base.join("not-a-sock");
+    std::fs::write(&regular_file, b"plain")?;
+
+    let ok_listener = UnixListener::bind(&ok_sock)?;
+    ok_listener.set_nonblocking(true)?;
+    std::fs::set_permissions(&ok_sock, std::fs::Permissions::from_mode(0o660))?;
+
+    let _bad_listener = UnixListener::bind(&bad_sock)?;
+    std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o000))?;
+
+    let _ro_listener = UnixListener::bind(&ro_sock)?;
+    std::fs::set_permissions(&ro_sock, std::fs::Permissions::from_mode(0o400))?;
+
+    let bad_cfg = conf_dir.join("bad.kdl");
+    std::fs::write(
+        &bad_cfg,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "php-denied.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+"#,
+            www_dir.display(),
+            bad_sock.display()
+        ),
+    )?;
+
+    let ro_cfg = conf_dir.join("ro.kdl");
+    std::fs::write(
+        &ro_cfg,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "php-ro.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+"#,
+            www_dir.display(),
+            ro_sock.display()
+        ),
+    )?;
+
+    let clean_cfg = conf_dir.join("clean.kdl");
+    std::fs::write(
+        &clean_cfg,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "php-clean.example" {{
+    root "{}"
+    route "/ok/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/absent/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/file/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/tcp/*" {{
+        fastcgi-pass "tcp://127.0.0.1:9000"
+    }}
+}}
+"#,
+            www_dir.display(),
+            ok_sock.display(),
+            absent_sock.display(),
+            regular_file.display()
+        ),
+    )?;
+
+    let no_existing_sock_cfg = conf_dir.join("no-existing.kdl");
+    std::fs::write(
+        &no_existing_sock_cfg,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "php-no-existing.example" {{
+    root "{}"
+    route "/absent/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/file/*" {{
+        fastcgi-pass "unix:{}"
+    }}
+    route "/tcp/*" {{
+        fastcgi-pass "tcp://127.0.0.1:9000"
+    }}
+}}
+"#,
+            www_dir.display(),
+            absent_sock.display(),
+            regular_file.display()
+        ),
+    )?;
+
+    let multi_sock_cfg = conf_dir.join("multi.kdl");
+    std::fs::write(
+        &multi_sock_cfg,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "php-a.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+site "php-b.example" {{
+    root "{}"
+    route "*.php" {{
+        fastcgi-pass "unix:{}"
+    }}
+}}
+"#,
+            www_dir.display(),
+            ok_sock.display(),
+            www_dir.display(),
+            bad_sock.display()
+        ),
+    )?;
+
+    // Without `--fs`: never emits W033 or the root note.
+    let no_fs = Command::new(miraserve_bin())
+        .args(["check", "--strict", "--dev-tls"])
+        .arg(&bad_cfg)
+        .output()?;
+    assert!(
+        no_fs.status.success(),
+        "check without --fs must pass: stderr={}",
+        String::from_utf8_lossy(&no_fs.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&no_fs.stderr).contains("W033"));
+    assert!(!String::from_utf8_lossy(&no_fs.stdout).contains("root"));
+
+    // Absent socket, non-socket regular file, and TCP target produce zero warnings and zero notes.
+    let no_existing = Command::new(miraserve_bin())
+        .args(["check", "--fs", "--strict", "--dev-tls", "--format", "json"])
+        .arg(&no_existing_sock_cfg)
+        .output()?;
+    assert!(
+        no_existing.status.success(),
+        "absent/non-socket/tcp check --fs --strict must pass: stdout={} stderr={}",
+        String::from_utf8_lossy(&no_existing.stdout),
+        String::from_utf8_lossy(&no_existing.stderr)
+    );
+    let no_existing_json: serde_json::Value = serde_json::from_slice(&no_existing.stdout)?;
+    assert!(
+        no_existing_json
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "absent/non-socket/tcp must emit no warnings: {no_existing_json}"
+    );
+    assert!(
+        no_existing_json
+            .get("notes")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "absent/non-socket/tcp must emit no root note: {no_existing_json}"
+    );
+
+    let is_root = rustix::process::geteuid().is_root();
+    if is_root {
+        // Running as root (euid 0): do NOT warn, print ONE plain note per run even with 2 sockets,
+        // and `--strict` succeeds.
+        let root_text = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&multi_sock_cfg)
+            .output()?;
+        assert!(
+            root_text.status.success(),
+            "check --fs --strict as root must pass: stdout={} stderr={}",
+            String::from_utf8_lossy(&root_text.stdout),
+            String::from_utf8_lossy(&root_text.stderr)
+        );
+        assert!(
+            !String::from_utf8_lossy(&root_text.stderr).contains("W033"),
+            "root must not emit W033"
+        );
+        let root_stdout = String::from_utf8_lossy(&root_text.stdout);
+        let note_lines: Vec<&str> = root_stdout
+            .lines()
+            .filter(|l| l.starts_with("note:") && l.contains("root"))
+            .collect();
+        assert_eq!(
+            note_lines.len(),
+            1,
+            "expected exactly ONE plain root note in text output, got:\n{root_stdout}"
+        );
+
+        let root_json_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls", "--format", "json"])
+            .arg(&multi_sock_cfg)
+            .output()?;
+        assert!(root_json_out.status.success());
+        let root_json: serde_json::Value = serde_json::from_slice(&root_json_out.stdout)?;
+        assert_eq!(
+            root_json.get("valid").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            root_json
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        let json_notes: Vec<&str> = root_json
+            .get("notes")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .filter(|n| n.contains("root"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            json_notes.len(),
+            1,
+            "expected exactly ONE root note in JSON output: {root_json}"
+        );
+    } else {
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let effective_group = rustix::process::getegid().as_raw();
+
+        // 1. Accessible 0660 socket + absent + regular file + TCP: passes `--strict`, no W033,
+        //    and NEVER connects to the listening socket.
+        let clean_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&clean_cfg)
+            .output()?;
+        assert!(
+            clean_out.status.success(),
+            "accessible socket check --fs --strict failed: stderr={}",
+            String::from_utf8_lossy(&clean_out.stderr)
+        );
+        assert!(
+            matches!(
+                ok_listener.accept(),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "check --fs must not call connect() on the FastCGI unix socket"
+        );
+
+        // 2. Inaccessible 0000 socket: text mode without --strict exits 0 with W033 + details + help.
+        let bad_text = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--dev-tls"])
+            .arg(&bad_cfg)
+            .output()?;
+        assert!(
+            bad_text.status.success(),
+            "check --fs without --strict must exit 0 on warning: stderr={}",
+            String::from_utf8_lossy(&bad_text.stderr)
+        );
+        let bad_stderr = String::from_utf8_lossy(&bad_text.stderr);
+        assert!(
+            bad_stderr.contains("warning[W033]:")
+                && bad_stderr.contains("php-denied.example")
+                && bad_stderr.contains(&bad_sock.display().to_string())
+                && bad_stderr.contains("0000")
+                && bad_stderr.contains(&effective_uid.to_string())
+                && bad_stderr.contains(&effective_group.to_string())
+                && bad_stderr.contains("listen.group"),
+            "unexpected W033 text diagnostic:\n{bad_stderr}"
+        );
+
+        // 3. Read-only (0400, missing write) socket also triggers W033.
+        let ro_strict = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&ro_cfg)
+            .output()?;
+        assert!(
+            !ro_strict.status.success(),
+            "read-only 0400 socket must fail check --fs --strict"
+        );
+        assert!(
+            String::from_utf8_lossy(&ro_strict.stderr).contains("W033"),
+            "expected W033 for 0400 socket: {}",
+            String::from_utf8_lossy(&ro_strict.stderr)
+        );
+
+        // 4. `--strict` fails on W033; `--strict --allow-warning W033` passes.
+        let bad_strict = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--dev-tls"])
+            .arg(&bad_cfg)
+            .output()?;
+        assert!(
+            !bad_strict.status.success(),
+            "check --fs --strict must fail on W033"
+        );
+
+        let bad_allowed = Command::new(miraserve_bin())
+            .args([
+                "check",
+                "--fs",
+                "--strict",
+                "--allow-warning",
+                "W033",
+                "--dev-tls",
+            ])
+            .arg(&bad_cfg)
+            .output()?;
+        assert!(
+            bad_allowed.status.success(),
+            "check --fs --strict --allow-warning W033 must succeed: stderr={}",
+            String::from_utf8_lossy(&bad_allowed.stderr)
+        );
+        assert!(String::from_utf8_lossy(&bad_allowed.stderr).contains("W033"));
+
+        // 5. JSON output carries W033 with help text.
+        let bad_json_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--dev-tls", "--format", "json"])
+            .arg(&bad_cfg)
+            .output()?;
+        assert!(bad_json_out.status.success());
+        let bad_json: serde_json::Value = serde_json::from_slice(&bad_json_out.stdout)?;
+        let w033 = bad_json
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|w| w.get("code").and_then(serde_json::Value::as_str) == Some("W033"))
+            })
+            .ok_or("missing W033 in JSON warnings")?;
+        assert_eq!(
+            w033.get("severity").and_then(serde_json::Value::as_str),
+            Some("warning")
+        );
+        assert!(
+            w033.get("help")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|h| h.contains("listen.group")),
+            "expected listen.group help in JSON W033: {w033}"
+        );
+
+        // 6. `reload --dry-run --config` MUST NOT fail on W033 (warning only, not error/quarantined).
+        let reload_json_out = Command::new(miraserve_bin())
+            .args(["reload", "--dry-run", "--format", "json", "--config"])
+            .arg(&bad_cfg)
+            .output()?;
+        assert!(
+            reload_json_out.status.success(),
+            "reload --dry-run --config must NOT fail on W033: stdout={} stderr={}",
+            String::from_utf8_lossy(&reload_json_out.stdout),
+            String::from_utf8_lossy(&reload_json_out.stderr)
+        );
+        let reload_json: serde_json::Value = serde_json::from_slice(&reload_json_out.stdout)?;
+        assert_eq!(
+            reload_json
+                .get("outcome")
+                .and_then(serde_json::Value::as_str),
+            Some("dry_run_passed")
+        );
+        assert!(
+            reload_json
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            reload_json
+                .get("quarantined")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+        );
+        assert!(
+            reload_json
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|w| w.get("code").and_then(serde_json::Value::as_str) == Some("W033"))
+                }),
+            "expected W033 in reload warnings: {reload_json}"
+        );
+    }
+
+    let _ = std::fs::set_permissions(&bad_sock, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::set_permissions(&ro_sock, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
