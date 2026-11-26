@@ -102,11 +102,6 @@ site "legacy-blog.example.com" {
     //     }
     // }
 
-    // Single-page-app fallback that returns 404 for missing extensioned paths (`.js`, `.css`, ...):
-    // route "/*" {
-    //     try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=true
-    // }
-
     route "*.php" {
         fastcgi-pass "unix:/run/php/php8.3-fpm.sock"
     }
@@ -141,3 +136,14 @@ site "ai.example.com" {
         }
     }
 }
+
+// 4. Single-Page Application (SPA): serve static files and fall back to `/index.html`,
+//    answering with this route's own 404 (not the fallback) for missing extension-like paths
+//    (`.js`, `.css`, ...):
+// site "spa.example.com" {
+//     root "/var/www/spa"
+//
+//     route "/*" {
+//         try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=true
+//     }
+// }

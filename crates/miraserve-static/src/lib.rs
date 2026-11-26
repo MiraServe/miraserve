@@ -2394,6 +2394,10 @@ impl StaticServer {
         self
     }
 
+    /// Returns `true` when `fallback-unless-extension` is enabled and the last `try-files`
+    /// candidate must be refused. When refused, the route answers its own `404 Not Found` (the
+    /// originating route's not-found answer, with its header rules and the site's error page),
+    /// rather than emulating the list with its last candidate removed.
     fn should_skip_try_files_last(&self, path_input: &str, decode_percent: bool) -> bool {
         if !self.try_files_fallback_unless_extension {
             return false;
@@ -2406,11 +2410,13 @@ impl StaticServer {
     }
 }
 
-/// Returns `true` when `path` ends with a dot followed by 1 to 8 ASCII letters or digits
-/// (`\.[A-Za-z0-9]{1,8}$`), matching the single-page-app `try-files` extensionless fallback rule.
+/// Returns `true` when `path`, with at most one trailing line feed (`'\n'`, U+000A) removed,
+/// ends with a dot followed by 1 to 8 ASCII letters or digits (`\.[A-Za-z0-9]{1,8}$` under PCRE
+/// default `$` semantics, matching Nginx's `$uri ~ "\.[A-Za-z0-9]{1,8}$"` single-page-app rule).
 #[must_use]
 pub fn path_ends_with_extension(path: &str) -> bool {
-    let Some((_, tail)) = path.rsplit_once('.') else {
+    let trimmed = path.strip_suffix('\n').unwrap_or(path);
+    let Some((_, tail)) = trimmed.rsplit_once('.') else {
         return false;
     };
     (1..=8).contains(&tail.len()) && tail.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -6005,6 +6011,9 @@ impl StaticServer {
                 return static_outcome(method_not_allowed(), tpl_path, candidate_path);
             }
         }
+        // Earlier `=status` candidates are ignored on non-read methods (only the final candidate
+        // runs `=status` or an internal rewrite). When `skip_last` refuses the final candidate,
+        // the route answers its own 404 directly rather than promoting an earlier candidate.
         let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
         if !skip_last && let Some(last) = candidates.last() {
             if let Some(code_str) = last.strip_prefix('=')
@@ -6144,6 +6153,10 @@ impl StaticServer {
                 .await;
         }
 
+        // When `skip_last` refuses the final candidate, break out of the loop and answer the
+        // originating route's own 404 (with its header rules and the site's error page). Earlier
+        // candidates run unchanged in order, and the penultimate candidate never acquires
+        // final-candidate rewrite semantics.
         let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
         for (idx, template) in candidates.iter().enumerate() {
             let is_last = idx + 1 == candidates.len();
@@ -6482,6 +6495,10 @@ impl StaticServer {
                 }
             };
 
+        // When `skip_last` refuses the final candidate, break out of the loop and answer the
+        // originating route's own 404 (with its header rules and the site's error page). Earlier
+        // candidates run unchanged in order, and the penultimate candidate never acquires
+        // final-candidate rewrite semantics.
         let skip_last = self.should_skip_try_files_last(path_input, decode_percent);
         for (idx, template) in candidates.iter().enumerate() {
             let is_last = idx + 1 == candidates.len();
@@ -7920,6 +7937,34 @@ static TEST_BLOCKING_POOL_HOOK: std::sync::Mutex<Option<BlockingPoolTestHook>> =
 #[cfg(all(any(test, feature = "test-h2-hooks"), target_os = "linux"))]
 static TEST_SHARED_INLINE_HOOK: std::sync::Mutex<Option<BlockingPoolTestHook>> =
     std::sync::Mutex::new(None);
+
+/// Integration-test helper probing whether `openat2(2)` is permitted on this thread and not
+/// latched unavailable (used by cache tests to match `file_cache_oracle`'s openat2-refusal
+/// handling).
+#[cfg(all(
+    any(test, feature = "test-h2-hooks"),
+    any(target_os = "linux", target_os = "android")
+))]
+#[doc(hidden)]
+#[must_use]
+pub fn test_host_allows_file_cache_admission() -> bool {
+    use rustix::fs::{CWD, Mode, OFlags, ResolveFlags, openat2};
+    use rustix::io::Errno;
+
+    if OPENAT2_UNAVAILABLE.load(Ordering::Relaxed) {
+        return false;
+    }
+    !matches!(
+        openat2(
+            CWD,
+            "",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::empty(),
+        ),
+        Err(Errno::NOSYS | Errno::PERM | Errno::ACCESS)
+    )
+}
 
 /// Integration-test RAII guard forcing `openat2(RESOLVE_CACHED)` to return `EAGAIN` (`Unknown`).
 #[cfg(all(any(test, feature = "test-h2-hooks"), target_os = "linux"))]

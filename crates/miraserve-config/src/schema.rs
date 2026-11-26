@@ -1285,8 +1285,11 @@ pub enum RouteHandler {
 pub struct TryFilesConfig {
     /// Candidate paths or `=status` codes tried in order.
     pub candidates: Vec<String>,
-    /// When `true`, skip the final candidate if the normalised request path (without query string)
-    /// ends with a dot followed by 1 to 8 ASCII letters or digits (`\.[A-Za-z0-9]{1,8}$`).
+    /// When `true`, refuse the final candidate when the normalised request path (without query
+    /// string), with at most one trailing `'\n'` (U+000A) removed, ends with a dot followed by 1
+    /// to 8 ASCII letters or digits (`\.[A-Za-z0-9]{1,8}$` under PCRE default `$` semantics). When
+    /// refused, the route answers its own `404 Not Found` (with the originating route's header
+    /// rules and the site's error page) rather than promoting an earlier candidate.
     pub fallback_unless_extension: bool,
 }
 

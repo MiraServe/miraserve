@@ -1,7 +1,7 @@
 //! Oracle and regression tests for `try-files ... fallback-unless-extension=#true` (0.1.6 Item 3).
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,13 +9,31 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use http::header::HOST;
 use http::{HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt as _;
-use miraserve_config::parse_kdl;
+use miraserve_config::{LimitsConfig, parse_kdl};
 use miraserve_http::{HttpEngine, RequestContext, empty_http_body};
+use miraserve_security::validate_request_framing;
 use miraserve_tls::AcmeChallengeStore;
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+fn kdl_escape_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+fn host_allows_file_cache_admission() -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        miraserve_static::test_host_allows_file_cache_admission()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        false
+    }
+}
 
 fn ctx() -> RequestContext {
     RequestContext {
@@ -110,14 +128,63 @@ site "single.example.test" {{
         try-files "/index.html" fallback-unless-extension=#true
     }}
 }}
+site "dispatch-semantics.example.test" {{
+    root "{root}"
+    error-pages {{ page 404 "404.html" }}
+    route "/dispatch" {{
+        try-files "=204"
+        headers {{
+            set "x-dispatch" "from-dispatch"
+        }}
+    }}
+    route "/*" {{
+        try-files "/dispatch" "/index.html" fallback-unless-extension=#true
+        headers {{
+            set "x-owner" "catchall-route"
+            set "x-not-found" "yes" status="404"
+        }}
+    }}
+}}
+site "status-semantics.example.test" {{
+    root "{root}"
+    error-pages {{ page 404 "404.html" }}
+    route "/*" {{
+        try-files "=410" "/index.html" fallback-unless-extension=#true
+        headers {{
+            set "x-owner" "status-catchall"
+        }}
+    }}
+}}
 "#,
-        root = root.display(),
+        root = kdl_escape_path(&root),
     );
 
     let (cfg, _) = parse_kdl("spa.kdl", &kdl)?;
     let engine = HttpEngine::from_config(&cfg, Arc::new(AcmeChallengeStore::new()), None, 8443)?;
 
-    // All required path cases on `spa.example.test`:
+    // Confirm MiraServe's own request validation (`miraserve_security::smuggling::validate_raw_path`)
+    // permits percent-encoded `%0A`/`%0D` in paths (so they reach routing and the fallback
+    // predicate), while rejecting raw unencoded control bytes (`URI_CTRL_CHAR`).
+    let limits = LimitsConfig::default();
+    for encoded_uri in ["/missing.js%0A", "/missing.js%0A%0A", "/missing.js%0D"] {
+        let probe_req = Request::builder()
+            .method(Method::GET)
+            .uri(encoded_uri)
+            .header(HOST, "spa.example.test")
+            .body(())?;
+        assert!(
+            validate_request_framing(&probe_req, &limits).is_ok(),
+            "encoded control byte URI {encoded_uri} should reach routing (not be rejected in smuggling validation)"
+        );
+    }
+    let raw_lf_rej = miraserve_security::validate_request_target("/missing.js\n");
+    assert_eq!(
+        raw_lf_rej.err().map(|r| r.rule),
+        Some("URI_CTRL_CHAR"),
+        "raw unencoded LF in request target must still be rejected by URI_CTRL_CHAR"
+    );
+
+    // All required path cases on `spa.example.test` (including Nginx PCRE single-final-LF parity):
     let not_found_paths = [
         "/assets/nope.js",
         "/assets/nope.js?v=1",
@@ -127,6 +194,8 @@ site "single.example.test" {{
         "/assets/nope%2ejs",
         "/assets/nope%2EJS",
         "//assets//nope.js",
+        "/missing.js%0A",
+        "/missing.js%0a",
     ];
     for uri in not_found_paths {
         let (st, hdrs, body) = send(&engine, Method::GET, "spa.example.test", uri).await?;
@@ -159,6 +228,9 @@ site "single.example.test" {{
         "/photo%2ejpeg2000x",
         "/app.v2/",
         "/app.v2//",
+        "/missing.js%0A%0A",
+        "/missing.js%0D",
+        "/missing.js%0D%0A",
     ];
     for uri in fallback_paths {
         let (st, hdrs, body) = send(&engine, Method::GET, "spa.example.test", uri).await?;
@@ -245,6 +317,69 @@ site "single.example.test" {{
     .await?;
     assert_eq!(st, StatusCode::NOT_FOUND);
 
+    // P2 #9 semantics: when fallback is refused, the route answers its own 404 (with its headers
+    // and site error page) — it does NOT emulate removing the last candidate from the list.
+    // Example 1: exact `/dispatch` route (204) before catch-all `try-files "/dispatch" "/index.html"`.
+    let (st_direct, hdrs_direct, _) = send(
+        &engine,
+        Method::GET,
+        "dispatch-semantics.example.test",
+        "/dispatch",
+    )
+    .await?;
+    assert_eq!(st_direct, StatusCode::NO_CONTENT);
+    assert_eq!(
+        hdrs_direct.get("x-dispatch").and_then(|v| v.to_str().ok()),
+        Some("from-dispatch")
+    );
+    let (st, hdrs, body) = send(
+        &engine,
+        Method::GET,
+        "dispatch-semantics.example.test",
+        "/missing.js",
+    )
+    .await?;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(body, "CUSTOM_404");
+    assert_eq!(
+        hdrs.get("x-owner").and_then(|v| v.to_str().ok()),
+        Some("catchall-route")
+    );
+    assert_eq!(
+        hdrs.get("x-not-found").and_then(|v| v.to_str().ok()),
+        Some("yes")
+    );
+    assert!(
+        hdrs.get("x-dispatch").is_none(),
+        "refused fallback must not promote penultimate /dispatch into an internal rewrite"
+    );
+
+    // Example 2: `POST` with `try-files "=410" "/index.html" fallback-unless-extension=#true`
+    // answers 404 (non-read methods ignore earlier `=status` candidates and refusing the final
+    // candidate returns the originating route's 404). On `GET`, earlier `=410` still runs before
+    // reaching the skipped last candidate and answers 410.
+    let (st, hdrs, body) = send(
+        &engine,
+        Method::POST,
+        "status-semantics.example.test",
+        "/missing.js",
+    )
+    .await?;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert_eq!(body, "CUSTOM_404");
+    assert_eq!(
+        hdrs.get("x-owner").and_then(|v| v.to_str().ok()),
+        Some("status-catchall")
+    );
+    let (st, _, _) = send(
+        &engine,
+        Method::GET,
+        "status-semantics.example.test",
+        "/missing.js",
+    )
+    .await?;
+    assert_eq!(st, StatusCode::GONE);
+
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
 }
@@ -282,7 +417,7 @@ site "php-spa.example.test" {{
     }}
 }}
 "#,
-        root = root.display(),
+        root = kdl_escape_path(&root),
     );
     let (cfg, _) = parse_kdl("php-spa.kdl", &kdl)?;
     let engine = HttpEngine::from_config(&cfg, Arc::new(AcmeChallengeStore::new()), None, 8443)?;
@@ -351,10 +486,11 @@ site "cached-spa.example.test" {{
     }}
 }}
 "#,
-        root = root.display(),
+        root = kdl_escape_path(&root),
     );
     let (cfg, _) = parse_kdl("cached-spa.kdl", &kdl)?;
     let engine = HttpEngine::from_config(&cfg, Arc::new(AcmeChallengeStore::new()), None, 8443)?;
+    let openat2_available = host_allows_file_cache_admission();
 
     // 1. Warm cached fallback entry via `/about`.
     for _ in 0..2 {
@@ -369,11 +505,18 @@ site "cached-spa.example.test" {{
     }
 
     let (hits_before, _, fills_before, _) = engine.telemetry().file_cache_counts();
-    #[cfg(target_os = "linux")]
-    assert!(
-        fills_before >= 1 && hits_before >= 1,
-        "expected `/about` fallback to fill and hit file cache on Linux, got hits={hits_before} fills={fills_before}"
-    );
+    if openat2_available {
+        assert!(
+            fills_before >= 1 && hits_before >= 1,
+            "expected `/about` fallback to fill and hit file cache when openat2 is available, got hits={hits_before} fills={fills_before}"
+        );
+    } else {
+        assert_eq!(
+            (fills_before, hits_before),
+            (0, 0),
+            "expected non-openat2 environment to store nothing, got hits={hits_before} fills={fills_before}"
+        );
+    }
 
     // 2. Request `/assets/nope.js` twice: must NEVER answer from a cached fallback entry and
     //    must NEVER create one (`hit` and `fill` stay unchanged).
@@ -418,12 +561,17 @@ site "cached-spa.example.test" {{
             Some("catchall-route")
         );
     }
-    #[cfg(target_os = "linux")]
-    {
-        let (hits_final, _, fills_final, _) = engine.telemetry().file_cache_counts();
+    let (hits_final, _, fills_final, _) = engine.telemetry().file_cache_counts();
+    if openat2_available {
         assert!(
             fills_final > fills_after && hits_final > hits_after,
-            "existing file `/assets/real.js` should still fill and hit cache on Linux"
+            "existing file `/assets/real.js` should still fill and hit cache when openat2 is available"
+        );
+    } else {
+        assert_eq!(
+            (fills_final, hits_final),
+            (fills_after, hits_after),
+            "expected non-openat2 environment to store nothing for `/assets/real.js`"
         );
     }
 

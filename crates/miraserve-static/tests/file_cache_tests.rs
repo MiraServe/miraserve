@@ -1572,6 +1572,43 @@ async fn p2_d_foreign_fill_start_across_caches_is_refused() -> TestResult {
     Ok(())
 }
 
+/// 0.1.6 Item 3 (Codex P1 #2): `path_ends_with_extension` matches Nginx's PCRE pattern
+/// `\.[A-Za-z0-9]{1,8}$`, where `$` also matches immediately before a single final `'\n'`
+/// (U+000A), while double `'\n'` and `'\r'` do not match.
+#[test]
+fn path_ends_with_extension_matches_pcre_final_newline_semantics() {
+    for matched in [
+        "/missing.js",
+        "/missing.js\n",
+        "/missing.JS\n",
+        "/docs/v1.2\n",
+        "/files/archive.tar.gz\n",
+        "/missing.12345678\n",
+    ] {
+        assert!(
+            miraserve_static::path_ends_with_extension(matched),
+            "expected match for {matched:?}"
+        );
+    }
+    for unmatched in [
+        "/about",
+        "/about\n",
+        "/missing.js\n\n",
+        "/missing.js\r",
+        "/missing.js\r\n",
+        "/missing.\n",
+        "/missing.123456789\n",
+        "/app.v2/\n",
+        "/a.b/c\n",
+        "/report.2026-11\n",
+    ] {
+        assert!(
+            !miraserve_static::path_ends_with_extension(unmatched),
+            "expected no match for {unmatched:?}"
+        );
+    }
+}
+
 /// 0.1.6 Item 3: enabling `fallback-unless-extension` allocates a fresh file-cache namespace,
 /// never serves an extension-like path from an earlier cached fallback entry, and never creates
 /// a cached entry when fallback is refused.
@@ -1580,6 +1617,16 @@ async fn p2_d_foreign_fill_start_across_caches_is_refused() -> TestResult {
 #[allow(clippy::too_many_lines)]
 async fn try_files_fallback_unless_extension_isolates_and_never_caches_refused_fallback()
 -> TestResult {
+    let openat2_available = !matches!(
+        rustix::fs::openat2(
+            rustix::fs::CWD,
+            "",
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+            rustix::fs::ResolveFlags::empty(),
+        ),
+        Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM | rustix::io::Errno::ACCESS)
+    );
     let root = temp_root("tf-ext-cache")?;
     fs::write(root.join("index.html"), b"SPA_SHELL")?;
     fs::write(root.join("real.js"), b"REAL_JS")?;
@@ -1619,8 +1666,9 @@ async fn try_files_fallback_unless_extension_isolates_and_never_caches_refused_f
     };
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(read_body(*response).await?, b"SPA_SHELL");
-    assert_eq!(counters.fills(), 1);
-    assert_eq!(cache.entry_count(), 1);
+    let expected_step = u64::from(openat2_available);
+    assert_eq!(counters.fills(), expected_step);
+    assert_eq!(cache.entry_count(), usize::from(openat2_available));
 
     // 2. Cloning with `with_try_files_fallback_unless_extension(true)` allocates a fresh namespace:
     //    `/assets/nope.js` MUST NOT hit the cached fallback entry and MUST NOT create one.
@@ -1666,7 +1714,7 @@ async fn try_files_fallback_unless_extension_isolates_and_never_caches_refused_f
     };
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(read_body(*response).await?, b"SPA_SHELL");
-    assert_eq!(counters.fills(), fills_before + 1);
+    assert_eq!(counters.fills(), fills_before + expected_step);
 
     let out_still_404 = ext_srv
         .serve_try_files_canonical_routed(
@@ -1701,7 +1749,7 @@ async fn try_files_fallback_unless_extension_isolates_and_never_caches_refused_f
     };
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(read_body(*resp).await?, b"REAL_JS");
-    assert_eq!(counters.fills(), fills_before + 2);
+    assert_eq!(counters.fills(), fills_before + expected_step * 2);
 
     let _ = fs::remove_dir_all(&root);
     Ok(())

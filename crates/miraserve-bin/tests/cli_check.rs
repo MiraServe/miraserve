@@ -9867,6 +9867,7 @@ site "php-b.example" {{
 /// byte-identical 0.1.5 `--dump-normalized` JSON when omitted or `#false`, emits the object form
 /// when `#true`, accepts single-candidate lists, and rejects bad types/unknown/duplicate attrs.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn check_validates_try_files_fallback_unless_extension_and_dump_normalized() -> TestResult {
     let run_stdin = |kdl: &str, extra: &[&str]| -> Result<std::process::Output, std::io::Error> {
         let mut child = Command::new(miraserve_bin())
@@ -9882,6 +9883,156 @@ fn check_validates_try_files_fallback_unless_extension_and_dump_normalized() -> 
         }
         child.wait_with_output()
     };
+
+    // 0. Exact byte-for-byte 0.1.5 serialization parity for a 0.1.5 configuration (omitted
+    //    `fallback-unless-extension` vs explicit `#false` vs pinned literal 0.1.5 JSON bytes).
+    //    Uses `protocols="h1"` so no kernel-dependent HTTP/2 openat2 note can alter the envelope.
+    let kdl_015 = r#"
+server {
+    listen ":443" protocols="h1"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "spa.example.test" {
+    root "/var/www/spa"
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.html"
+    }
+}
+"#;
+    let kdl_explicit_false = r#"
+server {
+    listen ":443" protocols="h1"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "spa.example.test" {
+    root "/var/www/spa"
+    route "/*" {
+        try-files "{path}" "{path}/" "/index.html" fallback-unless-extension=#false
+    }
+}
+"#;
+    const EXPECTED_015_JSON_BYTES: &[u8] = concat!(
+        "{\n",
+        "  \"valid\": true,\n",
+        "  \"strict\": true,\n",
+        "  \"source\": \"<stdin>\",\n",
+        "  \"summary\": {\n",
+        "    \"listeners\": 1,\n",
+        "    \"sites\": 1,\n",
+        "    \"routes\": 1,\n",
+        "    \"tls_min_version\": \"1.3\",\n",
+        "    \"pqc_hybrid\": true,\n",
+        "    \"warnings\": 0,\n",
+        "    \"errors\": 0\n",
+        "  },\n",
+        "  \"errors\": [],\n",
+        "  \"warnings\": [],\n",
+        "  \"config\": {\n",
+        "    \"server\": {\n",
+        "      \"listeners\": [\n",
+        "        {\n",
+        "          \"addr\": \":443\",\n",
+        "          \"protocols\": [\n",
+        "            \"h1\"\n",
+        "          ],\n",
+        "          \"redirect_https\": false\n",
+        "        }\n",
+        "      ],\n",
+        "      \"tls\": {\n",
+        "        \"min_version\": \"1.3\",\n",
+        "        \"pqc_hybrid\": true,\n",
+        "        \"key_isolation\": \"in-process\",\n",
+        "        \"ech\": false,\n",
+        "        \"ech_rotate_interval_ms\": 3600000,\n",
+        "        \"cert\": \"/etc/miraserve/certs/a.crt\",\n",
+        "        \"key\": \"/etc/miraserve/certs/a.key\"\n",
+        "      },\n",
+        "      \"sandbox\": {\n",
+        "        \"landlock\": true,\n",
+        "        \"seccomp\": \"strict\"\n",
+        "      },\n",
+        "      \"timeouts\": {\n",
+        "        \"tls_handshake_ms\": 10000,\n",
+        "        \"header_read_ms\": 10000,\n",
+        "        \"idle_keepalive_ms\": 60000,\n",
+        "        \"graceful_drain_ms\": 30000,\n",
+        "        \"body_idle_timeout_ms\": 30000,\n",
+        "        \"max_body_duration_ms\": 3600000,\n",
+        "        \"min_body_rate_bps\": 1024,\n",
+        "        \"upstream_connect_ms\": 10000,\n",
+        "        \"upstream_response_ms\": 60000,\n",
+        "        \"upstream_body_idle_ms\": 60000,\n",
+        "        \"response_write_idle_ms\": 30000,\n",
+        "        \"min_response_rate_bps\": 1024\n",
+        "      },\n",
+        "      \"limits\": {\n",
+        "        \"max_header_bytes\": 16384,\n",
+        "        \"max_body_bytes\": 10485760,\n",
+        "        \"max_concurrent_streams\": 128,\n",
+        "        \"max_h2_rst_stream_per_sec\": 50,\n",
+        "        \"max_connections\": 16384,\n",
+        "        \"max_connections_per_ip\": 128,\n",
+        "        \"ipv6_prefix_conn_multiplier\": 4,\n",
+        "        \"max_streamed_answers_per_ip\": 8,\n",
+        "        \"max_streamed_answers_per_backend\": 4\n",
+        "      },\n",
+        "      \"telemetry\": {\n",
+        "        \"metrics_path\": \"/metrics\",\n",
+        "        \"service_name\": \"miraserve\",\n",
+        "        \"redact_logs\": true\n",
+        "      }\n",
+        "    },\n",
+        "    \"sites\": [\n",
+        "      {\n",
+        "        \"hosts\": [\n",
+        "          \"spa.example.test\"\n",
+        "        ],\n",
+        "        \"security_headers\": \"strict\",\n",
+        "        \"root\": \"/var/www/spa\",\n",
+        "        \"routes\": [\n",
+        "          {\n",
+        "            \"pattern\": \"/*\",\n",
+        "            \"handler\": {\n",
+        "              \"type\": \"try-files\",\n",
+        "              \"config\": [\n",
+        "                \"{path}\",\n",
+        "                \"{path}/\",\n",
+        "                \"/index.html\"\n",
+        "              ]\n",
+        "            }\n",
+        "          }\n",
+        "        ]\n",
+        "      }\n",
+        "    ]\n",
+        "  }\n",
+        "}\n"
+    )
+    .as_bytes();
+    let out_015 = run_stdin(
+        kdl_015,
+        &["--strict", "--format", "json", "--dump-normalized"],
+    )?;
+    assert!(
+        out_015.status.success(),
+        "0.1.5 try-files config must pass: stderr={}",
+        String::from_utf8_lossy(&out_015.stderr)
+    );
+    assert_eq!(
+        out_015.stdout.as_slice(),
+        EXPECTED_015_JSON_BYTES,
+        "0.1.5 try-files normalized JSON bytes diverged:\n{}",
+        String::from_utf8_lossy(&out_015.stdout)
+    );
+    let out_false = run_stdin(
+        kdl_explicit_false,
+        &["--strict", "--format", "json", "--dump-normalized"],
+    )?;
+    assert!(out_false.status.success());
+    assert_eq!(
+        out_false.stdout.as_slice(),
+        EXPECTED_015_JSON_BYTES,
+        "explicit fallback-unless-extension=#false must serialize byte-for-byte identically to 0.1.5"
+    );
 
     // 1. Valid `#true`, `#false`, and single-candidate list pass `--strict`.
     let valid_kdl = r#"
@@ -9925,13 +10076,16 @@ site "spa.example.test" {
             .and_then(serde_json::Value::as_bool),
         Some(true)
     );
-    // Explicit `#false`: serialized as plain array (0.1.5 byte-for-byte compatible).
-    assert!(
-        routes
-            .get(1)
-            .and_then(|r| r.pointer("/handler/config"))
-            .is_some_and(serde_json::Value::is_array),
-        "fallback-unless-extension=#false must dump as plain array for 0.1.5 parity: {parsed}"
+    // Explicit `#false`: exact JSON serialization of the try-files candidate array in order.
+    assert_eq!(
+        serde_json::to_string(
+            routes
+                .get(1)
+                .and_then(|r| r.pointer("/handler/config"))
+                .ok_or("missing default route config")?
+        )?,
+        r#"["{path}","{path}/","/index.html"]"#,
+        "fallback-unless-extension=#false must dump exact 0.1.5 candidate array bytes: {parsed}"
     );
     // Multi-candidate `#true`: serialized as object.
     assert_eq!(
@@ -9940,6 +10094,57 @@ site "spa.example.test" {
             .and_then(|r| r.pointer("/handler/config/fallback_unless_extension"))
             .and_then(serde_json::Value::as_bool),
         Some(true)
+    );
+
+    // 1b. P2 #8: `examples/miraserve.kdl` passes unchanged, and uncommenting its standalone SPA
+    //     `site` block also passes `miraserve check --strict` with 0 warnings and 4 sites.
+    let example_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples/miraserve.kdl");
+    let example_check = Command::new(miraserve_bin())
+        .args(["check", "--strict"])
+        .arg(&example_path)
+        .output()?;
+    assert!(
+        example_check.status.success(),
+        "examples/miraserve.kdl check --strict failed: {}",
+        String::from_utf8_lossy(&example_check.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&example_check.stdout)
+            .contains("(2 listener(s), 3 site(s), 4 route(s), TLS >= 1.3, PQC: X25519MLKEM768 enabled, 0 warning(s))"),
+        "unexpected examples/miraserve.kdl summary: {}",
+        String::from_utf8_lossy(&example_check.stdout)
+    );
+    let example_src = std::fs::read_to_string(&example_path)?;
+    let spa_marker = "// site \"spa.example.com\" {";
+    let spa_start = example_src
+        .find(spa_marker)
+        .ok_or("examples/miraserve.kdl missing commented standalone SPA site block")?;
+    let mut uncommented = String::with_capacity(example_src.len());
+    uncommented.push_str(&example_src[..spa_start]);
+    for line in example_src[spa_start..].split_inclusive('\n') {
+        if let Some(rest) = line.strip_prefix("// ") {
+            uncommented.push_str(rest);
+        } else if let Some(rest) = line.strip_prefix("//") {
+            uncommented.push_str(rest);
+        } else {
+            uncommented.push_str(line);
+        }
+    }
+    let spa_uncommented = run_stdin(&uncommented, &["--strict"])?;
+    assert!(
+        spa_uncommented.status.success(),
+        "uncommenting the SPA site block in examples/miraserve.kdl must pass --strict: stdout={} stderr={}",
+        String::from_utf8_lossy(&spa_uncommented.stdout),
+        String::from_utf8_lossy(&spa_uncommented.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&spa_uncommented.stdout)
+            .contains("(2 listener(s), 4 site(s), 5 route(s), TLS >= 1.3, PQC: X25519MLKEM768 enabled, 0 warning(s))"),
+        "expected 4 sites / 5 routes / 0 warnings when SPA block is uncommented, got: {}",
+        String::from_utf8_lossy(&spa_uncommented.stdout)
     );
 
     // 2. Non-boolean attribute rejected with E004.
