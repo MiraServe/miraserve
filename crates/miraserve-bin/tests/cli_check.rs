@@ -10956,3 +10956,209 @@ fn debian_postremove_purge_removes_only_empty_dirs_and_notes_kept_paths() -> Tes
     let _ = std::fs::remove_dir_all(&base);
     Ok(())
 }
+
+/// Panel pin: `miraserve check --fs --format json` reports the exact literal JSON `path`
+/// `"site[N].route[M].fastcgi-pass"` on `W033` entries so a hosting panel can map each warning
+/// back to its site from the leading `"site[N]"`.
+#[cfg(unix)]
+#[test]
+fn check_fs_json_w033_path_pin_carries_site_and_route_indices() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixListener;
+
+    if rustix::process::geteuid().is_root() {
+        eprintln!(
+            "skipping check_fs_json_w033_path_pin_carries_site_and_route_indices: running as root"
+        );
+        return Ok(());
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    // Keep socket paths short for macOS 104-byte sun_path limit.
+    let base = PathBuf::from(format!("/tmp/ms-w033-pin-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let conf_dir = base.join("c");
+    let www_dir = base.join("www");
+    std::fs::create_dir_all(&conf_dir)?;
+    std::fs::create_dir_all(&www_dir)?;
+
+    let sock0 = base.join("s0.sock");
+    let sock1 = base.join("s1.sock");
+    let _l0 = UnixListener::bind(&sock0)?;
+    let _l1 = UnixListener::bind(&sock1)?;
+    std::fs::set_permissions(&sock0, std::fs::Permissions::from_mode(0o000))?;
+    std::fs::set_permissions(&sock1, std::fs::Permissions::from_mode(0o000))?;
+
+    struct Cleanup {
+        base: PathBuf,
+        socks: [PathBuf; 2],
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for s in &self.socks {
+                let _ = std::fs::set_permissions(s, std::fs::Permissions::from_mode(0o600));
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+    let _cleanup = Cleanup {
+        base: base.clone(),
+        socks: [sock0.clone(), sock1.clone()],
+    };
+
+    let cfg_path = conf_dir.join("panel-w033.kdl");
+    std::fs::write(
+        &cfg_path,
+        format!(
+            r#"
+server {{
+    listen ":443"
+}}
+site "first.example.test" {{
+    root "{www}"
+    route "/assets/*" {{
+        static {{}}
+    }}
+    route "*.php" {{
+        fastcgi-pass "unix:{sock0}"
+    }}
+}}
+site "second.example.test" {{
+    root "{www}"
+    route "/assets/*" {{
+        static {{}}
+    }}
+    route "*.php" {{
+        fastcgi-pass "unix:{sock1}"
+    }}
+}}
+"#,
+            www = www_dir.display(),
+            sock0 = sock0.display(),
+            sock1 = sock1.display(),
+        ),
+    )?;
+
+    let out = Command::new(miraserve_bin())
+        .args(["check", "--fs", "--format", "json"])
+        .arg(&cfg_path)
+        .output()?;
+    assert!(
+        out.status.success(),
+        "check --fs --format json without --strict must exit 0 on W033: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)?;
+    assert_eq!(
+        parsed.get("valid").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    let w033_paths: Vec<&str> = parsed
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("missing warnings array in JSON output")?
+        .iter()
+        .filter(|w| w.get("code").and_then(serde_json::Value::as_str) == Some("W033"))
+        .map(|w| {
+            w.get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("<missing>")
+        })
+        .collect();
+    assert_eq!(
+        w033_paths,
+        vec![
+            "site[0].route[1].fastcgi-pass",
+            "site[1].route[1].fastcgi-pass",
+        ],
+        "unexpected W033 JSON path entries: {parsed}"
+    );
+    Ok(())
+}
+
+/// Panel pin: plain `miraserve check` (no `--fs`) on a minimal site probing
+/// `try-files "$uri" "/index.html" fallback-unless-extension=#true` exits 0 with no warning and
+/// no error.
+#[test]
+fn check_minimal_site_try_files_fallback_unless_extension_panel_probe() -> TestResult {
+    let probe_kdl = r#"
+server {
+    listen ":443"
+    tls {
+        cert "/etc/miraserve/certs/a.crt"
+        key "/etc/miraserve/certs/a.key"
+    }
+}
+site "probe.example.test" {
+    root "/var/www/probe"
+    route "/*" {
+        try-files "$uri" "/index.html" fallback-unless-extension=#true
+    }
+}
+"#;
+
+    let run_check = |extra: &[&str]| -> Result<std::process::Output, std::io::Error> {
+        let mut child = Command::new(miraserve_bin())
+            .arg("check")
+            .args(extra)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(probe_kdl.as_bytes())?;
+        }
+        child.wait_with_output()
+    };
+
+    // Plain `check` (no `--fs`): exit 0, zero warnings, zero errors.
+    let plain = run_check(&[])?;
+    assert!(
+        plain.status.success(),
+        "plain check must exit 0: stdout={} stderr={}",
+        String::from_utf8_lossy(&plain.stdout),
+        String::from_utf8_lossy(&plain.stderr),
+    );
+    assert!(
+        plain.stderr.is_empty(),
+        "plain check must emit no warning or error on stderr, got: {}",
+        String::from_utf8_lossy(&plain.stderr),
+    );
+    let plain_stdout = String::from_utf8_lossy(&plain.stdout);
+    assert!(
+        plain_stdout.contains("OK:") && plain_stdout.contains("0 warning(s)"),
+        "expected OK with 0 warning(s), got:\n{plain_stdout}"
+    );
+
+    // JSON check confirms 0 errors and 0 warnings structurally.
+    let json_out = run_check(&["--format", "json"])?;
+    assert!(
+        json_out.status.success(),
+        "json check must exit 0: stderr={}",
+        String::from_utf8_lossy(&json_out.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&json_out.stdout)?;
+    assert_eq!(
+        parsed.get("valid").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert!(
+        parsed
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "expected 0 errors in JSON output: {parsed}"
+    );
+    assert!(
+        parsed
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty),
+        "expected 0 warnings in JSON output: {parsed}"
+    );
+    Ok(())
+}
