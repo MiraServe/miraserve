@@ -1,58 +1,78 @@
-# MiraServe Benchmarks & Baseline Methodology
+# Measuring MiraServe yourself
 
-This document records reproducible benchmark methodology and observed local release-build baselines for MiraServe.
+MiraServe does not publish benchmark figures or comparisons with other servers. Results depend on hardware, kernel version, configuration, and workload. This page describes the local harness in the repository and a method for measuring MiraServe on your own hardware.
 
----
+## Running the harness
 
-## 1. Local Release-Build Smoke Baseline (Observed — Not a Production Benchmark)
-
-Recorded as a single-run local smoke baseline via [`scripts/bench.sh`](../scripts/bench.sh) on an Apple Silicon developer workstation (`Darwin 25.6.0 arm64`, release profile: `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`, full feature set including `wasmtime 48` Cranelift JIT, `aws-lc-rs` PQC, `quinn`/`h3`, `cap-std`, and `instant-acme`). Note that Linux Landlock and seccomp-bpf sandbox policies are no-ops on macOS.
-
-| Metric | Observed Smoke Baseline | Notes |
-| :--- | :--- | :--- |
-| **Stripped release binary size** | **24.46 MiB** (`25,648,832` bytes) | Single binary containing HTTP/1.1/2/3, PQC TLS 1.3, FastCGI, AI/MCP gateway, atomic publisher, `keyd`, and Wasmtime Cranelift runtime. |
-| **Cold `miraserve check --strict`** | **4.59 ms median** (`4.18 ms` min / `6.21 ms` max) | 10 cold process invocations parsing & strictly validating KDL v2. |
-| **Startup to first TLS 1.3 response** | **~121 ms** | Single run; includes ephemeral ECDSA P-256 dev-TLS cert generation, TCP+UDP bind, and first TLS 1.3 handshake. |
-| **Idle RSS (post-startup)** | **14.25 MiB** (`14,592 KiB`) | Single run with HTTP/3 + HTTP/2 + HTTP/1.1 listeners bound (`pqc-hybrid #true` configured). |
-| **Single-connection `curl` smoke check** | **~7.3k req/s** (`500/500` in `0.068 s`) | Single-process sequential keep-alive `curl -sk --tlsv1.3 --http2` loop (`127.0.0.1`); verifies responsiveness and steady RSS only (no variance or multi-client saturation). |
-| **Post-load RSS** | **14.41 MiB** (`14,752 KiB`) | `+160 KiB` delta after 500 sequential requests. |
-
-> **Note:** These macOS loopback figures are a **smoke baseline** for binary footprint, startup overhead, and steady-state RSS (with Linux sandbox confinement inactive on macOS). They are **not** competitive throughput measurements; use the two-host Linux methodology below (`oha` / `h2load`, multi-run variance, Landlock + seccomp active) for publishable performance comparisons.
-
----
-
-## 2. Reproducing the Baseline
+The repository includes [`scripts/bench.sh`](../scripts/bench.sh) for a local loopback run:
 
 ```bash
-# Build stripped release binary and run the local baseline harness
 ./scripts/bench.sh
 ```
 
-If `oha`, `h2load`, or `wrk` is installed in `PATH`, `scripts/bench.sh` automatically runs a multi-client HTTP/2 or HTTP/1.1 TLS 1.3 saturation run instead of the single-connection `curl` fallback.
+To test an existing executable binary without building, set `MIRASERVE_BIN` to its path:
 
----
+```bash
+MIRASERVE_BIN=/path/to/miraserve ./scripts/bench.sh
+```
 
-## 3. Linux Production Benchmark Methodology (vs. Nginx & Caddy)
+The script requires `python3` and `curl`, and behaves as follows:
 
-For reproducible head-to-head server evaluations (e.g., MiraServe vs. Nginx 1.28+ vs. Caddy 2.9+):
+- **Binary and build step:** Uses `target/release/miraserve` by default, or `MIRASERVE_BIN` when nonempty. Set `MIRASERVE_BIN` only to an existing executable binary: if the selected path is missing or not executable, the script runs `cargo build --release --locked --bin miraserve` in the repository root and then still invokes the configured path. If the binary already exists and is executable, Cargo is not run.
+- **Files created and removed:** Creates a temporary work directory at `${TMPDIR:-/tmp}/miraserve-bench.XXXXXX` containing `www/index.html`, `www/64k.txt`, `bench.kdl`, and `server.log`. An `EXIT` trap sends `SIGTERM` to the server process if it is still running, waits for it to exit, and removes the temporary work directory it created.
+- **Server started:** Starts `miraserve run <work_dir>/bench.kdl --dev-tls --log-level warn` with stdout and stderr redirected to `server.log`. The generated configuration binds `127.0.0.1:18443` with `protocols="h3,h2,h1"`, TLS `min-version "1.3"`, `pqc-hybrid #true`, `key-isolation "in-process"`, `sandbox { landlock #true; seccomp "strict" }` (Linux only), and a `localhost` site with `security-headers "strict"` serving `<work_dir>/www`.
+- **What it prints:**
+  1. Host (`uname -srm`), `miraserve version`, and the binary path and size in bytes and MiB.
+  2. Ten runs of `miraserve check --strict --dev-tls <work_dir>/bench.kdl`, each in a new process (filesystem caches may be warm), printed in milliseconds as `min`, `median` (the sixth of the ten sorted runs), and `max`.
+  3. Readiness and idle RSS: polls `https://127.0.0.1:18443/` up to 100 times with `curl -sk --max-time 1`, sleeping `0.05` s after each failed attempt and succeeding when `curl` exits `0` (without requiring HTTP `200`; if all 100 attempts fail, it prints `server.log` and exits non-zero). It prints elapsed milliseconds from before launch to loop exit, followed by resident set size (`ps -o rss=`) in KiB and MiB.
+  4. A load step against `https://127.0.0.1:18443/` using the first command found in `PATH`:
+     - `oha`: `oha --insecure --http2 -z 5s -c 64 https://127.0.0.1:18443/`
+     - `h2load`: `h2load -n 10000 -c 32 -m 16 https://127.0.0.1:18443/`
+     - `wrk`: `wrk -t4 -c32 -d5s https://127.0.0.1:18443/`
+     - Fallback when none of those is in `PATH`: one `curl -sk --tlsv1.3 --http2` invocation with 500 `https://127.0.0.1:18443/` URL arguments, counting lines equal to `200 2` after trimming whitespace (exiting non-zero if the count is not 500) and printing elapsed seconds and requests per second.
+  5. After a successful load step, post-load resident set size (`ps -o rss=`) in KiB and MiB.
 
-### 3.1 Test Harness Topology
-- **Two dedicated Linux hosts** (client load generator + server under test) on a 10 GbE+ isolated VLAN to avoid loopback scheduler contention.
-- **Kernel tuning (identical across all servers):**
-  - `net.core.somaxconn = 65535`
-  - `net.core.rmem_max = 7500000`, `net.core.wmem_max = 7500000` (for HTTP/3 QUIC)
-  - `LimitNOFILE = 1048576`
-- **Comparable TLS policy:** TLS 1.3 with `X25519MLKEM768` (or `X25519` baseline comparison) and identical ECDSA P-256 leaf certificates.
+Because `scripts/bench.sh` runs client and server on loopback with `--dev-tls`, treat it as a local check only. Use separate Linux hosts for measurements you plan to compare or share.
 
-### 3.2 Benchmark Workloads
+## Measuring on Linux hosts
 
-| Workload | Tool & Parameters | What It Measures |
+To compare MiraServe with another server, run the same workloads against both on the same hosts with the same kernel settings, process limits, and TLS policy.
+
+### Test harness topology
+
+- **Two dedicated Linux hosts** (client load generator and server under test) on a 10 GbE+ isolated VLAN so client and server do not compete for the same host scheduler.
+- **Kernel sysctls (identical across tested servers):**
+  - `net.core.somaxconn = 65535` (listen backlog cap)
+  - `net.core.rmem_max = 7500000` and `net.core.wmem_max = 7500000` (socket buffer size caps)
+- **Process file-descriptor limit (identical across tested servers):** `LimitNOFILE=1048576` in the `systemd` unit's `[Service]` section.
+- **Comparable TLS policy:** TLS 1.3 with `X25519MLKEM768` (or `X25519` for a classical comparison) and identical ECDSA P-256 leaf certificates.
+
+### Workloads
+
+The workloads below are **examples to adapt** to your hostnames, paths, separately provisioned test fixtures (for example, a 1 KiB `index.html` and a 64 KiB `64k.txt` on the server), and client builds. All commands assume the client host trusts the server's test CA (pass `--insecure` to `oha` only if using an untrusted certificate) and target `<host>`.
+
+| Workload | Example command and setup | What to record |
 | :--- | :--- | :--- |
-| **1. Static Small Asset (1 KiB HTML, H2 TLS 1.3)** | `oha --http2 -z 30s -c 256 https://<host>/` | `cap-std` confined file lookup, ETag generation, H2 multiplexing, p50/p95/p99 latency. |
-| **2. Static Compressed Asset (64 KiB text, `Accept-Encoding: br, gzip`)** | `h2load -n 200000 -c 64 -m 32 -H 'Accept-Encoding: br'` | Precompressed `.br`/`.gz` serving and on-the-fly pure-Rust compression cost. |
-| **3. HTTP/3 over QUIC (UDP 443)** | `h2load --alpn-list=h3 -n 100000 -c 64 -m 16` | `quinn` + `h3` UDP throughput, 0-RTT/1-RTT handshake latency, and packet loss resilience. |
-| **4. Post-Quantum Handshake Cost (`X25519MLKEM768` vs `X25519`)** | `oha --disable-keepalive -z 20s -c 64` | New TLS 1.3 connection rate with hybrid PQC key exchange (`aws-lc-rs`). |
-| **5. Split-Privilege `miraserve-keyd` Overhead** | Same as Workload 4 with `key-isolation "split-daemon"` | Additional p99 handshake latency from Unix-socket IPC signing vs in-process keys. |
-| **6. Reverse Proxy & Zero-Buffer SSE Streaming** | Upstream mock emitter sending 100 SSE tokens/s across 500 concurrent streams | Time-to-first-token (TTFT) overhead and RSS under long-lived LLM streams. |
-| **7. WordPress / PHP-FPM FastCGI** | `oha --http2 -z 30s -c 64` against isolated `php8.3-fpm` Unix socket | Pure-Rust FastCGI framing + `wordpress-hardened` preset overhead. |
-| **8. Hot Reload Zero-Drop Verification** | Continuous `oha` run while executing `systemctl reload miraserve` 10× | Confirms 0 dropped/5xx responses across atomic `ArcSwap` reloads. |
+| **1. Static small asset (1 KiB HTML, HTTP/2 over TLS 1.3)** | `oha --http2 -z 30s -c 32 -p 8 https://<host>/` (32 connections × 8 parallel HTTP/2 streams = 256 concurrent requests) | Request rate, latency percentiles (p50/p95/p99), and error count. |
+| **2. Static compressed asset (64 KiB text, `Accept-Encoding: br` or `gzip`)** | `h2load -n 200000 -c 64 -m 32 -H 'Accept-Encoding: br' https://<host>/64k.txt` (repeat with `gzip` if testing both). Run separate fixtures **with** and **without** a precompressed `.br`/`.gz` sibling (an eligible sibling takes precedence); repeated requests may be served from cache. Enable the tested sibling encoding in `precompressed` for both runs. Check the `Content-Encoding` response header. | Request rate, transfer rate, latency (use `--log-file` if your `h2load` build omits percentiles), error count, sibling and cache state, and server CPU from a server-side observer. |
+| **3. HTTP/3 over QUIC (UDP 443)** | `h2load --alpn-list=h3 -n 100000 -c 64 -m 16 https://<host>/` (requires an `h2load` build compiled with `ngtcp2` and `nghttp3`; optionally inject packet loss with `tc netem`) | Request rate, latency (use `--log-file` if your `h2load` build omits percentiles), and connection or error counts. |
+| **4. Post-quantum TLS 1.3 new connections (`pqc-hybrid #true` vs. `#false`)** | `oha --disable-keepalive -z 20s -c 64 https://<host>/` against `pqc-hybrid #true` and `pqc-hybrid #false`. `oha` has no CLI flag to choose TLS key-exchange groups; verify the negotiated group on **both** runs, because `pqc-hybrid #false` permits `X25519`, `P-256`, and `P-384`. | Request rate, whole-request latency percentiles on new connections (not handshake-only time), error count, negotiated group, and server CPU from a server-side observer. |
+| **5. Split-privilege `miraserve-keyd` new connections** | Same `oha` command as Row 4, comparing `key-isolation "split-daemon"` (requires a running `miraserve-keyd` daemon and `keyd-socket` in `miraserve.kdl`; see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)) against `key-isolation "in-process"`. Verify connections perform full certificate handshakes rather than session resumptions. | Request rate, whole-request latency percentiles on new connections (not handshake-only time), and error count. |
+| **6. Reverse proxy and SSE streaming** | Upstream mock emitter sending 100 Server-Sent Events per second across 500 concurrent client streams through a `reverse-proxy` route (no fixed CLI tool) | Time to first event, per-event delivery latency, error count, and server RSS and open file descriptors (from a server-side observer). |
+| **7. WordPress / PHP-FPM FastCGI** | `oha --http2 -z 30s -c 64 https://<host>/<php-path>` targeting a URL that dispatches to PHP via `fastcgi-pass` over a local `php8.3-fpm` Unix socket (for example with `preset "wordpress-hardened"`) | Request rate, latency percentiles, error count, and PHP-FPM worker usage (from a server-side observer). |
+| **8. Hot reload under load** | Run `oha --http2 -z 60s -c 64 https://<host>/` while running `systemctl reload miraserve` 10 times | Latency percentiles, connection errors, and non-2xx response counts during reloads. |
+
+Notes on tool options:
+
+- In `oha`, `--http2` (shorthand for `--http-version=2`), `-z <duration>`, `-c <connections>`, `-p <streams>` (parallel requests per HTTP/2 connection; default `1`), `--disable-keepalive`, and `--insecure` are documented CLI options. `--disable-keepalive` applies to HTTP/1.1 runs (not `--http2`), and `oha` reports whole-request latency rather than handshake-only time.
+- In `h2load`, `-n`, `-c`, `-m`, `-H`, `--alpn-list` (`--h3` is shorthand for `--alpn-list=h3`), and `--log-file` (for per-request durations when a build's summary omits percentiles) are documented CLI options. HTTP/3 requires an `h2load` binary built with `ngtcp2` and `nghttp3`, which many distribution packages omit.
+
+## Reporting results
+
+If you publish numbers, include enough detail for someone else to reproduce the run:
+
+- The exact commit hash (or release tag) and the output of `miraserve version`.
+- The full `miraserve.kdl` configuration (including `workers`, `file-cache`, TLS, and Linux Landlock/seccomp sandbox directives) and any CLI flags passed to `miraserve run`.
+- The Linux kernel version (`uname -a`) and relevant `sysctl` values on both hosts.
+- The `systemd` unit or container settings — in particular whether `RestrictSUIDSGID` is effectively enabled (an omitted setting can inherit `yes`; when enabled, systemd's filter can refuse `openat2`, forcing a fallback and preventing `file-cache` admission; see [`docs/DEPLOYMENT.md`](DEPLOYMENT.md)).
+- The exact load-generator commands, tool versions, and whether results come from a single run or multiple runs.
