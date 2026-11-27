@@ -3517,7 +3517,7 @@ site "mixed.example.test" {{
     let local: SocketAddr = "127.0.0.1:8443".parse()?;
     let (_shut_tx, shut_rx) = watch::channel(false);
 
-    // Connection A: paced reader (4 KiB every 15 ms) carrying mixed 64 KiB and 1 KiB responses
+    // Connection A: carrying mixed 64 KiB and 1 KiB responses
     // concurrently under WriteGuardedIo.
     let a_bytes_written = Arc::new(AtomicUsize::new(0));
     let a_progress_notify = Arc::new(Notify::new());

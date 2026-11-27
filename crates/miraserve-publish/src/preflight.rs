@@ -36,7 +36,7 @@ const MAX_TOTAL_ATTR_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MARKUP_FILE_BYTES: usize = 2 * 1024 * 1024;
 /// Target chunk size fed to `html5ever` per step (`R5-PUB-8`).
 const HTML_FEED_CHUNK_BYTES: usize = 4_096;
-/// Hard per-file scan budget for HTML/XML preflight scanning (`R7-SCAN-3`), measured with
+/// Per-file scan budget for HTML/XML preflight scanning (`R7-SCAN-3`), measured with
 /// [`scan_clock_now`].
 const MAX_FILE_MARKUP_SCAN_DURATION: Duration = Duration::from_secs(1);
 /// Base whole-bundle scan budget across all active markup files (`R7-SCAN-3`).

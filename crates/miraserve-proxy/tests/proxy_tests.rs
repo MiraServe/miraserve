@@ -1945,10 +1945,6 @@ async fn review4_health_probe_uses_configured_host_on_preserve_host_route() -> T
     Ok(())
 }
 
-/// Two upstreams with one down (and no active health-check) fail over on connect errors
-/// (including a non-empty POST after the cooldown window), place the dead backend in passive
-/// cooldown, and return 502 without hitting the sibling backend when an accepted connection
-/// closes without a response on a POST.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_duplicates_sent_post()
@@ -2068,8 +2064,6 @@ async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_d
     let post_bytes = post_resp.into_body().collect().await?.to_bytes();
     assert_eq!(post_bytes.as_ref(), b"live-ok:payload=hello-failover");
 
-    // 3. A backend that accepts TCP and drops the socket without responding returns 502 without
-    //    hitting the sibling backend.
     let drop_listener = TcpListener::bind("127.0.0.1:0").await?;
     let drop_addr = drop_listener.local_addr()?;
     let drop_task = tokio::spawn(async move {

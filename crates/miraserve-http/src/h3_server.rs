@@ -223,7 +223,7 @@ pub async fn serve_h3_connection_with_control(
                 }
             }
             Some(_) = active_streams.join_next(), if !active_streams.is_empty() => {
-                // See `h3_quic::Shared`: send GOAWAY and stop accepting further requests on this
+                // See `h3_quic::Shared`: stop accepting further requests on this
                 // connection while letting in-flight requests finish.
                 if !replacing && quic.stale_notifications() >= MAX_STALE_STOP_NOTIFICATIONS {
                     debug!(peer = %peer_addr, "replacing an HTTP/3 connection with many reset streams");
@@ -304,7 +304,7 @@ pub async fn serve_h3_connection_with_control(
 }
 
 /// How many streams of one connection may be reset by the server while Quinn holds a stop
-/// notification for them (kept until the connection closes) before the server sends GOAWAY and
+/// notification for them (kept until the connection closes) before the server
 /// stops accepting further requests on that connection.
 const MAX_STALE_STOP_NOTIFICATIONS: u32 = 512;
 

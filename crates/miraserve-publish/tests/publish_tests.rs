@@ -2463,7 +2463,7 @@ fn publish_round5_wave2_site_id_rebind_x509_dn_v2_allowlist_replay_and_preflight
 }
 
 /// Round 5 Wave 3 scanner regressions (`R5-PUB-8, 9, 10, 13, 14`):
-/// - `R5-PUB-8`: 1 MB of nested `<div>` hits the depth cap within 5 s (best of 3), 50k
+/// - `R5-PUB-8`: nested `<div>` hits the depth cap within 5 s (best of 3), 50k
 ///   foster-parented `<table><i></i>` completes within 10 s, and `max-size` short-circuits
 ///   markup scanning.
 /// - `R5-PUB-9`: Ordinary valid pages pass without false positives (XHTML 1.0 DOCTYPE, `a < b`,
@@ -2485,7 +2485,7 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
         PreflightCheck::CspValid,
     ];
 
-    // 1. R5-PUB-8: 1 MB of deeply nested `<div>` must hit the depth cap within the 5 s bound.
+    // 1. R5-PUB-8: deeply nested `<div>` must hit the depth cap within the 5 s bound.
     let nested_divs = "<div>".repeat(210_000);
     assert!(nested_divs.len() > 1_000_000);
     let div_bundle = SiteBundle {
@@ -2919,8 +2919,8 @@ fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() 
     assert!(t1.elapsed() < std::time::Duration::from_secs(2));
 
     // 3. HTML5 adoption-agency attribute amplification bomb (`<p>` followed by 95 `<b>` × 20 × 900 B
-    //    attributes, then 2,500 `<p>t`): each `<p>` closes the previous `<p>` and reconstructs all
-    //    95 active formatting `<b>` elements with cloned attributes. Must abort cleanly on the
+    //    attributes, then 2,500 `<p>t`).
+    //    Must abort cleanly on the
     //    4 MiB expanded attribute memory budget.
     let mut bomb = String::with_capacity(1_900_000);
     bomb.push_str("<!doctype html><html><body><p>");

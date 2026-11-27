@@ -2010,7 +2010,7 @@ thread_local! {
 
 /// Registers a direct access-log `sink` used instead of the `tracing` formatter when INFO is
 /// enabled for `miraserve::access`, no `tracing` span is entered, and the timestamp is at or
-/// after `UNIX_EPOCH` (falling back to `tracing` otherwise). Returns `false` if a sink was
+/// after `UNIX_EPOCH`. Returns `false` if a sink was
 /// already set.
 pub fn set_access_log_sink(sink: AccessLogSink) -> bool {
     ACCESS_LOG_SINK.set(sink).is_ok()
@@ -2626,8 +2626,7 @@ impl AccessLogRecord {
     }
 }
 
-/// Upper bound on the size of the per-request service future passed to hyper (checked in
-/// `debug_assert!` where the boxed request pipeline future is returned).
+/// Upper bound on the size of the per-request service future passed to hyper.
 const SERVICE_FUTURE_MAX_BYTES: usize = 2048;
 
 const TRANSPORT_OUTCOME_PENDING: u8 = 0;
@@ -3461,7 +3460,7 @@ pub fn text_response(status: StatusCode, text: impl Into<String>) -> Response<Ht
 pub type SendBufferProbe<I> = Box<dyn Fn(&I) -> Option<usize> + Send + Sync>;
 
 /// Largest send-buffer allowance the guard grants where the kernel cannot bound its unsent
-/// queue (`R8-HTTP-1`; not Linux, see [`NOTSENT_LOWAT_BYTES`]).
+/// queue (`R8-HTTP-1`; see [`NOTSENT_LOWAT_BYTES`]).
 const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 
 /// `TCP_NOTSENT_LOWAT` set on every accepted connection on Linux, and the guard's kernel
@@ -3480,8 +3479,7 @@ const NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 
 /// Largest lead over the minimum rate a client can bank in one backpressure episode, and so the
 /// longest extra silence it can buy on a blocked TCP write:
-/// `MAX_READER_LEAD_BYTES / min-response-rate` (about 8.5 minutes at 2048 bytes per second, 17 at
-/// the default 1024).
+/// `MAX_READER_LEAD_BYTES / min-response-rate`.
 ///
 /// Caps the TCP write-idle allowance credited for bytes already accepted ahead of the minimum rate
 /// (`WriteGuardedIo::reader_lead`, `WriteGuardedIo::idle_limit`), bounding how long a client that
