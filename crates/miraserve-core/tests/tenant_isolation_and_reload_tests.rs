@@ -56,6 +56,34 @@ fn reserve_free_port() -> Result<u16, std::io::Error> {
     Ok(sock.local_addr()?.port())
 }
 
+/// Starts `MiraServeServer` on a freshly picked loopback port, retrying on `AddrInUse` in case
+/// another concurrent test claimed the ephemeral port between `reserve_free_port` and bind.
+async fn start_server_with_free_port<F>(
+    source_name: &str,
+    mut make_kdl: F,
+    options: ServerOptions,
+) -> Result<(miraserve_core::RunningServer, u16, String), Box<dyn std::error::Error>>
+where
+    F: FnMut(u16) -> String,
+{
+    let mut last_err: Option<CoreError> = None;
+    for _ in 0..16 {
+        let port = reserve_free_port()?;
+        let kdl = make_kdl(port);
+        let (cfg, _) = parse_kdl(source_name, &kdl)?;
+        match MiraServeServer::start(Arc::new(ConfigStore::new(cfg)), options.clone()).await {
+            Ok(server) => return Ok((server, port, kdl)),
+            Err(CoreError::Bind { source, addr })
+                if source.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                last_err = Some(CoreError::Bind { addr, source });
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Err(last_err.map_or_else(|| "exhausted bind retries".into(), Into::into))
+}
+
 fn build_h1_tls_connector(cert_pem: &str) -> Result<TlsConnector, Box<dyn std::error::Error>> {
     let mut roots = RootCertStore::empty();
     let certs: Vec<CertificateDer<'static>> =
@@ -122,9 +150,11 @@ async fn tenant_owned_missing_roots_wasm_and_intermediate_symlink_error_pages_ne
     std::os::unix::fs::symlink(&secret_dir, &error_dir_symlink)?;
     let abs_symlinked_dir_404 = error_dir_symlink.join("404.html");
 
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, tls_port, kdl) = start_server_with_free_port(
+        "tenant-iso.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
 }}
@@ -154,17 +184,14 @@ site "broken-routes.example" {{
     }}
 }}
 "#,
-        healthy = healthy_root.to_string_lossy().replace('\\', "/"),
-        deleted_site = deleted_site_root.to_string_lossy().replace('\\', "/"),
-        broken_routes = broken_routes_root.to_string_lossy().replace('\\', "/"),
-        abs_err_404 = abs_symlinked_dir_404.to_string_lossy().replace('\\', "/"),
-        deleted_route = deleted_route_root.to_string_lossy().replace('\\', "/"),
-        missing_wasm = missing_wasm.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg, _) = parse_kdl("tenant-iso.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                healthy = healthy_root.to_string_lossy().replace('\\', "/"),
+                deleted_site = deleted_site_root.to_string_lossy().replace('\\', "/"),
+                broken_routes = broken_routes_root.to_string_lossy().replace('\\', "/"),
+                abs_err_404 = abs_symlinked_dir_404.to_string_lossy().replace('\\', "/"),
+                deleted_route = deleted_route_root.to_string_lossy().replace('\\', "/"),
+                missing_wasm = missing_wasm.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             dev_tls: true,
             ..ServerOptions::default()
@@ -298,9 +325,11 @@ async fn reload_refuses_uncovered_sandbox_path_with_restart_required_and_keeps_o
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    let tls_port = reserve_free_port()?;
-    let kdl_v1 = format!(
-        r#"
+    let (server, tls_port, _) = start_server_with_free_port(
+        "restart-req-v1.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -317,15 +346,12 @@ site "a1.example" {{
     root "{site_a1}"
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        tree_a = tree_a.to_string_lossy().replace('\\', "/"),
-        site_a1 = site_a1.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg_v1, _) = parse_kdl("restart-req-v1.kdl", &kdl_v1)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg_v1)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                tree_a = tree_a.to_string_lossy().replace('\\', "/"),
+                site_a1 = site_a1.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: true,
             ..ServerOptions::default()
@@ -480,9 +506,14 @@ async fn g3_tenant_fifos_in_error_pages_and_wasm_never_stall_startup_or_sibling_
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    // Startup MUST complete promptly (within 5s) instead of hanging forever on open(FIFO)!
+    let (server, _, kdl) = tokio::time::timeout(
+        Duration::from_secs(5),
+        start_server_with_free_port(
+            "g3-fifo.kdl",
+            |tls_port| {
+                format!(
+                    r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -512,22 +543,16 @@ site "wasm-fifo.example" {{
     }}
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        healthy_root = healthy_root.to_string_lossy().replace('\\', "/"),
-        rel_fifo_root = rel_fifo_root.to_string_lossy().replace('\\', "/"),
-        abs_fifo_root = abs_fifo_root.to_string_lossy().replace('\\', "/"),
-        abs_fifo = abs_fifo.to_string_lossy().replace('\\', "/"),
-        wasm_fifo_root = wasm_fifo_root.to_string_lossy().replace('\\', "/"),
-        wasm_fifo = wasm_fifo.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg, _) = parse_kdl("g3-fifo.kdl", &kdl)?;
-    // Startup MUST complete promptly (within 5s) instead of hanging forever on open(FIFO)!
-    let server = tokio::time::timeout(
-        Duration::from_secs(5),
-        MiraServeServer::start(
-            Arc::new(ConfigStore::new(cfg)),
+                    cert = cert_path.to_string_lossy().replace('\\', "/"),
+                    key = key_path.to_string_lossy().replace('\\', "/"),
+                    healthy_root = healthy_root.to_string_lossy().replace('\\', "/"),
+                    rel_fifo_root = rel_fifo_root.to_string_lossy().replace('\\', "/"),
+                    abs_fifo_root = abs_fifo_root.to_string_lossy().replace('\\', "/"),
+                    abs_fifo = abs_fifo.to_string_lossy().replace('\\', "/"),
+                    wasm_fifo_root = wasm_fifo_root.to_string_lossy().replace('\\', "/"),
+                    wasm_fifo = wasm_fifo.to_string_lossy().replace('\\', "/"),
+                )
+            },
             ServerOptions {
                 apply_sandbox: false,
                 ..ServerOptions::default()
@@ -620,9 +645,12 @@ async fn g7_p1_reload_refuses_docroot_overlapping_active_log_directory_and_keeps
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    let tls_port = reserve_free_port()?;
-    let kdl_v1 = format!(
-        r#"
+    let log_file = logs.join("access.log");
+    let (server, tls_port, _) = start_server_with_free_port(
+        "g7-v1.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -634,14 +662,11 @@ site "good.example" {{
     root "{www}"
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-    );
-    let (cfg_v1, _) = parse_kdl("g7-v1.kdl", &kdl_v1)?;
-    let log_file = logs.join("access.log");
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg_v1)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                www = www.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![log_file.clone()],
@@ -728,9 +753,11 @@ async fn g2_external_absolute_custom_error_page_survives_live_reload() -> TestRe
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, _, kdl) = start_server_with_free_port(
+        "g2-err-v1.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -745,15 +772,12 @@ site "errpage.example" {{
     }}
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-        abs_404 = abs_404.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg, _) = parse_kdl("g2-err-v1.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                www = www.to_string_lossy().replace('\\', "/"),
+                abs_404 = abs_404.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             ..ServerOptions::default()
@@ -827,9 +851,12 @@ async fn g7_r3_p1_p2_reload_parity_and_trust_anchor_under_rotating_log_dir() -> 
     fs::write(&ca_in_logs, &dev_pem.cert_pem)?;
     fs::write(&sig_pub_in_logs, b"00000000000000000000000000000000")?;
 
-    let tls_port = reserve_free_port()?;
-    let base_kdl = format!(
-        r#"
+    let access_log = logs.join("access.log");
+    let (server, tls_port, base_kdl) = start_server_with_free_port(
+        "g7-r3-v1.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -841,15 +868,11 @@ site "g7trust.example" {{
     root "{www}"
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-    );
-
-    let access_log = logs.join("access.log");
-    let (cfg, _) = parse_kdl("g7-r3-v1.kdl", &base_kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                www = www.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![access_log.clone()],
@@ -974,9 +997,11 @@ async fn g7_r4_p1_tenant_symlink_error_page_into_log_dir_never_blocks_sibling_st
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, _, kdl) = start_server_with_free_port(
+        "g7-r4-errpage.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -994,16 +1019,13 @@ site "good-sibling.example" {{
     root "{root_b}"
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        root_a = bad_tenant_root.to_string_lossy().replace('\\', "/"),
-        evil_404 = evil_404.to_string_lossy().replace('\\', "/"),
-        root_b = sibling_root.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg, _) = parse_kdl("g7-r4-errpage.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                root_a = bad_tenant_root.to_string_lossy().replace('\\', "/"),
+                evil_404 = evil_404.to_string_lossy().replace('\\', "/"),
+                root_b = sibling_root.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![private_log.clone()],
@@ -1090,9 +1112,11 @@ async fn g7_r4_p1_p2_moved_log_alias_and_outward_trust_symlink_refused_on_reload
     let access_log_alias = alias.join("access.log");
     let server_log_b = logs_b.join("server.log");
 
-    let tls_port = reserve_free_port()?;
-    let base_kdl = format!(
-        r#"
+    let (server, tls_port, _) = start_server_with_free_port(
+        "g7-r4-alias-v1.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -1104,14 +1128,11 @@ site "stable.example" {{
     root "{www}"
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-    );
-
-    let (cfg, _) = parse_kdl("g7-r4-alias-v1.kdl", &base_kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                www = www.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![access_log_alias.clone(), server_log_b.clone()],
@@ -1252,9 +1273,11 @@ async fn g7_r5_p1_tenant_wasm_symlink_into_log_dir_isolated_to_route_with_rotati
         &tmp.path.join("tls"),
         &["tenant.example", "sibling.example"],
     )?;
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, _, kdl) = start_server_with_free_port(
+        "r5-wasm-rot.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -1272,15 +1295,13 @@ site "sibling.example" {{
     root "{sibling}"
 }}
 "#,
-        cert = cert.display(),
-        key = key.display(),
-        tenant = tenant_root.display(),
-        module = module.display(),
-        sibling = sibling_root.display(),
-    );
-    let (cfg, _) = parse_kdl("r5-wasm-rot.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert.display(),
+                key = key.display(),
+                tenant = tenant_root.display(),
+                module = module.display(),
+                sibling = sibling_root.display(),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![access_log.clone()],
@@ -1345,9 +1366,11 @@ async fn g7_r5_p1_intermediate_symlink_error_page_sandboxed_builtin_page_and_no_
         &tmp.path.join("tls"),
         &["tenant.example", "sibling.example"],
     )?;
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, _, kdl) = start_server_with_free_port(
+        "r5-errpage-ll.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -1369,15 +1392,13 @@ site "sibling.example" {{
     root "{sibling}"
 }}
 "#,
-        cert = cert.display(),
-        key = key.display(),
-        tenant = tenant_root.display(),
-        page = errors_link.join("404.html").display(),
-        sibling = sibling_root.display(),
-    );
-    let (cfg, _) = parse_kdl("r5-errpage-ll.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert.display(),
+                key = key.display(),
+                tenant = tenant_root.display(),
+                page = errors_link.join("404.html").display(),
+                sibling = sibling_root.display(),
+            )
+        },
         ServerOptions {
             apply_sandbox: true,
             ..ServerOptions::default()
@@ -1425,9 +1446,9 @@ async fn g7_r5_p2_non_rotating_log_beside_docroot_starts_and_reloads() -> TestRe
     let access_log = tmp.path.join("access.log");
 
     let (cert, key, cert_pem) = r5_dev_cert(&tmp.path.join("tls"), &["beside.example"])?;
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let make_kdl = |tls_port: u16| {
+        format!(
+            r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -1439,12 +1460,13 @@ site "beside.example" {{
     root "{www}"
 }}
 "#,
-        cert = cert.to_string_lossy().replace('\\', "/"),
-        key = key.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-    );
+            cert = cert.to_string_lossy().replace('\\', "/"),
+            key = key.to_string_lossy().replace('\\', "/"),
+            www = www.to_string_lossy().replace('\\', "/"),
+        )
+    };
 
-    let (cfg_rot, _) = parse_kdl("r5-plain-rot.kdl", &kdl)?;
+    let (cfg_rot, _) = parse_kdl("r5-plain-rot.kdl", &make_kdl(8443))?;
     let refused = MiraServeServer::start(
         Arc::new(ConfigStore::new(cfg_rot)),
         ServerOptions {
@@ -1460,9 +1482,9 @@ site "beside.example" {{
         "a rotating log whose directory contains the site root must be refused"
     );
 
-    let (cfg, _) = parse_kdl("r5-plain.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+    let (server, _, kdl) = start_server_with_free_port(
+        "r5-plain.kdl",
+        make_kdl,
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![access_log],
@@ -1865,9 +1887,9 @@ async fn g7_r6_enforced_replaced_error_page_dir_requires_restart_and_keeps_old_g
     fs::write(errors.join("404.html"), b"<h1>ORIGINAL-404</h1>")?;
 
     let (cert, key, cert_pem) = r5_dev_cert(&tmp.path.join("tls"), &["errdir.example"])?;
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let make_kdl = |tls_port: u16| {
+        format!(
+            r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -1886,11 +1908,12 @@ site "errdir.example" {{
     }}
 }}
 "#,
-        cert = cert.display(),
-        key = key.display(),
-        www = www.display(),
-        page = errors.join("404.html").display(),
-    );
+            cert = cert.display(),
+            key = key.display(),
+            www = www.display(),
+            page = errors.join("404.html").display(),
+        )
+    };
 
     // Spawn the unconfined fixture-owner thread BEFORE `MiraServeServer::start` confines this
     // thread and Tokio's worker threads under Landlock.
@@ -1927,9 +1950,9 @@ site "errdir.example" {{
         }
     });
 
-    let (cfg, _) = parse_kdl("r6-errdir.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+    let (server, _, kdl) = start_server_with_free_port(
+        "r6-errdir.kdl",
+        make_kdl,
         ServerOptions {
             apply_sandbox: true,
             ..ServerOptions::default()
@@ -1995,9 +2018,11 @@ async fn g7_r11_p2_reload_refuses_candidate_grant_failure_but_accepts_missing_tr
     let optional_tree = tmp.path.join("optional-tree");
 
     let (cert, key, cert_pem) = r5_dev_cert(&tmp.path.join("tls"), &["grant.example"])?;
-    let tls_port = reserve_free_port()?;
-    let kdl = format!(
-        r#"
+    let (server, _, kdl) = start_server_with_free_port(
+        "r11-grant.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -2012,14 +2037,12 @@ site "grant.example" {{
     root "{www}"
 }}
 "#,
-        cert = cert.to_string_lossy().replace('\\', "/"),
-        key = key.to_string_lossy().replace('\\', "/"),
-        tree = optional_tree.to_string_lossy().replace('\\', "/"),
-        www = www.to_string_lossy().replace('\\', "/"),
-    );
-    let (cfg, _) = parse_kdl("r11-grant.kdl", &kdl)?;
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg)),
+                cert = cert.to_string_lossy().replace('\\', "/"),
+                key = key.to_string_lossy().replace('\\', "/"),
+                tree = optional_tree.to_string_lossy().replace('\\', "/"),
+                www = www.to_string_lossy().replace('\\', "/"),
+            )
+        },
         ServerOptions {
             apply_sandbox: false,
             ..ServerOptions::default()
@@ -2082,9 +2105,9 @@ async fn tenant_site_with_an_unsafe_root_is_quarantined_and_the_reload_applies()
     )?;
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
-    let tls_port = reserve_free_port()?;
-    let header = format!(
-        r#"
+    let make_header = |tls_port: u16| {
+        format!(
+            r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -2093,19 +2116,20 @@ server {{
     }}
 }}
 "#,
-        cert = cert_path.to_string_lossy().replace('\\', "/"),
-        key = key_path.to_string_lossy().replace('\\', "/"),
-    );
+            cert = cert_path.to_string_lossy().replace('\\', "/"),
+            key = key_path.to_string_lossy().replace('\\', "/"),
+        )
+    };
     let good = |body: &str| {
         format!(
             "site \"good.example\" {{\n    root \"{}\"\n}}\n{body}",
             www.to_string_lossy().replace('\\', "/")
         )
     };
-    let (cfg_v1, _) = parse_kdl("tq-v1.kdl", &format!("{header}{}", good("")))?;
     let log_file = logs.join("access.log");
-    let server = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg_v1)),
+    let (server, tls_port, _) = start_server_with_free_port(
+        "tq-v1.kdl",
+        |tls_port| format!("{}{}", make_header(tls_port), good("")),
         ServerOptions {
             apply_sandbox: false,
             log_file_paths: vec![log_file.clone()],
@@ -2114,6 +2138,7 @@ server {{
         },
     )
     .await?;
+    let header = make_header(tls_port);
     let https_addr = server
         .bound_listeners()
         .iter()
