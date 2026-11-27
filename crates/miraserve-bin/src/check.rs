@@ -77,6 +77,13 @@ pub(crate) struct CheckArgs {
     #[arg(long)]
     pub(crate) fs: bool,
 
+    /// Opt-in Linux-only diagnostic (requires `--fs`) emitting `W034` (reports, never enforces) on
+    /// six classes: socket-tree roots, exact `fastcgi-pass` unix sockets, `keyd-socket`, ACME dir,
+    /// `ai-publish` storage, and rotating log parents. Pass verifies `/` ancestors (root/service
+    /// uid, not g/o-writable; sticky allows trusted existing child), symlinks, absence, local FS.
+    #[arg(long)]
+    pub(crate) trusted_paths: bool,
+
     /// ACME state directory to verify when `--fs` and `server.tls.acme` are enabled (`R5-CHK-1`).
     #[arg(long, value_name = "DIR")]
     pub(crate) acme_dir: Option<PathBuf>,
@@ -204,6 +211,12 @@ pub(crate) fn run_check(args: &CheckArgs) -> ExitCode {
     if args.writable_set && args.format == OutputFormat::Json {
         let mut stderr = SanitizingLineWriter::new(io::stderr().lock());
         let _ = stderr.write_line("error: --writable-set cannot be combined with --format json");
+        return ExitCode::FAILURE;
+    }
+
+    if args.trusted_paths && !args.fs {
+        let mut stderr = SanitizingLineWriter::new(io::stderr().lock());
+        let _ = stderr.write_line("error: --trusted-paths requires --fs");
         return ExitCode::FAILURE;
     }
 
@@ -566,6 +579,17 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
         .partition(|issue| issue.severity == Severity::Error);
     filtered_warnings.extend(fs_warnings);
 
+    let trusted_path_notes = if args.trusted_paths {
+        #[cfg(target_os = "linux")]
+        {
+            crate::trusted_paths::check(&mut filtered_warnings, loaded, args)
+        }
+        #[cfg(not(target_os = "linux"))]
+        vec!["--trusted-paths is Linux-only; no paths were verified".into()]
+    } else {
+        Vec::new()
+    };
+
     let warning_count = filtered_warnings.len();
     let error_count = fs_errors.len();
     // Warnings that count against `--strict`: all except the explicitly allowed codes.
@@ -591,7 +615,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
         errors: error_count,
     };
 
-    let mut notes: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = trusted_path_notes.clone();
     let has_http_listener = loaded
         .config
         .server
@@ -685,6 +709,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             | "W029"
                             | "W030"
                             | "W033"
+                            | "W034"
                     )
                 }) {
                     if args.writable_set {
@@ -699,7 +724,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             extra_warn.code, extra_warn.message
                         );
                     }
-                    if extra_warn.code == "W033"
+                    if matches!(extra_warn.code.as_str(), "W033" | "W034")
                         && let Some(help) = &extra_warn.help
                     {
                         if args.writable_set {
@@ -713,7 +738,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                 // P2 #6: Print the root / indeterminate FastCGI socket access notes in text mode
                 // on failed runs too, once each, after the warnings.
                 if failed {
-                    for note in &socket_access_notes {
+                    for note in trusted_path_notes.iter().chain(&socket_access_notes) {
                         if args.writable_set {
                             let _ = SanitizingLineWriter::new(&mut stderr)
                                 .write_line(&format!("note: {note}"));

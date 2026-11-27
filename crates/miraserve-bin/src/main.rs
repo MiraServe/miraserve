@@ -8,6 +8,8 @@ mod keyd;
 mod publish;
 mod run;
 mod service;
+#[cfg(target_os = "linux")]
+mod trusted_paths;
 
 use std::io::{self, Write as _};
 use std::process::ExitCode;
