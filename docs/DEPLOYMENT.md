@@ -427,37 +427,43 @@ sudo sysctl -w net.core.rmem_max=7500000 net.core.wmem_max=7500000
 
 ## 3. Rootless Distroless OCI Container
 
-MiraServe ships a multi-stage `Containerfile` built onto `gcr.io/distroless/cc-debian12:nonroot` (UID/GID `65532:65532`, zero shell, zero package manager).
+MiraServe ships a multi-stage `Containerfile` built onto `gcr.io/distroless/cc-debian12:nonroot` (UID/GID `65532:65532`, zero shell, zero package manager), and publishes prebuilt `linux/amd64` and `linux/arm64` images on Docker Hub as `miraserve/miraserve`. Replace `0.1.x` below with the current release tag.
 
 ```bash
 # Build locally
 docker build -f Containerfile -t miraserve:local .
 
-# Run rootless out of the box (default CMD generates an ephemeral per-container dev TLS cert)
-docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve:local
+# Run rootless out of the box (default CMD generates an ephemeral development TLS certificate;
+# port 8080 redirects to HTTPS on port 8443, so publish 8443 unchanged)
+docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve/miraserve:0.1.x
+```
 
-# Production container with read-only rootfs, dropped capabilities, and persistent ACME state
-# (override CMD without `--dev-tls` so missing certs/ACME fail closed)
+For production, the redirect from HTTP to HTTPS points at the port the server listens on inside the container. Let your configuration listen on `:443` and `:80` with `redirect-https` and publish `443:443` (TCP and UDP) and `80:80` unchanged:
+
+```kdl
+server {
+    listen ":443" protocols="h3,h2,h1"
+    listen ":80" redirect-https=#true
+    // tls, sandbox and your sites as in the documentation
+}
+```
+
+```bash
+# Production container with read-only rootfs, dropped capabilities, and persistent ACME and
+# release volumes (override CMD without `--dev-tls` so missing certs/ACME fail closed)
 docker run -d --name miraserve \
   --read-only \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
-  -p 443:8443/tcp -p 443:8443/udp -p 80:8080/tcp \
+  -p 443:443/tcp -p 443:443/udp -p 80:80/tcp \
   -v /etc/miraserve/miraserve.kdl:/etc/miraserve/miraserve.kdl:ro \
   -v miraserve-acme:/var/lib/miraserve/acme \
   -v miraserve-releases:/var/lib/miraserve/releases \
-  ghcr.io/miraserve/miraserve:latest \
+  miraserve/miraserve:0.1.x \
   run /etc/miraserve/miraserve.kdl --acme-dir /var/lib/miraserve/acme
 ```
 
-Verify the signed OCI image before deployment:
-
-```bash
-cosign verify \
-  --certificate-identity-regexp "^https://github\.com/miraserve/miraserve/\.github/workflows/release\.yml@" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  ghcr.io/miraserve/miraserve:latest
-```
+Started this way, without `--dev-tls`, the server refuses to start unless your configuration has a certificate or an ACME block. Certificates obtained by ACME and published releases live in the two volumes (`miraserve-acme` and `miraserve-releases`); without them they are lost when the container stops. The Docker Hub image and release downloads do not carry signatures.
 
 ---
 
