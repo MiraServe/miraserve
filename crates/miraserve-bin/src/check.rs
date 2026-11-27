@@ -595,6 +595,13 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
         .partition(|issue| issue.severity == Severity::Error);
     filtered_warnings.extend(fs_warnings);
 
+    #[cfg(target_os = "linux")]
+    if args.fs && loaded.config.server.sandbox.landlock && !args.no_sandbox {
+        let probe = miraserve_core::probe_landlock_availability();
+        let req = miraserve_core::LANDLOCK_MIN_REQUIRED_ABI_VERSION;
+        filtered_warnings.extend(landlock_availability_warning(&probe, req, loaded));
+    }
+
     let trusted_path_notes = if args.trusted_paths {
         #[cfg(target_os = "linux")]
         {
@@ -726,9 +733,11 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             | "W030"
                             | "W033"
                             | "W034"
+                            | "W035"
                     )
                 }) {
-                    let san = args.writable_set || extra_warn.code == "W034";
+                    let san =
+                        args.writable_set || matches!(extra_warn.code.as_str(), "W034" | "W035");
                     if san {
                         let _ = SanitizingLineWriter::new(&mut stderr).write_line(&format!(
                             "warning[{}]: {}",
@@ -741,7 +750,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             extra_warn.code, extra_warn.message
                         );
                     }
-                    if matches!(extra_warn.code.as_str(), "W033" | "W034")
+                    if matches!(extra_warn.code.as_str(), "W033" | "W034" | "W035")
                         && let Some(help) = &extra_warn.help
                     {
                         if san {
@@ -2783,6 +2792,35 @@ fn make_report_handler() -> GraphicalReportHandler {
     GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor())
 }
 
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn landlock_availability_warning(
+    probe: &miraserve_core::LandlockProbe,
+    req: u32,
+    loaded: &LoadedConfig,
+) -> Option<ConfigIssue> {
+    use miraserve_core::LandlockProbe as P;
+    const L: &str = "Linux Landlock";
+    const R: &str = "`miraserve run` will refuse to start on this kernel";
+    const K: &str = "server.sandbox.landlock";
+    const H: &str = "run on a Landlock-enabled Linux kernel, or disable via `sandbox { landlock #false }` or `--no-sandbox`";
+    let message = match probe {
+        P::Available(a) if *a >= req && *a >= 1 => return None,
+        P::Available(a) => format!("{L} ABI {a} found, ABI {req} required; {R}"),
+        P::Disabled => format!("{L} LSM not available (disabled in LSM list); {R}"),
+        P::NotImplemented => format!("{L} LSM not available on this kernel; {R}"),
+        P::ProbeError(e) => format!("{L} probe failed ({e}); {R} if unavailable"),
+    };
+    Some(ConfigIssue {
+        code: "W035".into(),
+        severity: Severity::Warning,
+        message,
+        path: Some(K.into()),
+        help: Some(H.into()),
+        label: None,
+        location: loaded.location_for(K),
+    })
+}
+
 #[cfg(test)]
 mod writable_set_unit_tests {
     use super::*;
@@ -3082,6 +3120,133 @@ mod writable_set_unit_tests {
         }
 
         let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn landlock_availability_warning_covers_every_probe_branch_and_location()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use miraserve_core::LandlockProbe;
+        const EXPECTED_HELP: &str = "run on a Landlock-enabled Linux kernel, or disable via \
+            `sandbox { landlock #false }` or `--no-sandbox`";
+
+        let explicit = parse_kdl_detailed(
+            "explicit.kdl",
+            r#"
+server {
+    listen ":443"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+    sandbox { landlock #true; seccomp "strict" }
+}
+site "a.example" { root "/var/www/a" }
+"#,
+        )?;
+        let block_only = parse_kdl_detailed(
+            "block.kdl",
+            r#"
+server {
+    listen ":443"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+    sandbox { user "miraserve" }
+}
+site "a.example" { root "/var/www/a" }
+"#,
+        )?;
+        let omitted = parse_kdl_detailed(
+            "omitted.kdl",
+            r#"
+server {
+    listen ":443"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+}
+site "a.example" { root "/var/www/a" }
+"#,
+        )?;
+
+        // 1. Available at or above required ABI -> None (no warning).
+        assert_eq!(
+            landlock_availability_warning(&LandlockProbe::Available(1), 1, &explicit),
+            None
+        );
+        assert_eq!(
+            landlock_availability_warning(&LandlockProbe::Available(5), 1, &explicit),
+            None
+        );
+        assert_eq!(
+            landlock_availability_warning(&LandlockProbe::Available(5), 5, &explicit),
+            None
+        );
+
+        // 2. Available below required ABI (and zero ABI) -> W035 naming ABI found vs required.
+        let low = landlock_availability_warning(&LandlockProbe::Available(2), 5, &explicit)
+            .ok_or("expected W035 for ABI 2 < 5")?;
+        assert_eq!(low.code, "W035");
+        assert_eq!(low.severity, Severity::Warning);
+        assert_eq!(low.path.as_deref(), Some("server.sandbox.landlock"));
+        assert_eq!(
+            low.message,
+            "Linux Landlock ABI 2 found, ABI 5 required; `miraserve run` will refuse to start on this kernel"
+        );
+        assert_eq!(low.help.as_deref(), Some(EXPECTED_HELP));
+        assert_eq!(
+            low.location,
+            explicit.location_for("server.sandbox.landlock")
+        );
+        assert!(low.location.is_some());
+
+        let zero = landlock_availability_warning(&LandlockProbe::Available(0), 1, &explicit)
+            .ok_or("expected W035 for ABI 0 < 1")?;
+        assert_eq!(zero.code, "W035");
+        assert_eq!(zero.path.as_deref(), Some("server.sandbox.landlock"));
+        assert_eq!(
+            zero.message,
+            "Linux Landlock ABI 0 found, ABI 1 required; `miraserve run` will refuse to start on this kernel"
+        );
+
+        // 3. Disabled in kernel LSM list (EOPNOTSUPP) -> W035.
+        let disabled = landlock_availability_warning(&LandlockProbe::Disabled, 1, &block_only)
+            .ok_or("expected W035 for Disabled")?;
+        assert_eq!(disabled.code, "W035");
+        assert_eq!(disabled.severity, Severity::Warning);
+        assert_eq!(disabled.path.as_deref(), Some("server.sandbox.landlock"));
+        assert_eq!(
+            disabled.message,
+            "Linux Landlock LSM not available (disabled in LSM list); `miraserve run` will refuse to start on this kernel"
+        );
+        assert_eq!(disabled.help.as_deref(), Some(EXPECTED_HELP));
+        assert_eq!(disabled.location, block_only.location_for("server.sandbox"));
+        assert!(disabled.location.is_some());
+
+        // 4. Not implemented in kernel (ENOSYS / filtered) -> W035.
+        let not_impl = landlock_availability_warning(&LandlockProbe::NotImplemented, 1, &omitted)
+            .ok_or("expected W035 for NotImplemented")?;
+        assert_eq!(not_impl.code, "W035");
+        assert_eq!(not_impl.severity, Severity::Warning);
+        assert_eq!(not_impl.path.as_deref(), Some("server.sandbox.landlock"));
+        assert_eq!(
+            not_impl.message,
+            "Linux Landlock LSM not available on this kernel; `miraserve run` will refuse to start on this kernel"
+        );
+        assert_eq!(not_impl.help.as_deref(), Some(EXPECTED_HELP));
+        assert_eq!(not_impl.location, omitted.location_for("server"));
+        assert!(not_impl.location.is_some());
+
+        // 5. Probe error -> W035 stating probe failure, never silent, never Error severity.
+        let err_issue = landlock_availability_warning(
+            &LandlockProbe::ProbeError("unexpected Landlock ABI 0".to_owned()),
+            1,
+            &explicit,
+        )
+        .ok_or("expected W035 for ProbeError")?;
+        assert_eq!(err_issue.code, "W035");
+        assert_eq!(err_issue.severity, Severity::Warning);
+        assert_eq!(err_issue.path.as_deref(), Some("server.sandbox.landlock"));
+        assert_eq!(
+            err_issue.message,
+            "Linux Landlock probe failed (unexpected Landlock ABI 0); `miraserve run` will refuse to start on this kernel if unavailable"
+        );
+        assert_eq!(err_issue.help.as_deref(), Some(EXPECTED_HELP));
         Ok(())
     }
 }

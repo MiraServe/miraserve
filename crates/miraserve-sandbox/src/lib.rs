@@ -59,6 +59,24 @@ pub enum EnforcementStatus {
 /// platforms) report Landlock as unavailable.
 pub const LANDLOCK_TARGET_ABI_VERSION: u32 = 5;
 
+/// Minimum Linux Landlock ABI required for `run` to start (`ABI::V1`).
+pub const LANDLOCK_MIN_REQUIRED_ABI_VERSION: u32 = 1;
+
+/// Outcome of a query-only Linux Landlock availability probe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandlockProbe {
+    /// Kernel supports Landlock at the reported ABI version.
+    Available(u32),
+    /// Landlock is disabled in the kernel LSM list (`EOPNOTSUPP`).
+    Disabled,
+    /// Landlock is not available on this kernel (`ENOSYS` or filtered).
+    NotImplemented,
+    /// Probing Landlock availability failed.
+    ProbeError(String),
+}
+#[cfg(target_os = "linux")]
+pub use linux::probe_landlock_availability;
+
 /// Effective Landlock enforcement level computed for a [`SandboxPolicy`] on the running host.
 ///
 /// Shared by both `miraserve run` (when installing and reporting confinement) and
@@ -4640,22 +4658,30 @@ mod linux {
     const LANDLOCK_TARGET_ABI: ABI = ABI::V5;
     const _: () = assert!(LANDLOCK_TARGET_ABI as u32 == LANDLOCK_TARGET_ABI_VERSION);
 
-    /// Probes the running Linux kernel's Landlock ABI version without installing a ruleset or
-    /// calling `prctl(PR_SET_NO_NEW_PRIVS)`.
+    /// Query-only Landlock availability probe (no ruleset, no `PR_SET_NO_NEW_PRIVS`).
+    #[must_use]
+    pub fn probe_landlock_availability() -> crate::LandlockProbe {
+        use crate::LandlockProbe as P;
+        match RestrictSelf::default().no_new_privs(false).apply() {
+            Err(e) => P::ProbeError(e.to_string()),
+            Ok(s) => match s.landlock {
+                LandlockStatus::NotEnabled => P::Disabled,
+                LandlockStatus::NotImplemented => P::NotImplemented,
+                LandlockStatus::Available {
+                    effective_abi: e,
+                    kernel_abi: k,
+                } => match k.unwrap_or(e as i32) {
+                    v if v >= 1 => P::Available(v.cast_unsigned()),
+                    v => P::ProbeError(format!("unexpected Landlock ABI {v}")),
+                },
+            },
+        }
+    }
+
     pub(crate) fn probe_host_landlock_abi() -> Option<u32> {
-        // `RestrictSelf::default().no_new_privs(false).apply()` queries
-        // `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)` and returns
-        // immediately when no ruleset is attached (CompatState::Init).
-        let status = RestrictSelf::default().no_new_privs(false).apply().ok()?;
-        match status.landlock {
-            LandlockStatus::Available {
-                effective_abi,
-                kernel_abi,
-            } => {
-                let raw = kernel_abi.unwrap_or(effective_abi as i32);
-                u32::try_from(raw).ok().filter(|&v| v >= 1)
-            }
-            LandlockStatus::NotEnabled | LandlockStatus::NotImplemented => None,
+        match probe_landlock_availability() {
+            crate::LandlockProbe::Available(abi) => Some(abi),
+            _ => None,
         }
     }
 

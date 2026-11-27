@@ -38,6 +38,9 @@ pub use miraserve_http::{
     read_no_symlink_file_opened, reserved_acme_tokens, scan_precompressed_siblings_no_follow,
     users_file_alias_problem, with_nonblocking_inline_context,
 };
+#[cfg(target_os = "linux")]
+pub use miraserve_sandbox::probe_landlock_availability;
+pub use miraserve_sandbox::{LANDLOCK_MIN_REQUIRED_ABI_VERSION, LandlockProbe};
 pub use miraserve_sandbox::{
     LANDLOCK_TARGET_ABI_VERSION, LandlockEnforcement, LogDirBinding, Openat2AdvisoryLevel,
     PinnedLogDir, PinnedWritableDir, SandboxPolicy, WritableGrant, apply_landlock_current_thread,

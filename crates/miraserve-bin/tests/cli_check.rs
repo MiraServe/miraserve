@@ -11168,3 +11168,499 @@ site "probe.example.test" {
     );
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+fn compile_landlock_syscall_filter(
+    syscalls: &[i64],
+    action: seccompiler::SeccompAction,
+) -> Result<seccompiler::BpfProgram, Box<dyn std::error::Error>> {
+    use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
+    use std::collections::BTreeMap;
+
+    let arch = TargetArch::try_from(std::env::consts::ARCH)?;
+    let mut rules = BTreeMap::new();
+    for &nr in syscalls {
+        rules.insert(nr, Vec::new());
+        if arch == TargetArch::x86_64 {
+            rules.insert(nr | 0x4000_0000, Vec::new());
+        }
+    }
+    Ok(SeccompFilter::new(rules, SeccompAction::Allow, action, arch)?.try_into()?)
+}
+
+/// On Linux with Landlock available, `check --fs` on both example configurations and a generated
+/// valid configuration emits no `W035`, and never calls `landlock_add_rule` or
+/// `landlock_restrict_self` (query-only probe).
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
+    const SYS_LANDLOCK_ADD_RULE: i64 = 445;
+    const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+
+    if !matches!(
+        miraserve_core::probe_landlock_availability(),
+        miraserve_core::LandlockProbe::Available(abi) if abi >= 1
+    ) {
+        return Ok(());
+    }
+
+    let examples_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("examples");
+
+    // 1. Both example configurations under `check --fs` (text & JSON): zero W035.
+    for (cwd, cfg) in [
+        (&examples_dir, PathBuf::from("dev-local.kdl")),
+        (&examples_dir, examples_dir.join("miraserve.kdl")),
+    ] {
+        let text = Command::new(miraserve_bin())
+            .current_dir(cwd)
+            .args(["check", "--fs"])
+            .arg(&cfg)
+            .output()?;
+        assert!(
+            !String::from_utf8_lossy(&text.stderr).contains("W035"),
+            "unexpected W035 in text output for {}: {}",
+            cfg.display(),
+            String::from_utf8_lossy(&text.stderr)
+        );
+        let json_out = Command::new(miraserve_bin())
+            .current_dir(cwd)
+            .args(["check", "--fs", "--format", "json"])
+            .arg(&cfg)
+            .output()?;
+        let parsed: serde_json::Value = serde_json::from_slice(&json_out.stdout)?;
+        assert!(
+            !parsed
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("missing warnings")?
+                .iter()
+                .any(|w| w.get("code").and_then(serde_json::Value::as_str) == Some("W035")),
+            "unexpected W035 in JSON output for {}: {parsed}",
+            cfg.display()
+        );
+    }
+
+    // 2. Generated valid config under KILL_PROCESS on add_rule/restrict_self: succeeds with 0
+    //    warnings, proving `check --fs` is query-only and never restricts the checking process.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let base = PathBuf::from(format!("/tmp/ms-w035-ok-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let www = base.join("www");
+    let certs = base.join("certs");
+    std::fs::create_dir_all(&www)?;
+    std::fs::create_dir_all(&certs)?;
+    std::fs::write(www.join("index.html"), b"<h1>ok</h1>\n")?;
+    let cert = certs.join("s.crt");
+    let key = certs.join("s.key");
+    let gen_cert = Command::new(miraserve_bin())
+        .args(["cert", "generate-dev", "--hosts", "ok.example", "--cert"])
+        .arg(&cert)
+        .arg("--key")
+        .arg(&key)
+        .output()?;
+    assert!(gen_cert.status.success());
+    let cfg = base.join("gen.kdl");
+    std::fs::write(
+        &cfg,
+        format!(
+            "server {{\n\
+                 listen \":443\"\n\
+                 tls {{ cert \"{}\"; key \"{}\" }}\n\
+                 sandbox {{ landlock #true; seccomp \"strict\" }}\n\
+             }}\n\
+             site \"ok.example\" {{ security-headers \"strict\"; root \"{}\" }}\n",
+            kdl_escape_path(&cert),
+            kdl_escape_path(&key),
+            kdl_escape_path(&www),
+        ),
+    )?;
+
+    let kill_restrict = compile_landlock_syscall_filter(
+        &[SYS_LANDLOCK_ADD_RULE, SYS_LANDLOCK_RESTRICT_SELF],
+        seccompiler::SeccompAction::KillProcess,
+    )?;
+    let cfg_c = cfg.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&kill_restrict).map_err(|e| e.to_string())?;
+        let out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--format", "json"])
+            .arg(&cfg_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "check --fs --strict failed under KILL add_rule/restrict_self: status={:?} stderr={}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+        let empty = parsed
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if !empty {
+            return Err(format!("expected 0 warnings, got: {parsed}"));
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "query-only helper thread panicked")?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// On Linux, uses the existing in-tree `seccompiler` thread-filter technique (cf.
+/// `compile_openat2_errno_filter` and `check_fs_fastcgi_unix_socket_never_calls_faccessat2_*`)
+/// to make `landlock_create_ruleset(2)` return `ENOSYS`, `EOPNOTSUPP`, or `KILL_PROCESS` and
+/// verifies: `W035` text & JSON output, `--strict`, `--allow-warning W035`, omitted `sandbox`
+/// block, unchanged `check` without `--fs`, and zero probe when Landlock is disabled.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> TestResult {
+    const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    const LINUX_ENOSYS: u32 = 38;
+    const LINUX_EOPNOTSUPP: u32 = 95;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let base = PathBuf::from(format!("/tmp/ms-w035-sc-{}-{nanos}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let www = base.join("www");
+    let certs = base.join("certs");
+    std::fs::create_dir_all(&www)?;
+    std::fs::create_dir_all(&certs)?;
+    std::fs::write(www.join("index.html"), b"<h1>ok</h1>\n")?;
+    let cert = certs.join("s.crt");
+    let key = certs.join("s.key");
+    let gen_cert = Command::new(miraserve_bin())
+        .args(["cert", "generate-dev", "--hosts", "sbx.example", "--cert"])
+        .arg(&cert)
+        .arg("--key")
+        .arg(&key)
+        .output()?;
+    assert!(gen_cert.status.success());
+
+    let cert_e = kdl_escape_path(&cert);
+    let key_e = kdl_escape_path(&key);
+    let www_e = kdl_escape_path(&www);
+
+    let on_cfg = base.join("on.kdl");
+    std::fs::write(
+        &on_cfg,
+        format!(
+            "server {{\n\
+                 listen \":443\"\n\
+                 tls {{ cert \"{cert_e}\"; key \"{key_e}\" }}\n\
+                 sandbox {{ landlock #true; seccomp \"strict\" }}\n\
+             }}\n\
+             site \"sbx.example\" {{ security-headers \"strict\"; root \"{www_e}\" }}\n"
+        ),
+    )?;
+    let default_cfg = base.join("default.kdl");
+    std::fs::write(
+        &default_cfg,
+        format!(
+            "server {{\n\
+                 listen \":443\"\n\
+                 tls {{ cert \"{cert_e}\"; key \"{key_e}\" }}\n\
+             }}\n\
+             site \"sbx.example\" {{ security-headers \"strict\"; root \"{www_e}\" }}\n"
+        ),
+    )?;
+    let off_cfg = base.join("off.kdl");
+    std::fs::write(
+        &off_cfg,
+        format!(
+            "server {{\n\
+                 listen \":443\"\n\
+                 tls {{ cert \"{cert_e}\"; key \"{key_e}\" }}\n\
+                 sandbox {{ landlock #false; seccomp \"off\" }}\n\
+             }}\n\
+             site \"sbx.example\" {{ security-headers \"strict\"; root \"{www_e}\" }}\n"
+        ),
+    )?;
+
+    // Capture unfiltered `check` (no `--fs`) bytes for byte-identical comparison under ENOSYS.
+    let plain_baseline = Command::new(miraserve_bin())
+        .args(["check", "--strict"])
+        .arg(&on_cfg)
+        .output()?;
+    assert!(plain_baseline.status.success());
+
+    // 1. ENOSYS on landlock_create_ruleset -> W035 ("not available on this kernel"),
+    //    `--strict` fails, `--allow-warning W035` accepts, `check` without `--fs` byte-identical.
+    let enosys_bpf = compile_landlock_syscall_filter(
+        &[SYS_LANDLOCK_CREATE_RULESET],
+        seccompiler::SeccompAction::Errno(LINUX_ENOSYS),
+    )?;
+    let on_c = on_cfg.clone();
+    let def_c = default_cfg.clone();
+    let base_out = plain_baseline.stdout.clone();
+    let base_err = plain_baseline.stderr.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&enosys_bpf).map_err(|e| e.to_string())?;
+
+        // Without `--fs`: byte-identical to unfiltered run, zero W035.
+        let plain = Command::new(miraserve_bin())
+            .args(["check", "--strict"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !plain.status.success() || plain.stdout != base_out || plain.stderr != base_err {
+            return Err("check without --fs changed under ENOSYS".to_owned());
+        }
+
+        let exp_msg = "Linux Landlock LSM not available on this kernel; \
+            `miraserve run` will refuse to start on this kernel";
+
+        // `check --fs` (non-strict, text): exits 0 (warning, never error), emits exact W035.
+        let fs_text = Command::new(miraserve_bin())
+            .args(["check", "--fs"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !fs_text.status.success() {
+            return Err(format!("non-strict check --fs exited {:?}", fs_text.status));
+        }
+        let err_s = String::from_utf8_lossy(&fs_text.stderr);
+        if !err_s.contains(&format!("warning[W035]: {exp_msg}")) || !err_s.contains("  help: ") {
+            return Err(format!("unexpected W035 text stderr:\n{err_s}"));
+        }
+
+        // `check --fs --format json`: valid=true, 1 W035 with exact message & path.
+        let fs_json = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--format", "json"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !fs_json.status.success() {
+            return Err(format!("non-strict JSON exited {:?}", fs_json.status));
+        }
+        let j: serde_json::Value =
+            serde_json::from_slice(&fs_json.stdout).map_err(|e| e.to_string())?;
+        let warns = j
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .ok_or("missing warnings")?;
+        if j.get("valid").and_then(serde_json::Value::as_bool) != Some(true) || warns.len() != 1 {
+            return Err(format!("unexpected JSON report: {j}"));
+        }
+        let w = warns.first().ok_or("missing W035")?;
+        if w.get("code").and_then(serde_json::Value::as_str) != Some("W035")
+            || w.get("severity").and_then(serde_json::Value::as_str) != Some("warning")
+            || w.get("path").and_then(serde_json::Value::as_str) != Some("server.sandbox.landlock")
+            || w.get("message").and_then(serde_json::Value::as_str) != Some(exp_msg)
+        {
+            return Err(format!("unexpected W035 JSON entry: {w}"));
+        }
+
+        // `--strict` counts W035 (text & JSON fail with exit code 1).
+        let strict_text = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if strict_text.status.code() != Some(1) {
+            return Err(format!(
+                "expected --strict text exit 1, got {:?}",
+                strict_text.status
+            ));
+        }
+        let strict_json = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--format", "json"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if strict_json.status.code() != Some(1) {
+            return Err(format!(
+                "expected --strict JSON exit 1, got {:?}",
+                strict_json.status
+            ));
+        }
+        let sj: serde_json::Value =
+            serde_json::from_slice(&strict_json.stdout).map_err(|e| e.to_string())?;
+        if sj.get("valid").and_then(serde_json::Value::as_bool) != Some(false) {
+            return Err(format!("expected valid=false under --strict: {sj}"));
+        }
+
+        // `--allow-warning W035` accepts W035 under `--strict` (text & JSON exit 0, still emitted).
+        let allow_text = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--allow-warning", "W035"])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !allow_text.status.success()
+            || !String::from_utf8_lossy(&allow_text.stderr).contains("warning[W035]:")
+        {
+            return Err(format!(
+                "--allow-warning W035 text failed: status={:?} stderr={}",
+                allow_text.status,
+                String::from_utf8_lossy(&allow_text.stderr)
+            ));
+        }
+        let allow_json = Command::new(miraserve_bin())
+            .args([
+                "check",
+                "--fs",
+                "--strict",
+                "--allow-warning",
+                "W035",
+                "--format",
+                "json",
+            ])
+            .arg(&on_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !allow_json.status.success() {
+            return Err(format!(
+                "--allow-warning W035 JSON failed: {:?}",
+                allow_json.status
+            ));
+        }
+        let aj: serde_json::Value =
+            serde_json::from_slice(&allow_json.stdout).map_err(|e| e.to_string())?;
+        if aj.get("valid").and_then(serde_json::Value::as_bool) != Some(true)
+            || !aj
+                .get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ws| {
+                    ws.iter()
+                        .any(|x| x.get("code").and_then(serde_json::Value::as_str) == Some("W035"))
+                })
+        {
+            return Err(format!("unexpected --allow-warning JSON: {aj}"));
+        }
+
+        // Default config (omitted `sandbox` block -> landlock defaults to true) also emits W035.
+        let def_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--format", "json"])
+            .arg(&def_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        let dj: serde_json::Value =
+            serde_json::from_slice(&def_out.stdout).map_err(|e| e.to_string())?;
+        if !dj
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|ws| {
+                ws.len() == 1
+                    && ws
+                        .first()
+                        .and_then(|x| x.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("W035")
+            })
+        {
+            return Err(format!("omitted sandbox block must still emit W035: {dj}"));
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "ENOSYS W035 thread panicked")?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // 2. EOPNOTSUPP on landlock_create_ruleset -> W035 ("disabled in LSM list").
+    let eopnotsupp_bpf = compile_landlock_syscall_filter(
+        &[SYS_LANDLOCK_CREATE_RULESET],
+        seccompiler::SeccompAction::Errno(LINUX_EOPNOTSUPP),
+    )?;
+    let on_c2 = on_cfg.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&eopnotsupp_bpf).map_err(|e| e.to_string())?;
+        let out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--format", "json"])
+            .arg(&on_c2)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("EOPNOTSUPP non-strict exited {:?}", out.status));
+        }
+        let j: serde_json::Value =
+            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+        let w = j
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|ws| ws.first())
+            .ok_or("missing W035 for EOPNOTSUPP")?;
+        let exp_dis = "Linux Landlock LSM not available (disabled in LSM list); \
+            `miraserve run` will refuse to start on this kernel";
+        if w.get("code").and_then(serde_json::Value::as_str) != Some("W035")
+            || w.get("path").and_then(serde_json::Value::as_str) != Some("server.sandbox.landlock")
+            || w.get("message").and_then(serde_json::Value::as_str) != Some(exp_dis)
+        {
+            return Err(format!("unexpected EOPNOTSUPP W035: {w}"));
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "EOPNOTSUPP W035 thread panicked")?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // 3. KILL_PROCESS on landlock_create_ruleset: proves NO probe syscall is made when
+    //    `sandbox { landlock #false }`, when `--no-sandbox` is passed, or without `--fs`.
+    let kill_create = compile_landlock_syscall_filter(
+        &[SYS_LANDLOCK_CREATE_RULESET],
+        seccompiler::SeccompAction::KillProcess,
+    )?;
+    let off_c = off_cfg.clone();
+    let on_c3 = on_cfg.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&kill_create).map_err(|e| e.to_string())?;
+
+        for (label, args, path) in [
+            (
+                "sandbox off + --fs",
+                &["check", "--fs", "--format", "json"][..],
+                &off_c,
+            ),
+            (
+                "--no-sandbox + --fs",
+                &["check", "--fs", "--no-sandbox", "--format", "json"][..],
+                &on_c3,
+            ),
+            ("no --fs", &["check", "--format", "json"][..], &on_c3),
+        ] {
+            let out = Command::new(miraserve_bin())
+                .args(args)
+                .arg(path)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !out.status.success() {
+                return Err(format!(
+                    "{label} unexpectedly failed/killed under KILL landlock_create_ruleset: {:?}",
+                    out.status
+                ));
+            }
+            let j: serde_json::Value =
+                serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+            if j.get("warnings")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|ws| {
+                    ws.iter()
+                        .any(|x| x.get("code").and_then(serde_json::Value::as_str) == Some("W035"))
+                })
+            {
+                return Err(format!("{label} unexpectedly emitted W035: {j}"));
+            }
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "KILL no-probe thread panicked")?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
