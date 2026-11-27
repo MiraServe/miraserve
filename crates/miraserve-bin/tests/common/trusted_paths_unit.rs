@@ -338,8 +338,9 @@ fn walk_at_enforces_fs_guard_leaves_acme_sticky_symlink_and_p2_rules() -> TestRe
         assert_eq!(
             prod_gw.2,
             format!(
-                "group or other writable (other accounts can create or replace sockets in this \
-                 tree); directory is controlled by uid {euid} (the socket producer)"
+                "group or other writable (other accounts with search permission may be able to \
+                 create or replace sockets); directory is controlled by uid {euid} (the socket \
+                 producer)"
             )
         );
     }

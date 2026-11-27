@@ -1,17 +1,15 @@
 //! Opt-in Linux trusted-path diagnostic (`--trusted-paths`, `W034`); roles: 0=tree, 1=sock, 2=acme, 3=dir.
 
-use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::path::{Path, PathBuf};
-
+use crate::check::CheckArgs;
 use miraserve_config::{ConfigIssue, FastCgiTarget, LoadedConfig, RouteHandler, Severity};
 use miraserve_tls::{KeydEndpoint, resolve_unix_user_uid};
 use rustix::fd::{AsFd, OwnedFd};
 use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, fstatfs, openat, readlinkat};
 use rustix::io::Errno;
 use rustix::path::Arg;
-
-use crate::check::CheckArgs;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use std::path::{Path, PathBuf};
 
 const NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, \
     site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, \
@@ -23,10 +21,9 @@ const HELP_PROD: &str = "set the socket-tree directory owner to root or the serv
     pass --allow-warning W034 if you trust that socket producer (--allow-warning W034 applies to \
     all W034 warnings under --strict)";
 const SYM_BAD: &str = "symbolic link whose own parent or target chain is untrusted";
-const TREE_WR: &str =
-    "group or other writable (other accounts can create or replace sockets in this tree)";
+const TREE_WR: &str = "group or other writable \
+    (other accounts with search permission may be able to create or replace sockets)";
 const STKY_OWN: &str = "owner not trusted in sticky directory";
-
 type WalkRes = Result<Option<(PathBuf, OsString)>, Fail>;
 struct Ctx(Option<u32>, bool, Option<u32>, bool);
 struct Fail(PathBuf, Option<(u32, u32)>, String, u8);
@@ -55,8 +52,7 @@ pub(crate) fn is_local_posix_fs(m: u32) -> bool {
     A.contains(&m) || B.contains(&m) || C.contains(&m) || m == 0x0001_1954
 }
 pub(crate) fn is_identity_uid_map(s: &str) -> bool {
-    let v: Vec<&str> = s.split_whitespace().collect();
-    v.as_slice() == ["0", "0", "4294967295"]
+    s.split_whitespace().eq(["0", "0", "4294967295"])
 }
 pub(crate) fn obs(eu: u32, u: Option<&str>, r: fn(&str) -> Option<u32>) -> (Option<u32>, String) {
     let (fk, tr) = ("server.sandbox.user", "trusting uid 0 and service uid");
@@ -71,18 +67,18 @@ pub(crate) fn obs(eu: u32, u: Option<&str>, r: fn(&str) -> Option<u32>) -> (Opti
         let out = format!("trusted-paths: running as root; {m}");
         return (res.and_then(|(_, id)| id), out);
     }
-    if let Some((nm, Some(id))) = res
-        && id != eu
-    {
-        let s = format!("checked as uid {eu}, but {fk} '{nm}' resolves to uid {id}; {tr} {id}");
-        return (Some(id), format!("trusted-paths: {s}"));
-    }
-    let ex = match res {
-        Some((nm, None)) => format!("; {fk} '{nm}' could not be resolved"),
-        _ => String::new(),
+    let (id, msg) = match res {
+        Some((nm, Some(id))) if id != eu => {
+            let s = format!("checked as uid {eu}, but {fk} '{nm}' resolves to uid {id}");
+            (id, format!("{s}; {tr} {id}"))
+        }
+        Some((nm, None)) => {
+            let e = format!("effective uid of this check; {fk} '{nm}' could not be resolved");
+            (eu, format!("{tr} {eu} ({e})"))
+        }
+        _ => (eu, format!("{tr} {eu} (effective uid of this check)")),
     };
-    let out = format!("trusted-paths: {tr} {eu} (effective uid of this check{ex})");
-    (Some(eu), out)
+    (Some(id), format!("trusted-paths: {msg}"))
 }
 pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs) -> Vec<String> {
     let (cfg, euid) = (&l.config, rustix::process::geteuid().as_raw());
@@ -101,8 +97,9 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
             Ok(Some((pr, ms))) if mis.is_none() => {
                 let (pd, rd, md) = (p.display(), pr.display(), ms.to_string_lossy());
                 let pre = format!("trusted-paths: {lb} '{pd}': inspected existing prefix '{rd}'");
-                let suf = format!("stopped at '{md}', not found by this lookup");
-                notes.push(format!("{pre} ({suf})"));
+                notes.push(format!(
+                    "{pre} (stopped at '{md}', not found by this lookup)"
+                ));
             }
             Ok(_) => {}
             Err(f) => fs.push(f),
@@ -110,27 +107,26 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
         if let Some(su) = mis {
             let t = format!("but the configured service account is uid {su}");
             let m = format!("not verified: checked as uid {euid} {t}");
-            fs.push(Fail(p.into(), None, m, 1));
+            fs.push(Fail(p.into(), None, m, 5));
         }
         for Fail(comp, meta, reason, fl) in fs {
             let (uk, pd, cd) = ("uid unknown, mode unknown", p.display(), comp.display());
             let m = meta.map_or_else(|| uk.into(), |(u, d)| format!("uid {u}, mode {d:04o}"));
-            let help = if fl & 2 != 0 { HELP_PROD } else { HELP_GEN };
+            let d = format!("first untrusted component '{cd}' ({m}): ");
+            let message = format!("{lb} '{pd}': {}{reason}", if fl & 4 != 0 { "" } else { &d });
             out.push(ConfigIssue {
                 code: "W034".into(),
                 severity: Severity::Warning,
-                message: format!("{lb} '{pd}': first untrusted component '{cd}' ({m}): {reason}"),
+                message,
                 path: Some(k.into()),
-                help: Some(help.into()),
+                help: Some(if fl & 2 != 0 { HELP_PROD } else { HELP_GEN }.into()),
                 label: None,
                 location: if loc { l.location_for(k) } else { None },
             });
         }
     };
-    let (tk, tl) = (
-        "server.sandbox.socket-tree",
-        "server.sandbox socket-tree root",
-    );
+    let tk = "server.sandbox.socket-tree";
+    let tl = "server.sandbox socket-tree root";
     for t in &cfg.server.sandbox.socket_trees {
         let tp = t.trim_end_matches('/');
         let p = Path::new(if tp.is_empty() { t.as_str() } else { tp });
@@ -150,7 +146,7 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
         if let Some(st) = &s.ai_publish {
             let k = format!("site[{i}].ai-publish.storage");
             let lb = format!("site '{h}' ai-publish storage");
-            chk(&k, &lb, Path::new(&st.storage), true, Ok(3));
+            chk(&k, &lb, Path::new(st.storage.trim()), true, Ok(3));
         }
     }
     if let Some(s) = &cfg.server.tls.keyd_socket {
@@ -170,12 +166,11 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
         if let Some(p) = o.as_ref().filter(|_| a.log_max_bytes > 0) {
             let key = format!("server.{k}");
             let lb = format!("rotating --{k} parent directory");
-            let (t, r) = if !p.as_os_str().as_bytes().starts_with(b"/") {
-                (p.as_path(), Ok(3))
-            } else if let Some(d) = p.parent().filter(|x| !x.as_os_str().is_empty()) {
-                (d, Ok(3))
-            } else {
-                (p.as_path(), Err(fin(p, "log path has no parent directory")))
+            let dir = p.parent().filter(|x| !x.as_os_str().is_empty());
+            let (t, r) = match (p.is_absolute(), dir) {
+                (false, _) => (p.as_path(), Ok(3)),
+                (true, Some(d)) => (d, Ok(3)),
+                (true, None) => (p.as_path(), Err(fin(p, "log path has no parent directory"))),
             };
             chk(&key, &lb, t, false, r);
         }
@@ -203,7 +198,7 @@ fn inspect_fd(c: &Ctx, fd: &OwnedFd, p: &Path) -> Result<(Stat, bool), Fail> {
         (_, true) => return fse("unmapped overflow uid"),
         _ => {}
     }
-    let sf = fstatfs(fd).map_err(|e| fin(p, e))?;
+    let sf = fstatfs(fd).map_err(|e| fmeta(p, &st, e))?;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let m = sf.f_type as u32;
     if !is_local_posix_fs(m) {
@@ -223,12 +218,10 @@ fn check_node(ctx: &Ctx, leaf: Option<u8>, path: &Path, st: &Stat) -> Result<boo
     let (uid, wr, stky) = (st.st_uid, st.st_mode & 0o022 != 0, st.st_mode & 0o1000 != 0);
     let unt = uid != 0 && ctx.0 != Some(uid);
     let unk = "not verified: service uid is unknown; cannot verify ACME directory owner";
+    let ac = |s| format!("ACME directory must be owned by service uid {s} (owned by uid {uid})");
     match (leaf, ctx.0, unt, wr) {
         (Some(2), None, _, _) => fail(unk.into(), 0),
-        (Some(2), Some(s), _, _) if uid != s => {
-            let m = format!("ACME directory must be owned by service uid {s} (owned by uid {uid})");
-            fail(m, 0)
-        }
+        (Some(2), Some(s), _, _) if uid != s => fail(ac(s), 0),
         (Some(0), _, true, false) => fail(prod(uid), 2),
         (Some(0), _, true, true) => fail(format!("{TREE_WR}; {}", prod(uid)), 0),
         (Some(0), _, false, true) => fail(TREE_WR.into(), 0),
@@ -304,11 +297,10 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
         };
         let (st, nosym) = inspect_fd(c, &fd, &cp)?;
         let ft = FileType::from_raw_mode(st.st_mode);
-        let is_sym = ft == FileType::Symlink;
-        let is_leaf = !is_sym && pending.iter().all(|s| s == ".");
+        let is_leaf = ft != FileType::Symlink && pending.iter().all(|s| s == ".");
         if cur.3 && st.st_uid != 0 && c.0 != Some(st.st_uid) {
             let is_tr = is_leaf && role == 0 && ft == FileType::Directory;
-            let (r, fl) = match (is_sym, is_tr, st.st_mode & 0o022 != 0) {
+            let (r, fl) = match (ft == FileType::Symlink, is_tr, st.st_mode & 0o022 != 0) {
                 (true, _, _) => (format!("{SYM_BAD} ({STKY_OWN})"), 0),
                 (_, true, true) => (format!("{STKY_OWN}; {TREE_WR}; {}", prod(st.st_uid)), 0),
                 (_, true, false) => (format!("{STKY_OWN}; {}", prod(st.st_uid)), 2),
@@ -316,7 +308,7 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
             };
             return Err(wrap(&via, fst(&cp, &st, r, fl)));
         }
-        if is_sym {
+        if ft == FileType::Symlink {
             let (sw, pu) = (cur.2.st_mode & 0o1002 == 0o1002, cur.2.st_uid);
             let unk = "not verified: service uid is unknown in sticky world-writable directory";
             let blk = "blocked by fs.protected_symlinks for service uid";

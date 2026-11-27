@@ -78,19 +78,26 @@ pub(crate) struct CheckArgs {
     pub(crate) fs: bool,
 
     /// Opt-in Linux-only check (requires `--fs`); reports `W034` only, does not change the server
-    /// (without it, config matches 0.1.6; `--fs` probes still run). Inspects paths to six kinds:
-    /// `socket-tree` roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the endpoint
-    /// the server connects to), ACME dir, `ai-publish` storage (relative config-file values resolve
-    /// against the config dir first), rotating log parents; other paths are not looked at yet.
-    /// Reports `W034` for the first component owned by another account, group/other-writable, via
-    /// an unvouched symlink, missing where another account could create it, wrong kind, relative,
-    /// unaccepted filesystem type, or not inspectable (another account may replace it at start; fix
-    /// owner/mode or move it). No warning is not a guarantee. Sees checker's view; assumes same
-    /// root/mount view (unit isolates `/tmp`, restricts `/home`), ordinary local filesystems (no
-    /// idmap, stacking, name-hiding encryption, or other writable view), stable mounts, no shared
-    /// service account. Run as service account or root with `sandbox.user`; else not verified. Can
-    /// wait on unresponsive filesystems; writes nothing to configured paths, reads no contents
-    /// (symlink read can update atime; reads uid/symlink system files and account db).
+    /// (without it, config matches 0.1.6; `--fs` probes still run). Walks the directories on the way
+    /// to each of six kinds of configured paths and stops at the first one it reports or does not
+    /// find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the
+    /// endpoint the server connects to), ACME dir, `ai-publish` storage (relative config-file values
+    /// resolve against the config dir first), rotating log parents; other paths are not looked at
+    /// yet. Reports `W034` for the first component owned by another account, group/other-writable,
+    /// via an unvouched symlink, missing where another account could create it, wrong kind,
+    /// relative, unaccepted filesystem type, or not inspectable (another account may replace it at
+    /// start; fix owner/mode or move it). An existing socket at an exact endpoint is accepted
+    /// whatever its owner and mode (only its directory entry is examined), and in a sticky directory
+    /// owned by root or the service account an existing entry owned by root or the service account
+    /// is accepted. No warning is not a guarantee. Sees checker's view; assumes same root/mount view
+    /// (unit isolates `/tmp`, restricts `/home`), ordinary local filesystems (no idmap, stacking,
+    /// name-hiding encryption, or other writable view), stable mounts, no shared service account.
+    /// Run as the service account or as root with `server.sandbox.user` set; otherwise, when the
+    /// configuration names a service account different from the account running the check, each path
+    /// is reported as not verified; when no service account is configured, the check trusts the
+    /// account that runs it (only root when run as root), so run it as the service account. Can wait
+    /// on unresponsive filesystems; writes nothing to configured paths, reads no contents (symlink
+    /// read can update atime; reads uid/symlink system files and account db).
     #[arg(long)]
     pub(crate) trusted_paths: bool,
 
@@ -2679,7 +2686,8 @@ fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {
     let err_notes: Vec<String> = if !args.trusted_paths {
         Vec::new()
     } else if cfg!(target_os = "linux") {
-        vec!["trusted-paths: configuration invalid; no paths were verified".into()]
+        let m = "configuration could not be loaded or is invalid; no paths were verified";
+        vec![format!("trusted-paths: {m}")]
     } else {
         vec!["--trusted-paths is Linux-only; no paths were verified".into()]
     };

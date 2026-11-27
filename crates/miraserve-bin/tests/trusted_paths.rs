@@ -112,6 +112,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "--fs",
         "W034",
         "Linux-only",
+        "Walks the directories on the way to each of six kinds of configured paths and stops at the first one it reports or does not find:",
         "socket-tree",
         "fastcgi-pass",
         "keyd-socket",
@@ -121,6 +122,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "resolve against the config dir first",
         "rotating log",
         "other paths are not looked at yet",
+        "An existing socket at an exact endpoint is accepted whatever its owner and mode (only its directory entry is examined), and in a sticky directory owned by root or the service account an existing entry owned by root or the service account is accepted.",
         "No warning is not a guarantee.",
         "/tmp",
         "/home",
@@ -128,8 +130,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "stacking",
         "encryption",
         "writable view",
-        "sandbox.user",
-        "not verified",
+        "when the configuration names a service account different from the account running the check, each path is reported as not verified; when no service account is configured, the check trusts the account that runs it (only root when run as root), so run it as the service account.",
         "0.1.6",
         "unresponsive",
         "atime",
@@ -150,6 +151,9 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "race-free",
         "secure layout",
         "changes nothing",
+        "looks at each directory on the way",
+        "else not verified",
+        "otherwise results are reported as not verified",
     ] {
         assert!(
             !lower.contains(forbidden),
@@ -278,8 +282,7 @@ mod linux_tests {
         acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, \
         mcp-gateway, wasm-plugin, or non-rotating log paths";
 
-    const TREE_WR_LITERAL: &str =
-        "group or other writable (other accounts can create or replace sockets in this tree)";
+    const TREE_WR_LITERAL: &str = "group or other writable (other accounts with search permission may be able to create or replace sockets)";
 
     fn fs_magic_of(path: &str) -> Result<u32, std::io::Error> {
         let fd = rustix::fs::openat(
@@ -1166,7 +1169,8 @@ mod linux_tests {
         );
         assert_eq!(w_lines.first().copied(), Some(expected_esc.as_str()));
 
-        // 3. P2-7: invalid KDL with `--trusted-paths --format json` includes the diagnostic note.
+        // 3. P2-7 + Additional 2: invalid KDL and missing config I/O error with
+        // `--trusted-paths --format json` both emit the truthful load/validity diagnostic note.
         let bad_cfg = base.join("bad.kdl");
         fs::write(&bad_cfg, "broken {{{")?;
         let (bcode, bval) = run_json(&["--fs", "--trusted-paths"], &bad_cfg)?;
@@ -1174,7 +1178,16 @@ mod linux_tests {
         assert_eq!(
             bval.get("notes"),
             Some(&serde_json::json!([
-                "trusted-paths: configuration invalid; no paths were verified"
+                "trusted-paths: configuration could not be loaded or is invalid; no paths were verified"
+            ]))
+        );
+        let missing_cfg = base.join("does_not_exist.kdl");
+        let (mcode, mval) = run_json(&["--fs", "--trusted-paths"], &missing_cfg)?;
+        assert_eq!(mcode, Some(1));
+        assert_eq!(
+            mval.get("notes"),
+            Some(&serde_json::json!([
+                "trusted-paths: configuration could not be loaded or is invalid; no paths were verified"
             ]))
         );
 
@@ -2591,11 +2604,9 @@ mod linux_tests {
             ws.get(1).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'c1.example' FastCGI Unix socket '{}': first untrusted component '{}' \
-                     (uid unknown, mode unknown): not verified: checked as uid {euid} but the \
-                     configured service account is uid {other_uid}",
+                    "site 'c1.example' FastCGI Unix socket '{}': not verified: checked as uid {euid} \
+                     but the configured service account is uid {other_uid}",
                     sock.display(),
-                    sock.display()
                 )
                 .as_str()
             )
@@ -2609,9 +2620,8 @@ mod linux_tests {
             Some(
                 format!(
                     "site 'c1.example' FastCGI Unix socket '/ms-tp-c1-nonexistent.sock': \
-                     first untrusted component '/ms-tp-c1-nonexistent.sock' \
-                     (uid unknown, mode unknown): not verified: checked as uid {euid} but the \
-                     configured service account is uid {other_uid}"
+                     not verified: checked as uid {euid} but the configured service account is uid \
+                     {other_uid}"
                 )
                 .as_str()
             )
@@ -2753,6 +2763,98 @@ mod linux_tests {
         assert!(
             w_kdl.first().and_then(|w| w.get("location")).is_some(),
             "KDL-triggered default ACME W034 must carry location: {val_kdl}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_ai_publish_storage_whitespace_trimmed_matches_validator_and_loader() -> TestResult {
+        if !require_local_root_fs(
+            "linux_ai_publish_storage_whitespace_trimmed_matches_validator_and_loader",
+        )? {
+            return Ok(());
+        }
+        let base = make_temp_base("pub-space")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let pub_key = make_pub_key(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
+        let good_store = base.join("good_store");
+        let bad_store = base.join("bad_store");
+        for d in [&docroot, &good_store, &bad_store] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&bad_store, 0o775)?;
+
+        // Leading space pointing at an absolute trusted directory: loader and validator trim
+        // `ai-publish.storage`, so the walker must inspect the trimmed absolute path and emit
+        // zero W034 (must not report it as relative).
+        let good_cfg = base.join("good_space.kdl");
+        fs::write(
+            &good_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"good.example\" {{\n\
+                     root \"{}\"\n\
+                     ai-publish {{ storage \" {}\"; require-signature \"ed25519:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&good_store),
+                kdl_escape_path(&pub_key),
+            ),
+        )?;
+        let (_code, good_val) = run_json(&["--fs", "--trusted-paths"], &good_cfg)?;
+        let good_ws = w034s(&good_val);
+        assert!(
+            good_ws.is_empty(),
+            "leading-space absolute trusted ai-publish.storage must emit zero W034: {good_val}"
+        );
+
+        // Leading and trailing spaces pointing at an absolute untrusted (0775) directory: must
+        // report the untrusted component rather than treating the value as relative.
+        let bad_cfg = base.join("bad_space.kdl");
+        fs::write(
+            &bad_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"bad.example\" {{\n\
+                     root \"{}\"\n\
+                     ai-publish {{ storage \" {} \"; require-signature \"ed25519:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&bad_store),
+                kdl_escape_path(&pub_key),
+            ),
+        )?;
+        let (_bcode, bad_val) = run_json(&["--fs", "--trusted-paths"], &bad_cfg)?;
+        let bad_ws = w034s(&bad_val);
+        assert_eq!(
+            bad_ws.len(),
+            1,
+            "trimmed untrusted ai-publish.storage must emit 1 W034: {bad_val}"
+        );
+        assert_eq!(
+            bad_ws.first().and_then(|w| jstr(w, "path")),
+            Some("site[0].ai-publish.storage")
+        );
+        assert_eq!(
+            bad_ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'bad.example' ai-publish storage '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0775): group or other writable",
+                    bad_store.display(),
+                    bad_store.display()
+                )
+                .as_str()
+            )
         );
 
         let _ = fs::remove_dir_all(&base);
