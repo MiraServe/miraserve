@@ -1164,6 +1164,18 @@ impl SandboxPolicy {
             let keep = matches!(previous, Some(GrantState::Installed { .. }));
             if !keep {
                 let was_absent = matches!(previous, Some(GrantState::AbsentAtStartup));
+                #[cfg(target_os = "linux")]
+                let mut state = match self
+                    .pinned_read_write_dirs
+                    .iter()
+                    .find(|pin| normalized_paths_equal(p, &pin.path))
+                {
+                    Some(pin) if self.socket_paths.iter().any(|s| s == p) => {
+                        grant_state_from_pinned_dir(pin)
+                    }
+                    _ => open_grant(p, self.tree_paths.contains(p)),
+                };
+                #[cfg(not(target_os = "linux"))]
                 let mut state = open_grant(p, self.tree_paths.contains(p));
                 // A grant only tenant sites need that did not exist when the policy was built and
                 // cannot be opened now is treated as still absent: that tenant's site fails on
@@ -1657,58 +1669,52 @@ impl SandboxPolicy {
         }
 
         // Bind the Landlock RW rule to the validated canonical directory and pin its directory
-        // descriptor immediately if it already exists on disk (reusing any already-pinned handle
-        // for the same directory after verifying identity — Codex G7 P1).
-        let (pinned, push_fresh) = if real_parent.is_dir() {
-            if let Some(existing) = self
-                .pinned_read_write_dirs
-                .iter()
-                .find(|d| normalized_paths_equal(&d.path, &real_parent))
-                .cloned()
-            {
-                existing.verify_identity().map_err(|err| {
-                    let msg = err.to_string();
-                    self.warnings.push(msg.clone());
-                    msg
-                })?;
-                (Some(existing), false)
-            } else {
-                let fresh = PinnedWritableDir::open_validated(&real_parent).map_err(|err| {
-                    let msg = err.to_string();
-                    self.warnings.push(msg.clone());
-                    msg
-                })?;
-                (Some(fresh), true)
-            }
-        } else {
-            (None, false)
-        };
-        #[cfg(target_os = "linux")]
-        let rp_state = match pinned.as_ref() {
-            Some(pin) => grant_state_from_pinned_dir(pin).map_err(|err| {
+        // descriptor immediately if it already exists on disk. Look for an existing pin BEFORE
+        // `is_dir()` so a second bind of the same directory reuses and verifies the first pin and
+        // never falls back to a by-name open while a pin is retained (Codex G7 P1).
+        let pinned = if let Some(existing) = self
+            .pinned_read_write_dirs
+            .iter()
+            .find(|d| normalized_paths_equal(&d.path, &real_parent))
+            .cloned()
+        {
+            existing.verify_identity().map_err(|err| {
                 let msg = err.to_string();
                 self.warnings.push(msg.clone());
                 msg
-            })?,
-            None => open_grant(&real_parent, false),
-        };
-        #[cfg(not(target_os = "linux"))]
-        let rp_state = open_grant(&real_parent, false);
-        if push_fresh && let Some(fresh) = pinned.as_ref() {
+            })?;
+            Some(existing)
+        } else if real_parent.is_dir() {
+            let fresh = PinnedWritableDir::open_validated(&real_parent).map_err(|err| {
+                let msg = err.to_string();
+                self.warnings.push(msg.clone());
+                msg
+            })?;
             self.pinned_read_write_dirs.push(fresh.clone());
-        }
+            Some(fresh)
+        } else {
+            None
+        };
         let mut rw: BTreeSet<PathBuf> = self.read_write_paths.iter().cloned().collect();
         rw.insert(real_parent.clone());
         self.read_write_paths = rw.into_iter().collect();
+        #[cfg(target_os = "linux")]
+        let rp_state = match pinned.as_ref() {
+            Some(pin) if self.socket_paths.iter().any(|p| p == &real_parent) => {
+                grant_state_from_pinned_dir(pin)
+            }
+            _ => open_grant(&real_parent, false),
+        };
+        #[cfg(not(target_os = "linux"))]
+        let rp_state = open_grant(&real_parent, false);
         self.grant_states.insert(real_parent.clone(), rp_state);
         // Log binding adds the canonical RW path and replaces its grant state after initial class
-        // precedence (on Linux, duplicating the pinned directory handle when present rather than
-        // reopening by name). If the same path key is in `socket_paths`, record the socket list's
-        // spelling so the Linux installer emits the shadow WARN instead of skipping it: when
-        // `real_parent` is a directory it keeps the 0.1.5 socket-class rule on the replacement
-        // descriptor (followed by the pinned RW rule); when the log parent is a regular file (or
-        // other non-directory) there is no directory pin and the socket rule is reduced to read
-        // access (`AccessFs::ReadFile` only).
+        // precedence. If the same path key is in `socket_paths`, record the socket list's spelling
+        // so the Linux installer emits the shadow WARN instead of skipping it: when `real_parent`
+        // is a directory it keeps the 0.1.5 socket-class rule on the replacement descriptor
+        // (followed by the pinned RW rule); when the log parent is a regular file (or other
+        // non-directory) there is no directory pin and the socket rule is reduced to read access
+        // (`AccessFs::ReadFile` only).
         for sock_path in &self.socket_paths {
             if sock_path == &real_parent {
                 self.socket_shadows_other_class.insert(sock_path.clone());
@@ -2196,38 +2202,46 @@ pub fn check_docroot_classification_resources(
     Ok(())
 }
 
-/// Derives a Linux [`GrantState::Installed`] directly from a validated [`PinnedWritableDir`] by
-/// duplicating its descriptor (`F_DUPFD_CLOEXEC`) and `fstat`-ing the duplicate (no path lookup).
+/// Derives a Linux [`GrantState`] directly from a validated [`PinnedWritableDir`] via
+/// `F_DUPFD_CLOEXEC` (minimum 0) and `fstat` on the duplicate (no path lookup).
 #[cfg(target_os = "linux")]
-fn grant_state_from_pinned_dir(pinned: &PinnedWritableDir) -> Result<GrantState, SandboxError> {
+fn grant_state_from_pinned_dir(pinned: &PinnedWritableDir) -> GrantState {
     use rustix::fs::{FileType, fstat};
-    use std::os::fd::AsFd as _;
+    use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
-    let p = pinned.path.display();
-    let fd = pinned.file.as_fd().try_clone_to_owned().map_err(|e| {
-        SandboxError::Landlock(format!("failed to duplicate pinned dir '{p}': {e}"))
-    })?;
-    let st = fstat(&fd).map_err(|e| {
-        SandboxError::Landlock(format!(
-            "failed to inspect pinned dir '{p}': {}",
-            std::io::Error::from(e)
-        ))
-    })?;
+    let failed = |prefix: &str, err: Errno| GrantState::Failed {
+        reason: format!("{prefix}: {}", std::io::Error::from(err)),
+        kind: if matches!(err, Errno::MFILE | Errno::NFILE | Errno::NOMEM) {
+            GrantFailureKind::ResourceExhausted
+        } else {
+            GrantFailureKind::OpenError
+        },
+    };
+    let fd = match fcntl_dupfd_cloexec(&*pinned.file, 0) {
+        Ok(fd) => fd,
+        Err(err) => return failed("cannot duplicate pinned grant target", err),
+    };
+    let st = match fstat(&fd) {
+        Ok(st) => st,
+        Err(err) => return failed("cannot inspect grant target", err),
+    };
     #[allow(clippy::useless_conversion)]
     let identity = (u64::from(st.st_dev), u64::from(st.st_ino));
     let file_type = FileType::from_raw_mode(st.st_mode);
     let is_dir = file_type == FileType::Directory;
     if !is_dir || identity != pinned.inode_identity() {
-        return Err(SandboxError::Landlock(format!(
-            "pinned writable directory '{p}' changed identity during descriptor duplication"
-        )));
+        return GrantState::Failed {
+            reason: "pinned writable directory changed identity during descriptor duplication"
+                .to_owned(),
+            kind: GrantFailureKind::PolicyRejection,
+        };
     }
-    Ok(GrantState::Installed {
+    GrantState::Installed {
         identity,
         fd: std::sync::Arc::new(fd),
         is_dir,
         file_type,
-    })
+    }
 }
 
 /// Opens (and, for operator trees, validates) one grant target, returning the state that both
@@ -8722,23 +8736,83 @@ site "exfb.example.test" {{
     #[cfg(target_os = "linux")]
     fn snapshot_open_fds_for_test()
     -> Result<std::collections::BTreeMap<i32, std::path::PathBuf>, std::io::Error> {
+        use std::mem::MaybeUninit;
+        use std::os::fd::AsRawFd as _;
+
+        use rustix::fs::{CWD, Mode, OFlags, RawDir, openat};
+
+        let dir_fd = openat(
+            CWD,
+            "/proc/self/fd",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let self_fd = dir_fd.as_raw_fd();
         let mut out = std::collections::BTreeMap::new();
-        for entry in std::fs::read_dir("/proc/self/fd")? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Ok(fd) = name.to_string_lossy().parse::<i32>() else {
+        let mut buf = [MaybeUninit::uninit(); 4096];
+        let mut iter = RawDir::new(&dir_fd, &mut buf);
+        while let Some(entry) = iter.next() {
+            let entry = entry.map_err(std::io::Error::from)?;
+            let Ok(name) = entry.file_name().to_str() else {
                 continue;
             };
-            if let Ok(target) = std::fs::read_link(entry.path()) {
-                if target == std::path::Path::new("/proc/self/fd")
-                    || (target.to_string_lossy().ends_with("/fd") && target.starts_with("/proc/"))
-                {
-                    continue;
-                }
+            let Ok(fd) = name.parse::<i32>() else {
+                continue;
+            };
+            if fd == self_fd {
+                continue;
+            }
+            if let Ok(target) = std::fs::read_link(format!("/proc/self/fd/{fd}")) {
                 out.insert(fd, target);
             }
         }
         Ok(out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn plug_fd_gaps_from(
+        min_fd: i32,
+    ) -> Result<(Vec<std::os::fd::OwnedFd>, i32), Box<dyn std::error::Error>> {
+        use std::os::fd::AsRawFd as _;
+
+        use rustix::fs::{CWD, Mode, OFlags, openat};
+        use rustix::io::fcntl_dupfd_cloexec;
+
+        let open_before = snapshot_open_fds_for_test()?;
+        let max_open = open_before.keys().copied().max().unwrap_or(min_fd);
+        let seed_raw_fd = openat(
+            CWD,
+            "/dev/null",
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let seed = if seed_raw_fd.as_raw_fd() < min_fd {
+            let moved = fcntl_dupfd_cloexec(&seed_raw_fd, min_fd)?;
+            drop(seed_raw_fd);
+            moved
+        } else {
+            seed_raw_fd
+        };
+        let dense_max = max_open.max(seed.as_raw_fd());
+        let mut plugs = vec![seed];
+        let cur = snapshot_open_fds_for_test()?;
+        for fd in min_fd..=dense_max {
+            if !cur.contains_key(&fd) {
+                let seed_ref = plugs.first().ok_or("missing plug seed")?;
+                let dup = fcntl_dupfd_cloexec(seed_ref, fd)?;
+                assert_eq!(
+                    dup.as_raw_fd(),
+                    fd,
+                    "expected plug to fill FD gap {fd}, got {}",
+                    dup.as_raw_fd()
+                );
+                plugs.push(dup);
+            }
+        }
+        let final_open = snapshot_open_fds_for_test()?;
+        let top_fd = final_open.keys().copied().max().unwrap_or(dense_max);
+        Ok((plugs, top_fd))
     }
 
     #[cfg(target_os = "linux")]
@@ -8751,6 +8825,118 @@ site "exfb.example.test" {{
             }
         }
         Err(format!("missing flags line in /proc/self/fdinfo/{raw_fd}: {body:?}").into())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compile_block_by_name_reopen_bpf() -> Result<seccompiler::BpfProgram, String> {
+        use std::collections::BTreeMap;
+
+        use rustix::fs::OFlags;
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule, TargetArch,
+        };
+
+        let arch = TargetArch::try_from(std::env::consts::ARCH)
+            .map_err(|e| format!("unsupported arch {}: {e:?}", std::env::consts::ARCH))?;
+        let (sys_openat, sys_openat2, sys_open): (i64, i64, Option<i64>) = match arch {
+            TargetArch::x86_64 => (257, 437, Some(2)),
+            TargetArch::aarch64 | TargetArch::riscv64 => (56, 437, None),
+        };
+        let o_directory = u64::from(OFlags::DIRECTORY.bits());
+        let o_nofollow = u64::from(OFlags::NOFOLLOW.bits());
+        let at_fdcwd = u64::from((-100_i32).cast_unsigned());
+
+        let no_o_dir_rule = SeccompRule::new(vec![
+            SeccompCondition::new(
+                2,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(o_directory),
+                0,
+            )
+            .map_err(|e| e.to_string())?,
+        ])
+        .map_err(|e| e.to_string())?;
+        let cwd_nofollow_rule = SeccompRule::new(vec![
+            SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, at_fdcwd)
+                .map_err(|e| e.to_string())?,
+            SeccompCondition::new(
+                2,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(o_nofollow),
+                o_nofollow,
+            )
+            .map_err(|e| e.to_string())?,
+        ])
+        .map_err(|e| e.to_string())?;
+
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(sys_openat, vec![no_o_dir_rule, cwd_nofollow_rule]);
+        rules.insert(sys_openat2, Vec::new());
+        if let Some(nr) = sys_open {
+            rules.insert(nr, Vec::new());
+        }
+
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(1), // EPERM
+            arch,
+        )
+        .map_err(|e| e.to_string())?;
+        filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| e.to_string())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn compile_fcntl_dupfd_cloexec_bpf(
+        errno_code: u32,
+        only_nonzero_min: bool,
+    ) -> Result<seccompiler::BpfProgram, String> {
+        use std::collections::BTreeMap;
+
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule, TargetArch,
+        };
+
+        const F_DUPFD_CLOEXEC: u64 = 1030;
+
+        let arch = TargetArch::try_from(std::env::consts::ARCH)
+            .map_err(|e| format!("unsupported arch {}: {e:?}", std::env::consts::ARCH))?;
+        let sys_fcntl: i64 = match arch {
+            TargetArch::x86_64 => 72,
+            TargetArch::aarch64 | TargetArch::riscv64 => 25,
+        };
+        let mut conds = vec![
+            SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::Eq,
+                F_DUPFD_CLOEXEC,
+            )
+            .map_err(|e| e.to_string())?,
+        ];
+        if only_nonzero_min {
+            conds.push(
+                SeccompCondition::new(2, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+                    .map_err(|e| e.to_string())?,
+            );
+        }
+        let rule = SeccompRule::new(conds).map_err(|e| e.to_string())?;
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(sys_fcntl, vec![rule]);
+        let filter = SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(errno_code),
+            arch,
+        )
+        .map_err(|e| e.to_string())?;
+        filter
+            .try_into()
+            .map_err(|e: seccompiler::BackendError| e.to_string())
     }
 
     #[cfg(target_os = "linux")]
@@ -8767,12 +8953,12 @@ site "exfb.example.test" {{
             .env(env_key, scenario)
             .env(base_env_key, base)
             .output()?;
-        if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() || !stdout.contains("1 passed; 0 failed") {
             return Err(format!(
-                "child '{scenario}' failed (status={}):\nstdout:\n{}\nstderr:\n{}",
+                "child '{scenario}' failed or did not execute exactly 1 test (status={}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
                 output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
             )
             .into());
         }
@@ -8895,6 +9081,18 @@ site "logpin-parity.example.test" {{
                 log_dir_fd_count, 2,
                 "scenario {scenario}: expected exactly 2 retained FDs for log_dir (grant_state + pin), got {log_dir_fd_count} ({new_fds:?})"
             );
+            // Verify the first `expected_read_only.len()` retained FDs match the sorted RO open
+            // sequence verbatim, followed by the socket-tree / log-dir descriptors.
+            let expected_ro_targets: Vec<PathBuf> = expected_read_only
+                .iter()
+                .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+                .collect();
+            let actual_fd_targets: Vec<PathBuf> = new_fds.values().cloned().collect();
+            assert_eq!(
+                actual_fd_targets.get(..expected_ro_targets.len()),
+                Some(expected_ro_targets.as_slice()),
+                "scenario {scenario}: retained RO FD open sequence mismatch (new_fds={new_fds:?})"
+            );
             if !is_overlap {
                 let sock_tree_fd_count = new_fds
                     .values()
@@ -8980,6 +9178,15 @@ site "logpin-parity.example.test" {{
                 assert_eq!(policy.granted_identity(&log_dir), Some(log_inode));
                 assert_eq!(pinned_rw.inode_identity(), log_inode);
 
+                assert_eq!(
+                    assembled.read_only_access, ro_dir_mask,
+                    "scenario {scenario}: production read_only_access mask mismatch"
+                );
+                assert_eq!(
+                    assembled.read_write_access, writable_dir_mask,
+                    "scenario {scenario}: production read_write_access mask mismatch"
+                );
+                let prod_pinned_rw_mask = assembled.read_write_access;
                 let mut actual_rules: Vec<((u64, u64), landlock::BitFlags<AccessFs>)> = assembled
                     .readonly_rules
                     .into_iter()
@@ -8996,7 +9203,7 @@ site "logpin-parity.example.test" {{
                     #[allow(clippy::useless_conversion)]
                     actual_rules.push((
                         (u64::from(st.st_dev), u64::from(st.st_ino)),
-                        writable_dir_mask,
+                        prod_pinned_rw_mask,
                     ));
                 }
                 assert_eq!(
@@ -9044,6 +9251,27 @@ site "logpin-parity.example.test" {{
                     std::fs::read_dir(&ld).map_err(|e| format!("readdir in log_dir: {e}"))?;
                     std::fs::remove_file(&rotated)
                         .map_err(|e| format!("remove in log_dir: {e}"))?;
+                    // Cross-subdirectory rename inside `log_dir` exercises `AccessFs::Refer` on
+                    // Landlock ABI >= 2 (would fail with EXDEV if `Refer` were missing from the
+                    // production pinned RW mask).
+                    let sub_a = ld.join("sub_a");
+                    let sub_b = ld.join("sub_b");
+                    std::fs::create_dir_all(&sub_a)
+                        .map_err(|e| format!("create sub_a in log_dir: {e}"))?;
+                    std::fs::create_dir_all(&sub_b)
+                        .map_err(|e| format!("create sub_b in log_dir: {e}"))?;
+                    let src = sub_a.join("moved.log");
+                    let dst_moved = sub_b.join("moved.log");
+                    std::fs::write(&src, b"REFER-OK")
+                        .map_err(|e| format!("write sub_a/moved.log: {e}"))?;
+                    std::fs::rename(&src, &dst_moved)
+                        .map_err(|e| format!("cross-subdir rename (Refer) in log_dir: {e}"))?;
+                    std::fs::remove_file(&dst_moved)
+                        .map_err(|e| format!("remove sub_b/moved.log: {e}"))?;
+                    std::fs::remove_dir(&sub_a)
+                        .map_err(|e| format!("remove sub_a in log_dir: {e}"))?;
+                    std::fs::remove_dir(&sub_b)
+                        .map_err(|e| format!("remove sub_b in log_dir: {e}"))?;
                     std::fs::read_to_string(dr.join("index.html"))
                         .map_err(|e| format!("read docroot: {e}"))?;
                     if OpenOptions::new()
@@ -9087,12 +9315,12 @@ site "logpin-parity.example.test" {{
             let base = short_socket_test_dir(if scenario == "overlap" { "lpo" } else { "lpd" })?;
             if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
             {
-                eprintln!(
-                    "skipping parity_rotating_log_parent_socket_tree_overlap_and_disjoint_rules_fds_and_notices ({scenario}): temp path '{}' rejected ({reason})",
-                    base.display()
-                );
                 let _ = std::fs::remove_dir_all(&base);
-                continue;
+                return Err(format!(
+                    "parity_rotating_log_parent_socket_tree_overlap_and_disjoint_rules_fds_and_notices ({scenario}): temp path '{}' rejected ({reason})",
+                    base.display()
+                )
+                .into());
             }
             std::fs::create_dir_all(base.join("www"))?;
             std::fs::create_dir_all(base.join("logs"))?;
@@ -9150,75 +9378,17 @@ site "logpin-parity.example.test" {{
     #[allow(clippy::too_many_lines)]
     fn security_rotating_log_bind_derives_socket_grant_from_pin_without_path_lookup()
     -> Result<(), Box<dyn std::error::Error>> {
-        use std::collections::BTreeMap;
         use std::io::ErrorKind;
-        use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::fs::MetadataExt as _;
         use std::path::PathBuf;
 
         use rustix::fs::{FileType, OFlags, fstat};
         use rustix::io::{FdFlags, fcntl_getfd};
         use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
-        use seccompiler::{
-            BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition,
-            SeccompFilter, SeccompRule, TargetArch,
-        };
 
         const CHILD_ENV: &str = "MIRASERVE_LOGPIN_SEC1_CHILD";
         const BASE_ENV: &str = "MIRASERVE_LOGPIN_SEC1_BASE";
-
-        fn compile_block_by_name_reopen_bpf() -> Result<BpfProgram, String> {
-            let arch = TargetArch::try_from(std::env::consts::ARCH)
-                .map_err(|e| format!("unsupported arch {}: {e:?}", std::env::consts::ARCH))?;
-            let (sys_openat, sys_openat2, sys_open): (i64, i64, Option<i64>) = match arch {
-                TargetArch::x86_64 => (257, 437, Some(2)),
-                TargetArch::aarch64 | TargetArch::riscv64 => (56, 437, None),
-            };
-            let o_directory = u64::from(OFlags::DIRECTORY.bits());
-            let o_nofollow = u64::from(OFlags::NOFOLLOW.bits());
-            let at_fdcwd = u64::from((-100_i32).cast_unsigned());
-
-            let no_o_dir_rule = SeccompRule::new(vec![
-                SeccompCondition::new(
-                    2,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::MaskedEq(o_directory),
-                    0,
-                )
-                .map_err(|e| e.to_string())?,
-            ])
-            .map_err(|e| e.to_string())?;
-            let cwd_nofollow_rule = SeccompRule::new(vec![
-                SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, at_fdcwd)
-                    .map_err(|e| e.to_string())?,
-                SeccompCondition::new(
-                    2,
-                    SeccompCmpArgLen::Dword,
-                    SeccompCmpOp::MaskedEq(o_nofollow),
-                    o_nofollow,
-                )
-                .map_err(|e| e.to_string())?,
-            ])
-            .map_err(|e| e.to_string())?;
-
-            let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
-            rules.insert(sys_openat, vec![no_o_dir_rule, cwd_nofollow_rule]);
-            rules.insert(sys_openat2, Vec::new());
-            if let Some(nr) = sys_open {
-                rules.insert(nr, Vec::new());
-            }
-
-            let filter = SeccompFilter::new(
-                rules,
-                SeccompAction::Allow,
-                SeccompAction::Errno(1), // EPERM
-                arch,
-            )
-            .map_err(|e| e.to_string())?;
-            filter
-                .try_into()
-                .map_err(|e: seccompiler::BackendError| e.to_string())
-        }
 
         if let Ok(scenario) = std::env::var(CHILD_ENV) {
             let base = PathBuf::from(std::env::var(BASE_ENV)?);
@@ -9296,28 +9466,12 @@ site "sec-logpin.example.test" {{
                 assert_eq!(policy.granted_identity(&log_dir), Some(expected_log_id));
             }
 
-            // Plug every gap below `max_open` so `RLIMIT_NOFILE = max_open + 1 + 2` leaves
+            // Plug every gap below `top_fd` so `RLIMIT_NOFILE = top_fd + 1 + 2` leaves
             // EXACTLY 2 free FD slots: enough for `open_dir_no_follow` (2 transient slots -> 1
-            // retained) + `try_clone_to_owned` (uses the 1 remaining slot), and impossible for a
-            // second 2-slot component walk.
+            // retained) + `fcntl_dupfd_cloexec(..., 0)` (uses the 1 remaining slot), and impossible
+            // for a second 2-slot component walk.
             let orig_rlim = getrlimit(Resource::Nofile);
-            let mut plugs: Vec<OwnedFd> = Vec::new();
-            let open_before = snapshot_open_fds_for_test()?;
-            let max_open = open_before.keys().copied().max().unwrap_or(2);
-            let seed = std::io::stdin().as_fd().try_clone_to_owned()?;
-            let seed_raw = seed.as_raw_fd();
-            plugs.push(seed);
-            let dense_max = max_open.max(seed_raw);
-            loop {
-                let cur = snapshot_open_fds_for_test()?;
-                let gap = (0..=dense_max).find(|fd| !cur.contains_key(fd));
-                if gap.is_none() {
-                    break;
-                }
-                plugs.push(std::io::stdin().as_fd().try_clone_to_owned()?);
-            }
-            let final_open = snapshot_open_fds_for_test()?;
-            let top_fd = final_open.keys().copied().max().unwrap_or(dense_max);
+            let (plugs, top_fd) = plug_fd_gaps_from(0)?;
             let tight_soft = u64::try_from(top_fd + 1 + 2)?;
             let tight_rlim = Rlimit {
                 current: Some(tight_soft),
@@ -9469,12 +9623,12 @@ site "sec-logpin.example.test" {{
             })?;
             if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
             {
-                eprintln!(
-                    "skipping security_rotating_log_bind_derives_socket_grant_from_pin_without_path_lookup ({scenario}): temp path '{}' rejected ({reason})",
-                    base.display()
-                );
                 let _ = std::fs::remove_dir_all(&base);
-                continue;
+                return Err(format!(
+                    "security_rotating_log_bind_derives_socket_grant_from_pin_without_path_lookup ({scenario}): temp path '{}' rejected ({reason})",
+                    base.display()
+                )
+                .into());
             }
             std::fs::create_dir_all(base.join("www"))?;
             if scenario != "absent-then-created" {
@@ -9517,7 +9671,6 @@ site "sec-logpin.example.test" {{
     fn security_grant_state_from_pinned_dir_ignores_renamed_pathname_and_fails_cleanly_on_emfile()
     -> Result<(), Box<dyn std::error::Error>> {
         use std::io::ErrorKind;
-        use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
         use std::os::unix::fs::MetadataExt as _;
         use std::path::PathBuf;
 
@@ -9558,27 +9711,9 @@ site "emfile.example.test" {{
 
             // Plug every FD gap and cap RLIMIT_NOFILE at 0 free slots.
             let orig_rlim = getrlimit(Resource::Nofile);
-            let mut plugs: Vec<OwnedFd> = Vec::new();
-            let open_before = snapshot_open_fds_for_test()?;
-            let max_open = open_before.keys().copied().max().unwrap_or(2);
-            let seed = std::io::stdin().as_fd().try_clone_to_owned()?;
-            let seed_raw = seed.as_raw_fd();
-            plugs.push(seed);
-            let dense_max = max_open.max(seed_raw);
-            loop {
-                let cur = snapshot_open_fds_for_test()?;
-                if (0..=dense_max).all(|fd| cur.contains_key(&fd)) {
-                    break;
-                }
-                plugs.push(std::io::stdin().as_fd().try_clone_to_owned()?);
-            }
-            let top_fd = snapshot_open_fds_for_test()?
-                .keys()
-                .copied()
-                .max()
-                .unwrap_or(dense_max);
+            let (plugs, top_fd) = plug_fd_gaps_from(0)?;
 
-            // 1. Direct `grant_state_from_pinned_dir` with 0 free slots -> `EMFILE`.
+            // 1. Direct `grant_state_from_pinned_dir` with 0 free slots -> `Failed(ResourceExhausted)`.
             setrlimit(
                 Resource::Nofile,
                 Rlimit {
@@ -9586,18 +9721,29 @@ site "emfile.example.test" {{
                     maximum: orig_rlim.maximum,
                 },
             )?;
-            let dup_err = crate::grant_state_from_pinned_dir(&pinned)
-                .err()
-                .ok_or("expected EMFILE duplicating pinned dir with 0 free slots")?;
-            let dup_msg = dup_err.to_string();
-            assert!(
-                matches!(dup_err, crate::SandboxError::Landlock(_))
-                    && dup_msg.contains("failed to duplicate pinned dir"),
-                "unexpected dup error: {dup_err:?}"
-            );
+            let dup_state = crate::grant_state_from_pinned_dir(&pinned);
+            match &dup_state {
+                crate::GrantState::Failed {
+                    reason,
+                    kind: crate::GrantFailureKind::ResourceExhausted,
+                } => {
+                    assert!(
+                        reason.contains("cannot duplicate pinned grant target"),
+                        "unexpected dup failure reason: {reason}"
+                    );
+                }
+                other => {
+                    setrlimit(Resource::Nofile, orig_rlim)?;
+                    drop(plugs);
+                    return Err(format!(
+                        "expected GrantState::Failed(ResourceExhausted) with 0 free slots, got {other:?}"
+                    )
+                    .into());
+                }
+            }
 
-            // 2. `bind_log_rotation_dir` with 1 free slot (insufficient for binding) must take the
-            //    existing `Err(String)` + `warnings.push` failure path without mutating policy sets.
+            // 2. `bind_log_rotation_dir` with 1 free slot (insufficient for the 2-slot pin walk
+            //    `open_dir_no_follow`) takes the pin-validation error path without mutating policy.
             setrlimit(
                 Resource::Nofile,
                 Rlimit {
@@ -9609,7 +9755,9 @@ site "emfile.example.test" {{
             let bind_err = policy
                 .bind_log_rotation_dir(&log_file, &cfg, None, None, &[])
                 .err()
-                .ok_or("expected bind_log_rotation_dir failure under tight RLIMIT_NOFILE")?;
+                .ok_or(
+                    "expected bind_log_rotation_dir pin-walk failure under 1-slot RLIMIT_NOFILE",
+                )?;
             setrlimit(Resource::Nofile, orig_rlim)?;
             drop(plugs);
 
@@ -9627,12 +9775,12 @@ site "emfile.example.test" {{
         // Part A: real swap-and-restore oracle with released identity guards active.
         let base = short_socket_test_dir("swp")?;
         if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
-            eprintln!(
-                "skipping security_grant_state_from_pinned_dir_ignores_renamed_pathname_and_fails_cleanly_on_emfile: temp path '{}' rejected ({reason})",
-                base.display()
-            );
             let _ = std::fs::remove_dir_all(&base);
-            return Ok(());
+            return Err(format!(
+                "security_grant_state_from_pinned_dir_ignores_renamed_pathname_and_fails_cleanly_on_emfile: temp path '{}' rejected ({reason})",
+                base.display()
+            )
+            .into());
         }
         let docroot = base.join("www");
         let slot = base.join("logs");
@@ -9685,7 +9833,7 @@ site "swap-logpin.example.test" {{
         }
 
         // Fixed derivation: `grant_state_from_pinned_dir(&pinned)` stays pinned to dir A!
-        let pin_derived_state = crate::grant_state_from_pinned_dir(&pinned)?;
+        let pin_derived_state = crate::grant_state_from_pinned_dir(&pinned);
         match &pin_derived_state {
             crate::GrantState::Installed {
                 identity,
@@ -9834,5 +9982,765 @@ site "swap-logpin.example.test" {{
         );
         let _ = std::fs::remove_dir_all(&base);
         emfile_res
+    }
+
+    /// Fix round 1, Test C1 (Correction 1 — MUST FAIL on `c2f4fc8`, MUST PASS after fix):
+    /// Proves that when a rotating log's canonical parent already has a retained pin in
+    /// `pinned_read_write_dirs`, a second `bind_log_rotation_dir` while the pathname is ABSENT or
+    /// replaced by a REGULAR FILE fails closed (via `existing.verify_identity()`) before touching
+    /// `grant_states`, never overwrites the socket-class grant with `AbsentAtStartup` or a by-name
+    /// file grant alongside the retained pin, and a subsequent `finalize_grants()` while directory
+    /// B occupies the pathname never opens B by name. Also confirms a genuinely unpinned absent
+    /// parent preserves the original fallback (`pinned == None`, `AbsentAtStartup`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fix1_second_bind_absent_or_regular_file_preserves_pin_and_blocks_by_name_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::ErrorKind;
+        use std::os::unix::fs::MetadataExt as _;
+
+        use rustix::fs::{FileType, fstat};
+
+        for mode in ["absent", "regular-file"] {
+            let base = short_socket_test_dir(if mode == "absent" { "f1a" } else { "f1f" })?;
+            if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
+            {
+                let _ = std::fs::remove_dir_all(&base);
+                return Err(format!("temp path '{}' rejected: {reason}", base.display()).into());
+            }
+            let docroot = base.join("www");
+            let log_dir = base.join("logs");
+            let aside = base.join("logs_aside");
+            let decoy = base.join("decoy");
+            let unpinned_dir = base.join("unpinned_logs");
+            std::fs::create_dir_all(&docroot)?;
+            std::fs::create_dir_all(&log_dir)?;
+            std::fs::create_dir_all(&decoy)?;
+            std::fs::write(docroot.join("index.html"), "DOCROOT-OK")?;
+            std::fs::write(log_dir.join("ok.txt"), "DIR-A-OK")?;
+            std::fs::write(decoy.join("marker.txt"), "DIR-B-ATTACKER")?;
+
+            let md_a = std::fs::metadata(&log_dir)?;
+            let md_b = std::fs::metadata(&decoy)?;
+            let id_a = (md_a.dev(), md_a.ino());
+            let id_b = (md_b.dev(), md_b.ino());
+            assert_ne!(id_a, id_b);
+
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{
+        landlock #true
+        seccomp "off"
+        socket-tree "{log_dir}"
+    }}
+}}
+site "fix1.example.test" {{
+    root "{docroot}"
+}}
+"#,
+                log_dir = kdl_escape_test_path(&log_dir),
+                docroot = kdl_escape_test_path(&docroot),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("fix1.kdl", &kdl)?;
+            let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+
+            // First bind pins directory A and ties socket-class `grant_states[log_dir]` to A.
+            let first =
+                policy.bind_log_rotation_dir(&log_dir.join("server.log"), &cfg, None, None, &[])?;
+            assert!(first.pinned.is_some());
+            assert_eq!(policy.pinned_read_write_dirs.len(), 1);
+            assert_eq!(policy.granted_identity(&log_dir), Some(id_a));
+
+            // Move directory A aside so `log_dir` is either absent or a regular file.
+            std::fs::rename(&log_dir, &aside)?;
+            let regular_file_id = if mode == "regular-file" {
+                std::fs::write(&log_dir, b"NOT-A-DIR")?;
+                let rf_md = std::fs::metadata(&log_dir)?;
+                Some((rf_md.dev(), rf_md.ino()))
+            } else {
+                None
+            };
+
+            // Second bind of the same canonical parent while a pin is retained MUST fail closed
+            // without replacing `grant_states[log_dir]` with `AbsentAtStartup` or a file grant.
+            let warnings_before = policy.warnings.len();
+            let second_res =
+                policy.bind_log_rotation_dir(&log_dir.join("access.log"), &cfg, None, None, &[]);
+            let second_err = match second_res {
+                Err(err) => err,
+                Ok(binding) => {
+                    let _ = std::fs::remove_dir_all(&base);
+                    return Err(format!(
+                        "mode {mode}: second bind while pin retained must fail closed instead of falling back to open_grant; got Ok(pinned={:?}), granted_identity={:?}",
+                        binding.pinned.is_some(),
+                        policy.granted_identity(&log_dir),
+                    )
+                    .into());
+                }
+            };
+            assert_eq!(policy.warnings.len(), warnings_before + 1);
+            assert_eq!(
+                policy.warnings.last().map(String::as_str),
+                Some(second_err.as_str())
+            );
+            assert_eq!(policy.pinned_read_write_dirs.len(), 1);
+            assert_eq!(
+                policy.granted_identity(&log_dir),
+                Some(id_a),
+                "mode {mode}: grant_states[log_dir] must stay tied to pin A (never AbsentAtStartup or file {regular_file_id:?})"
+            );
+
+            // Put attacker dir B at `log_dir` and finalize: must keep pin A, never open dir B.
+            if mode == "regular-file" {
+                std::fs::remove_file(&log_dir)?;
+            }
+            std::fs::rename(&decoy, &log_dir)?;
+            policy.finalize_grants()?;
+            assert_eq!(
+                policy.granted_identity(&log_dir),
+                Some(id_a),
+                "mode {mode}: finalize_grants must never open decoy dir B while pin A is retained"
+            );
+
+            // While dir B sits at `log_dir`, assembly fails closed via `verify_pinned_writable_dirs`.
+            let mut bad_notes = Vec::new();
+            assert!(
+                crate::linux::assemble_landlock_rules(&policy, &mut bad_notes).is_err(),
+                "mode {mode}: assemble_landlock_rules must refuse while decoy dir B sits at log_dir"
+            );
+
+            // Restore dir A to `log_dir` and dir B to `decoy`: assembly and enforcing Landlock
+            // both bind solely to dir A (never dir B).
+            std::fs::rename(&log_dir, &decoy)?;
+            std::fs::rename(&aside, &log_dir)?;
+            let mut notes = Vec::new();
+            let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+            assert!(notes.is_empty(), "mode {mode}: unexpected notes {notes:?}");
+            let (sock_fd, _) = assembled
+                .sock_rules
+                .first()
+                .copied()
+                .ok_or("expected one sock_rule")?;
+            let sock_st = fstat(sock_fd)?;
+            #[allow(clippy::useless_conversion)]
+            let sock_dev_ino = (u64::from(sock_st.st_dev), u64::from(sock_st.st_ino));
+            assert_eq!(sock_dev_ino, id_a);
+            assert_ne!(sock_dev_ino, id_b);
+            assert_eq!(
+                FileType::from_raw_mode(sock_st.st_mode),
+                FileType::Directory
+            );
+
+            if crate::linux::probe_host_landlock_abi().is_some() {
+                let p = policy.clone();
+                let ld = log_dir.clone();
+                let d = decoy.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    crate::apply_landlock_current_thread(&p)
+                        .map_err(|e| format!("apply_landlock: {e}"))?;
+                    std::fs::read_to_string(ld.join("ok.txt"))
+                        .map_err(|e| format!("read dir A: {e}"))?;
+                    if std::fs::read_to_string(d.join("marker.txt"))
+                        .err()
+                        .map(|e| e.kind())
+                        != Some(ErrorKind::PermissionDenied)
+                    {
+                        return Err(
+                            "decoy dir B must be denied under enforcing Landlock".to_owned()
+                        );
+                    }
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| "fix1 enforcement thread panicked")??;
+            }
+
+            // Genuinely unpinned absent parent keeps the old fallback (`pinned == None`, `AbsentAtStartup`).
+            let unpinned = policy.bind_log_rotation_dir(
+                &unpinned_dir.join("server.log"),
+                &cfg,
+                None,
+                None,
+                &[],
+            )?;
+            assert!(unpinned.pinned.is_none());
+            assert_eq!(policy.granted_identity(&unpinned_dir), None);
+
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        Ok(())
+    }
+
+    /// Fix round 1, Test C2 (Correction 2 — MUST FAIL on `c2f4fc8`, MUST PASS after fix):
+    /// Rust's Unix runtime (`sanitize_standard_fds`) reopens closed descriptors 0–2 to `/dev/null`
+    /// before `main()`, and `#![forbid(unsafe_code)]` forbids closing raw fds 0–2 afterwards, so
+    /// leaving only fds `< 3` free cannot be arranged portably inside a safe Rust test binary.
+    /// Instead, this test verifies the exact Linux kernel syscall argument directly via a stacked
+    /// thread-local seccomp-bpf filter that:
+    ///   1. Rejects `SYS_fcntl(fd, F_DUPFD_CLOEXEC, min)` with `EPERM` whenever `min != 0`
+    ///      (catching `BorrowedFd::try_clone_to_owned()`, which passes `min = 3`), and
+    ///   2. Rejects by-name `open_grant` (`openat` without `O_DIRECTORY`).
+    ///
+    /// Also runs a negative control on the same confined thread confirming `try_clone_to_owned()`
+    /// fails with `PermissionDenied` (`EPERM`) while `bind_log_rotation_dir` succeeds with zero
+    /// grant failures and `FD_CLOEXEC` set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fix2_duplicate_uses_explicit_min_fd_zero_under_seccomp_abi_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::ErrorKind;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::PathBuf;
+
+        use rustix::fs::{OFlags, fstat};
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        const CHILD_ENV: &str = "MIRASERVE_LOGPIN_FIX2_CHILD";
+        const BASE_ENV: &str = "MIRASERVE_LOGPIN_FIX2_BASE";
+
+        if let Ok(scenario) = std::env::var(CHILD_ENV) {
+            assert_eq!(scenario, "min-zero");
+            let base = PathBuf::from(std::env::var(BASE_ENV)?);
+            let docroot = base.join("www");
+            let log_dir = base.join("logs");
+            let log_file = log_dir.join("server.log");
+
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{
+        landlock #true
+        seccomp "off"
+        socket-tree "{log_dir}"
+    }}
+}}
+site "fix2.example.test" {{
+    root "{docroot}"
+}}
+"#,
+                log_dir = kdl_escape_test_path(&log_dir),
+                docroot = kdl_escape_test_path(&docroot),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("fix2.kdl", &kdl)?;
+            let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+            let log_md = std::fs::metadata(&log_dir)?;
+            let expected_id = (log_md.dev(), log_md.ino());
+
+            let min0_bpf = compile_fcntl_dupfd_cloexec_bpf(1, true)?;
+            let no_by_name_bpf = compile_block_by_name_reopen_bpf()?;
+            let policy_ref = &mut policy;
+            let cfg_ref = &cfg;
+            let log_file_ref = &log_file;
+            let bind_res: Result<(crate::LogDirBinding, ErrorKind), String> = std::thread::scope(
+                |scope| {
+                    let handle = scope.spawn(move || -> Result<(crate::LogDirBinding, ErrorKind), String> {
+                        seccompiler::apply_filter(&min0_bpf)
+                            .map_err(|e| format!("apply min-0 seccomp filter failed: {e}"))?;
+                        seccompiler::apply_filter(&no_by_name_bpf)
+                            .map_err(|e| format!("apply no-by-name seccomp filter failed: {e}"))?;
+                        // Positive control for the seccomp filter itself: stdlib
+                        // `try_clone_to_owned()` passes `min = 3`, which MUST be rejected with
+                        // `EPERM` (`PermissionDenied`).
+                        let stdlib_err_kind = std::io::stdin()
+                            .as_fd()
+                            .try_clone_to_owned()
+                            .err()
+                            .ok_or_else(|| {
+                                "expected try_clone_to_owned (min=3) to be blocked by seccomp"
+                                    .to_owned()
+                            })?
+                            .kind();
+                        let binding = policy_ref
+                            .bind_log_rotation_dir(log_file_ref, cfg_ref, None, None, &[])?;
+                        // Also unit-test `grant_state_from_pinned_dir` directly under the same
+                        // `min != 0` seccomp filter.
+                        let pin_for_helper = binding
+                            .pinned
+                            .as_ref()
+                            .ok_or_else(|| "expected pinned dir from bind".to_owned())?;
+                        match crate::grant_state_from_pinned_dir(pin_for_helper) {
+                            crate::GrantState::Installed { fd, .. } => {
+                                if !fcntl_getfd(&fd)
+                                    .map_err(|e| format!("fcntl_getfd helper fd failed: {e}"))?
+                                    .contains(FdFlags::CLOEXEC)
+                                {
+                                    return Err(
+                                        "helper duplicated fd missing FD_CLOEXEC".to_owned()
+                                    );
+                                }
+                            }
+                            other => {
+                                return Err(format!(
+                                    "grant_state_from_pinned_dir must succeed under min=0 seccomp filter, got {other:?}"
+                                ));
+                            }
+                        }
+                        Ok((binding, stdlib_err_kind))
+                    });
+                    handle
+                        .join()
+                        .map_err(|_| "fix2 bind thread panicked".to_owned())?
+                },
+            );
+
+            let (binding, stdlib_err_kind) = bind_res.map_err(|e| {
+                format!(
+                    "bind_log_rotation_dir must duplicate via F_DUPFD_CLOEXEC with min=0 (not try_clone_to_owned min=3): {e}"
+                )
+            })?;
+            assert_eq!(stdlib_err_kind, ErrorKind::PermissionDenied);
+            assert!(binding.pinned.is_some());
+            assert!(
+                policy.grant_failures().is_empty(),
+                "expected no grant failures when dup uses min=0; got {:?}",
+                policy.grant_failures()
+            );
+            assert_eq!(policy.granted_identity(&log_dir), Some(expected_id));
+
+            policy.finalize_grants()?;
+            let mut notes = Vec::new();
+            let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+            let (sock_fd, _) = assembled
+                .sock_rules
+                .first()
+                .copied()
+                .ok_or("expected one sock_rule")?;
+            let pinned_rw = policy
+                .pinned_read_write_dirs
+                .first()
+                .ok_or("expected one pinned_read_write_dir")?;
+            assert_ne!(sock_fd.as_raw_fd(), pinned_rw.file.as_raw_fd());
+            assert!(
+                fcntl_getfd(sock_fd)?.contains(FdFlags::CLOEXEC),
+                "duplicated descriptor must carry FD_CLOEXEC"
+            );
+            let sock_flags = proc_fdinfo_flags_octal(sock_fd.as_raw_fd())?;
+            let o_pin_flags =
+                OFlags::PATH.bits() | OFlags::DIRECTORY.bits() | OFlags::NOFOLLOW.bits();
+            assert_eq!(sock_flags & o_pin_flags, o_pin_flags);
+            let sock_st = fstat(sock_fd)?;
+            #[allow(clippy::useless_conversion)]
+            let sock_dev_ino = (u64::from(sock_st.st_dev), u64::from(sock_st.st_ino));
+            assert_eq!(sock_dev_ino, expected_id);
+            return Ok(());
+        }
+
+        let base = short_socket_test_dir("f2m")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            let _ = std::fs::remove_dir_all(&base);
+            return Err(format!("temp path '{}' rejected: {reason}", base.display()).into());
+        }
+        std::fs::create_dir_all(base.join("www"))?;
+        std::fs::create_dir_all(base.join("logs"))?;
+        std::fs::write(base.join("www").join("index.html"), "DOCROOT-OK")?;
+
+        let res = run_unit_test_child(
+            "landlock_enforcement_tests::fix2_duplicate_uses_explicit_min_fd_zero_under_seccomp_abi_check",
+            CHILD_ENV,
+            "min-zero",
+            BASE_ENV,
+            &base,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        res
+    }
+
+    /// Fix round 1, Test C3 (Correction 3 — MUST FAIL on `c2f4fc8`, MUST PASS after fix):
+    /// For a rotating log whose parent is NOT in the socket class (`socket-tree` is a disjoint
+    /// directory):
+    ///   1. Under a seccomp filter rejecting ALL `fcntl(F_DUPFD_CLOEXEC)` with `EPERM`, both
+    ///      first and second `bind_log_rotation_dir` and `finalize_grants` succeed with zero
+    ///      `F_DUPFD_CLOEXEC` calls, and the stored `grant_states[log_dir]` descriptor carries
+    ///      `O_PATH | O_CLOEXEC` WITHOUT `O_DIRECTORY` (byte-for-byte `c4ae997`).
+    ///   2. Under a seccomp filter rejecting by-name `openat` without `O_DIRECTORY` (`EPERM`)
+    ///      while allowing `F_DUPFD_CLOEXEC`, `bind_log_rotation_dir` triggers that `openat` and
+    ///      records `"cannot open grant target: Operation not permitted"` (proving the by-name
+    ///      `open_grant` path WAS taken, matching `c4ae997`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fix3_disjoint_rotating_log_calls_by_name_open_and_never_dups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::PathBuf;
+
+        use rustix::fs::OFlags;
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        const CHILD_ENV: &str = "MIRASERVE_LOGPIN_FIX3_CHILD";
+        const BASE_ENV: &str = "MIRASERVE_LOGPIN_FIX3_BASE";
+
+        if let Ok(scenario) = std::env::var(CHILD_ENV) {
+            let base = PathBuf::from(std::env::var(BASE_ENV)?);
+            let docroot = base.join("www");
+            let log_dir = base.join("logs");
+            let socks_dir = base.join("socks");
+            let log_file = log_dir.join("server.log");
+            let access_log_file = log_dir.join("access.log");
+
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{
+        landlock #true
+        seccomp "off"
+        socket-tree "{socks_dir}"
+    }}
+}}
+site "fix3.example.test" {{
+    root "{docroot}"
+}}
+"#,
+                socks_dir = kdl_escape_test_path(&socks_dir),
+                docroot = kdl_escape_test_path(&docroot),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("fix3.kdl", &kdl)?;
+            let log_md = std::fs::metadata(&log_dir)?;
+            let expected_log_id = (log_md.dev(), log_md.ino());
+
+            match scenario.as_str() {
+                "no-dup" => {
+                    let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+                    let deny_dup_bpf = compile_fcntl_dupfd_cloexec_bpf(1, false)?;
+                    let res: Result<(), String> = std::thread::scope(|scope| {
+                        let handle = scope.spawn(|| -> Result<(), String> {
+                            seccompiler::apply_filter(&deny_dup_bpf)
+                                .map_err(|e| format!("apply deny-dup seccomp failed: {e}"))?;
+                            policy.bind_log_rotation_dir(&log_file, &cfg, None, None, &[])?;
+                            policy.bind_log_rotation_dir(
+                                &access_log_file,
+                                &cfg,
+                                None,
+                                None,
+                                &[],
+                            )?;
+                            policy.finalize_grants().map_err(|e| e.to_string())?;
+                            Ok(())
+                        });
+                        handle
+                            .join()
+                            .map_err(|_| "fix3 no-dup thread panicked".to_owned())?
+                    });
+                    res.map_err(|e| {
+                        format!("disjoint rotating log must NOT call F_DUPFD_CLOEXEC: {e}")
+                    })?;
+                    assert!(
+                        policy.grant_failures().is_empty(),
+                        "disjoint rotating log unexpected grant_failures: {:?}",
+                        policy.grant_failures()
+                    );
+                    assert_eq!(policy.granted_identity(&log_dir), Some(expected_log_id));
+                    match policy.grant_states.get(&log_dir) {
+                        Some(crate::GrantState::Installed { fd, .. }) => {
+                            let flags = proc_fdinfo_flags_octal(fd.as_raw_fd())?;
+                            assert_ne!(
+                                flags & OFlags::PATH.bits(),
+                                0,
+                                "disjoint grant FD must carry O_PATH (flags={flags:#o})"
+                            );
+                            assert_eq!(
+                                flags & (OFlags::DIRECTORY.bits() | OFlags::NOFOLLOW.bits()),
+                                0,
+                                "disjoint grant FD must match c4ae997 open_grant (O_PATH|O_CLOEXEC without O_DIRECTORY|O_NOFOLLOW; flags={flags:#o})"
+                            );
+                            assert!(
+                                fcntl_getfd(fd)?.contains(FdFlags::CLOEXEC),
+                                "disjoint grant FD must set FD_CLOEXEC"
+                            );
+                        }
+                        other => {
+                            return Err(format!(
+                                "expected Installed grant_state for disjoint log_dir, got {other:?}"
+                            )
+                            .into());
+                        }
+                    }
+                }
+                "uses-by-name-open" => {
+                    let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+                    let deny_by_name_bpf = compile_block_by_name_reopen_bpf()?;
+                    let bind_res: Result<crate::LogDirBinding, String> =
+                        std::thread::scope(|scope| {
+                            let handle = scope.spawn(|| -> Result<crate::LogDirBinding, String> {
+                                seccompiler::apply_filter(&deny_by_name_bpf).map_err(|e| {
+                                    format!("apply deny-openat seccomp failed: {e}")
+                                })?;
+                                policy.bind_log_rotation_dir(&log_file, &cfg, None, None, &[])
+                            });
+                            handle
+                                .join()
+                                .map_err(|_| "fix3 by-name thread panicked".to_owned())?
+                        });
+                    let binding = bind_res.map_err(|e| {
+                        format!(
+                            "disjoint bind should return Ok even when open_grant hits EPERM: {e}"
+                        )
+                    })?;
+                    assert!(binding.pinned.is_some());
+                    let failures = policy.grant_failures();
+                    assert!(
+                        failures.iter().any(
+                            |f| f.contains("cannot open grant target: Operation not permitted")
+                        ),
+                        "disjoint rotating log MUST execute by-name open_grant (expected EPERM failure); got failures={failures:?}"
+                    );
+                }
+                other => return Err(format!("unknown fix3 scenario: {other}").into()),
+            }
+            return Ok(());
+        }
+
+        for scenario in ["no-dup", "uses-by-name-open"] {
+            let base = short_socket_test_dir(if scenario == "no-dup" { "f3n" } else { "f3o" })?;
+            if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy())
+            {
+                let _ = std::fs::remove_dir_all(&base);
+                return Err(format!("temp path '{}' rejected: {reason}", base.display()).into());
+            }
+            std::fs::create_dir_all(base.join("www"))?;
+            std::fs::create_dir_all(base.join("logs"))?;
+            std::fs::create_dir_all(base.join("socks"))?;
+            std::fs::write(base.join("www").join("index.html"), "DOCROOT-OK")?;
+
+            let res = run_unit_test_child(
+                "landlock_enforcement_tests::fix3_disjoint_rotating_log_calls_by_name_open_and_never_dups",
+                CHILD_ENV,
+                scenario,
+                BASE_ENV,
+                &base,
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            res?;
+        }
+        Ok(())
+    }
+
+    /// Fix round 1, Test C4 (Correction 4 — MUST FAIL on `c2f4fc8`, MUST PASS after fix):
+    /// Exercises a genuine binder-level `EMFILE` on descriptor duplication AFTER `open_validated`
+    /// succeeds (via a scoped-thread seccomp filter returning `EMFILE` on `F_DUPFD_CLOEXEC`).
+    /// Asserts the released failure contract:
+    ///   - `bind_log_rotation_dir` returns `Ok(binding)` with the pin retained,
+    ///   - `read_write_paths` and `socket_shadows_other_class` are updated as on `c4ae997`,
+    ///   - zero warnings are appended,
+    ///   - `grant_states[log_dir]` is `Failed { kind: ResourceExhausted }` (`resource_failure_grants`
+    ///     non-empty, `writable_policy_grants` returns the OS resource-limit error),
+    ///   - a later `finalize_grants()` retry after swapping `log_dir` -> dir B (and with by-name
+    ///     `openat` blocked by seccomp) derives the grant state from the retained pin (dir A, NEVER
+    ///     dir B), and after restoring dir A, assembly + enforcing Landlock allow dir A and deny
+    ///     dir B.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fix4_duplicate_failure_keeps_released_contract_and_finalization_derives_from_pin()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::ErrorKind;
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::MetadataExt as _;
+        use std::path::PathBuf;
+
+        use rustix::fs::{FileType, OFlags, fstat};
+        use rustix::io::{FdFlags, fcntl_getfd};
+
+        const CHILD_ENV: &str = "MIRASERVE_LOGPIN_FIX4_CHILD";
+        const BASE_ENV: &str = "MIRASERVE_LOGPIN_FIX4_BASE";
+
+        if let Ok(scenario) = std::env::var(CHILD_ENV) {
+            assert_eq!(scenario, "dup-emfile-and-retry");
+            let base = PathBuf::from(std::env::var(BASE_ENV)?);
+            let docroot = base.join("www");
+            let log_dir = base.join("logs");
+            let aside = base.join("logs_aside");
+            let decoy = base.join("decoy");
+            let log_file = log_dir.join("server.log");
+
+            let md_a = std::fs::metadata(&log_dir)?;
+            let md_b = std::fs::metadata(&decoy)?;
+            let id_a = (md_a.dev(), md_a.ino());
+            let id_b = (md_b.dev(), md_b.ino());
+            assert_ne!(id_a, id_b);
+
+            let kdl = format!(
+                r#"
+server {{
+    listen "127.0.0.1:8443"
+    sandbox {{
+        landlock #true
+        seccomp "off"
+        socket-tree "{log_dir}"
+    }}
+}}
+site "fix4.example.test" {{
+    root "{docroot}"
+}}
+"#,
+                log_dir = kdl_escape_test_path(&log_dir),
+                docroot = kdl_escape_test_path(&docroot),
+            );
+            let (cfg, _) = miraserve_config::parse_kdl("fix4.kdl", &kdl)?;
+            let mut policy = crate::SandboxPolicy::from_config_with_file(&cfg, None, None);
+
+            // Phase 1: Pin succeeds via `open_dir_no_follow`, then `F_DUPFD_CLOEXEC` returns EMFILE (24).
+            let dup_emfile_bpf = compile_fcntl_dupfd_cloexec_bpf(24, false)?;
+            let warnings_before = policy.warnings.len();
+            let bind_res: Result<crate::LogDirBinding, String> = std::thread::scope(|scope| {
+                let handle = scope.spawn(|| -> Result<crate::LogDirBinding, String> {
+                    seccompiler::apply_filter(&dup_emfile_bpf)
+                        .map_err(|e| format!("apply dup-emfile seccomp failed: {e}"))?;
+                    policy.bind_log_rotation_dir(&log_file, &cfg, None, None, &[])
+                });
+                handle
+                    .join()
+                    .map_err(|_| "fix4 bind thread panicked".to_owned())?
+            });
+
+            let binding = bind_res.map_err(|e| {
+                format!(
+                    "duplication EMFILE must keep released contract (return Ok with Failed state and retained pin); got Err({e})"
+                )
+            })?;
+            assert_eq!(binding.real_parent, log_dir);
+            assert!(binding.pinned.is_some());
+            assert_eq!(policy.warnings.len(), warnings_before);
+            assert_eq!(policy.pinned_read_write_dirs.len(), 1);
+            assert_eq!(
+                policy
+                    .pinned_read_write_dirs
+                    .first()
+                    .map(crate::PinnedWritableDir::inode_identity),
+                Some(id_a)
+            );
+            assert!(policy.read_write_paths.contains(&log_dir));
+            assert!(policy.socket_shadows_other_class.contains(&log_dir));
+            assert_eq!(policy.granted_identity(&log_dir), None);
+            assert_eq!(policy.grant_failures().len(), 1);
+            assert_eq!(policy.resource_failure_grants().len(), 1);
+            assert_eq!(policy.policy_rejection_failures(), Vec::<String>::new());
+            let inspect_err = policy
+                .writable_policy_grants()
+                .err()
+                .ok_or("writable_policy_grants must fail closed on ResourceExhausted")?;
+            assert!(
+                inspect_err.to_string().contains("OS resource limit"),
+                "expected OS resource limit diagnostic, got: {inspect_err}"
+            );
+
+            // Phase 2: Swap `log_dir` -> dir B on disk and retry `finalize_grants()` with by-name
+            // `openat` blocked by seccomp: finalization MUST derive the grant state from the
+            // retained pin (dir A) and NEVER open dir B by name.
+            std::fs::rename(&log_dir, &aside)?;
+            std::fs::rename(&decoy, &log_dir)?;
+            let block_open_bpf = compile_block_by_name_reopen_bpf()?;
+            let fin_res: Result<(), String> = std::thread::scope(|scope| {
+                let handle = scope.spawn(|| -> Result<(), String> {
+                    seccompiler::apply_filter(&block_open_bpf)
+                        .map_err(|e| format!("apply block-open seccomp failed: {e}"))?;
+                    policy.finalize_grants().map_err(|e| e.to_string())
+                });
+                handle
+                    .join()
+                    .map_err(|_| "fix4 finalize thread panicked".to_owned())?
+            });
+            fin_res.map_err(|e| {
+                format!(
+                    "finalize_grants retry for pinned overlap entry must derive from retained pin without by-name open: {e}"
+                )
+            })?;
+            assert_eq!(policy.grant_failures(), Vec::<String>::new());
+            assert_eq!(policy.resource_failure_grants(), Vec::<String>::new());
+            assert_eq!(
+                policy.granted_identity(&log_dir),
+                Some(id_a),
+                "finalize_grants retry must install dir A from retained pin, never decoy dir B ({id_b:?})"
+            );
+
+            // While dir B is still at `log_dir`, assembly fails closed via `verify_pinned_writable_dirs`.
+            let mut bad_notes = Vec::new();
+            assert!(
+                crate::linux::assemble_landlock_rules(&policy, &mut bad_notes).is_err(),
+                "assemble_landlock_rules must refuse while decoy dir B sits at log_dir"
+            );
+
+            // Restore dir A to `log_dir` and dir B to `decoy`: assembly + enforcing Landlock
+            // install dir A only and deny `decoy/marker.txt`.
+            std::fs::rename(&log_dir, &decoy)?;
+            std::fs::rename(&aside, &log_dir)?;
+            let mut notes = Vec::new();
+            let assembled = crate::linux::assemble_landlock_rules(&policy, &mut notes)?;
+            assert!(notes.is_empty(), "unexpected notes: {notes:?}");
+            let (sock_fd, _) = assembled
+                .sock_rules
+                .first()
+                .copied()
+                .ok_or("expected one sock_rule")?;
+            let sock_st = fstat(sock_fd)?;
+            #[allow(clippy::useless_conversion)]
+            let sock_dev_ino = (u64::from(sock_st.st_dev), u64::from(sock_st.st_ino));
+            assert_eq!(sock_dev_ino, id_a);
+            assert_ne!(sock_dev_ino, id_b);
+            assert_eq!(
+                FileType::from_raw_mode(sock_st.st_mode),
+                FileType::Directory
+            );
+            let sock_flags = proc_fdinfo_flags_octal(sock_fd.as_raw_fd())?;
+            let o_pin_flags =
+                OFlags::PATH.bits() | OFlags::DIRECTORY.bits() | OFlags::NOFOLLOW.bits();
+            assert_eq!(sock_flags & o_pin_flags, o_pin_flags);
+            assert!(fcntl_getfd(sock_fd)?.contains(FdFlags::CLOEXEC));
+
+            if crate::linux::probe_host_landlock_abi().is_some() {
+                let p = policy.clone();
+                let ld = log_dir.clone();
+                let d = decoy.clone();
+                std::thread::spawn(move || -> Result<(), String> {
+                    crate::apply_landlock_current_thread(&p)
+                        .map_err(|e| format!("apply_landlock: {e}"))?;
+                    std::fs::read_to_string(ld.join("ok.txt"))
+                        .map_err(|e| format!("read dir A: {e}"))?;
+                    if std::fs::read_to_string(d.join("marker.txt"))
+                        .err()
+                        .map(|e| e.kind())
+                        != Some(ErrorKind::PermissionDenied)
+                    {
+                        return Err(
+                            "decoy dir B must be denied under enforcing Landlock".to_owned()
+                        );
+                    }
+                    Ok(())
+                })
+                .join()
+                .map_err(|_| "fix4 enforcement thread panicked")??;
+            }
+            return Ok(());
+        }
+
+        let base = short_socket_test_dir("f4e")?;
+        if let Some(reason) = miraserve_config::sandbox_tree_rejection(&base.to_string_lossy()) {
+            let _ = std::fs::remove_dir_all(&base);
+            return Err(format!("temp path '{}' rejected: {reason}", base.display()).into());
+        }
+        std::fs::create_dir_all(base.join("www"))?;
+        std::fs::create_dir_all(base.join("logs"))?;
+        std::fs::create_dir_all(base.join("decoy"))?;
+        std::fs::write(base.join("www").join("index.html"), "DOCROOT-OK")?;
+        std::fs::write(base.join("logs").join("ok.txt"), "DIR-A-OK")?;
+        std::fs::write(base.join("decoy").join("marker.txt"), "DIR-B-ATTACKER")?;
+
+        let res = run_unit_test_child(
+            "landlock_enforcement_tests::fix4_duplicate_failure_keeps_released_contract_and_finalization_derives_from_pin",
+            CHILD_ENV,
+            "dup-emfile-and-retry",
+            BASE_ENV,
+            &base,
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        res
     }
 }
