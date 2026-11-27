@@ -33,7 +33,7 @@ MiraServe bridges today's web (**Nginx, Apache, OpenLiteSpeed, WordPress/PHP**) 
 
 ## Project status
 
-Version 0.1.5. Binaries for Linux, macOS and Windows, a Debian package and a container image are listed at
+Version 0.1.6. Binaries for Linux, macOS and Windows, a Debian package and a container image are listed at
 <https://miraserve.org/download/>; what changed in each version is at <https://miraserve.org/releases/>.
 Configuration and command-line interfaces may still change before 1.0.
 

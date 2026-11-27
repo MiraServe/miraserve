@@ -1832,7 +1832,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-ai"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "aws-lc-rs",
@@ -1855,7 +1855,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-alloc-tests"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -1873,7 +1873,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-bin"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "miette 7.6.0",
@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-config"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "bcrypt",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "aws-lc-rs",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-fastcgi"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-http"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "aws-lc-rs",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-migrate"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "miraserve-config",
  "serde",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-proxy"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -2029,7 +2029,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-publish"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "aws-lc-rs",
@@ -2053,7 +2053,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-sandbox"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "landlock",
  "miraserve-config",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-security"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -2080,7 +2080,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-static"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "brotli",
  "bytes",
@@ -2102,7 +2102,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-telemetry"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-tls"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "miraserve-wasm"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "bytes",
  "http",

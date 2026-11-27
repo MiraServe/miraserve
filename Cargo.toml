@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0 OR MIT"
@@ -105,20 +105,20 @@ x509-parser = "0.18.1"
 winapi-util = "0.1.11"
 zeroize = "1.9.2"
 
-miraserve-config = { version = "0.1.5", path = "crates/miraserve-config" }
-miraserve-tls = { version = "0.1.5", path = "crates/miraserve-tls" }
-miraserve-security = { version = "0.1.5", path = "crates/miraserve-security" }
-miraserve-static = { version = "0.1.5", path = "crates/miraserve-static" }
-miraserve-proxy = { version = "0.1.5", path = "crates/miraserve-proxy" }
-miraserve-fastcgi = { version = "0.1.5", path = "crates/miraserve-fastcgi" }
-miraserve-publish = { version = "0.1.5", path = "crates/miraserve-publish" }
-miraserve-ai = { version = "0.1.5", path = "crates/miraserve-ai" }
-miraserve-wasm = { version = "0.1.5", path = "crates/miraserve-wasm" }
-miraserve-telemetry = { version = "0.1.5", path = "crates/miraserve-telemetry" }
-miraserve-http = { version = "0.1.5", path = "crates/miraserve-http" }
-miraserve-sandbox = { version = "0.1.5", path = "crates/miraserve-sandbox" }
-miraserve-core = { version = "0.1.5", path = "crates/miraserve-core" }
-miraserve-migrate = { version = "0.1.5", path = "crates/miraserve-migrate" }
+miraserve-config = { version = "0.1.6", path = "crates/miraserve-config" }
+miraserve-tls = { version = "0.1.6", path = "crates/miraserve-tls" }
+miraserve-security = { version = "0.1.6", path = "crates/miraserve-security" }
+miraserve-static = { version = "0.1.6", path = "crates/miraserve-static" }
+miraserve-proxy = { version = "0.1.6", path = "crates/miraserve-proxy" }
+miraserve-fastcgi = { version = "0.1.6", path = "crates/miraserve-fastcgi" }
+miraserve-publish = { version = "0.1.6", path = "crates/miraserve-publish" }
+miraserve-ai = { version = "0.1.6", path = "crates/miraserve-ai" }
+miraserve-wasm = { version = "0.1.6", path = "crates/miraserve-wasm" }
+miraserve-telemetry = { version = "0.1.6", path = "crates/miraserve-telemetry" }
+miraserve-http = { version = "0.1.6", path = "crates/miraserve-http" }
+miraserve-sandbox = { version = "0.1.6", path = "crates/miraserve-sandbox" }
+miraserve-core = { version = "0.1.6", path = "crates/miraserve-core" }
+miraserve-migrate = { version = "0.1.6", path = "crates/miraserve-migrate" }
 
 [profile.release]
 # Keep default `panic = "unwind"` for Wasmtime trap handling and Tokio per-connection task isolation.
