@@ -6,15 +6,16 @@ description: Install, configure and operate the MiraServe web server (static sit
 # Setting up MiraServe
 
 This guide is written for AI assistants that install or operate MiraServe for a user. The walkthrough was
-run against MiraServe 0.1.5 on Ubuntu 24.04 with the `.deb` package; the 0.1.6 additions were checked
-against the 0.1.6 code and binary.
+run against MiraServe 0.1.5 on Ubuntu 24.04 with the `.deb` package; selected 0.1.6 examples were checked
+against the 0.1.6 binary, and the other 0.1.6 statements were checked against the code and packaging.
 For anything not covered here, read the documentation at <https://miraserve.org/docs/introduction/>
 (index for machines: <https://miraserve.org/llms.txt>) instead of guessing.
 
 ## Safety rules
 
 1. **Tell the user and back up first.** Before any step that replaces, moves or deletes a file, or
-   restarts or removes the service, tell the user what will change and copy the file elsewhere first.
+   restarts or removes the service, tell the user what will change and copy the file to a private
+   directory outside the paths being changed first (mode `0700` for anything that may hold secrets).
    Never purge or delete data without the user saying so for that data.
 2. **Stop on the first failure.** Stop at the first failed command or check. Never continue an install
    after a failed checksum, and never put a configuration in place that the strict check rejected.
@@ -98,11 +99,12 @@ with the user's agreement.
 These `WARN` lines may appear at start-up with the packaged unit and are not errors: `running
 unprivileged (UID ..., GID ...); OS user/group isolation verified`, and, on kernels older than Linux
 6.10, `Landlock partially enforced`. The notice `openat2 is refused in this process` (usually caused
-by the default unit's `RestrictSUIDSGID=yes`; an outer seccomp filter or a kernel older than Linux
-5.6 gives the same notice) may also appear: it is logged at `WARN` only when a site `file-cache` is
-enabled (not `"off"`) with a non-zero `server.limits.file-cache-bytes` budget, or when `workers` is
-not `"shared"`; otherwise it is logged at `INFO`, and it may not appear at all when nothing
-configured depends on `openat2`.
+by the default unit's `RestrictSUIDSGID=yes`, an outer seccomp filter, or a kernel older than Linux
+5.6 behind an outer filter; a kernel older than Linux 5.6 without an outer filter prints a different
+message, `openat2 is not supported by this kernel`) may also appear: it is logged at `WARN` only when
+a site `file-cache` is enabled (not `"off"`) with a non-zero `server.limits.file-cache-bytes` budget,
+or when `workers` is not `"shared"`; otherwise it is logged at `INFO`, and it may not appear at all
+when nothing configured depends on `openat2`.
 
 ## 2. The configuration file
 
@@ -214,7 +216,9 @@ site "blog.example.com" {
   wrong-type path gets no socket rule and logs a `WARN` naming the path; a directory that is also
   another configured grant keeps its previous rule and logs a `WARN`; an individually granted file
   keeps read access only and logs a `WARN`; and a directory configured as `socket-tree` keeps its rule
-  with no warning. Fix a wrong socket path and restart (a reload cannot add a skipped rule).
+  with no warning. Correct the socket path and run the strict check. Reload if the corrected socket is
+  covered by the start-up policy (for example it lies under a configured `socket-tree`); arrange a
+  restart with the user if it needs a new grant.
 - **The `miraserve` account must be allowed to reach and open that socket.** A default Ubuntu pool
   creates it as `www-data:www-data` with mode `0660`. Running `miraserve check --fs` as the `miraserve`
   account catches access problems with warning `W033` (which fails `--strict`). If left unfixed, PHP
@@ -461,14 +465,14 @@ user's explicit decision. Rules in `.htaccess` files are never imported.
 | Reload says "restart required: path(s) outside the startup Landlock policy" | See section 5. |
 | Service does not start after adding a site under `/home` | See section 6. |
 | `502` on a proxied route | The application is not listening on the `upstream` address. Test it directly with `curl`. |
-| `502` on PHP | PHP-FPM is not running, the socket path is wrong, or the `miraserve` account may not reach or open the socket (journal: `FastCGI transport I/O error: Permission denied`; `check --fs` as `miraserve` reports `W033`; see the PHP part of section 2). Check `systemctl status php8.3-fpm` and `ls -l /run/php/`. |
+| `502` on PHP | PHP-FPM is not running, the socket path is wrong, or the `miraserve` account may not reach or open the socket. A stopped pool or a missing (or reachable non-socket) path gives `502` without `W033`; permission problems on the socket or a parent directory log `FastCGI transport I/O error: Permission denied` in the journal and are reported as `W033` by `check --fs` as `miraserve` (see the PHP part of section 2). Check `systemctl status php8.3-fpm` and `ls -l /run/php/`. |
 | `warning[W033]` naming a PHP socket's owner and mode (`requires read and write permission on the socket`) | The checking account reached the socket but lacks read/write permission on it (fails `--strict`; no `W033` when the path does not exist or is found to be something other than a socket, and the `root` note appears only after the socket itself is identified with matching real and effective UID and GID). Set `listen.group = miraserve` in the PHP-FPM pool and restart PHP-FPM, or add `miraserve` to the socket's group and restart MiraServe (section 2). |
 | `warning[W033]` saying a PHP socket `could not be reached (type and owner unknown)` | A parent directory cannot be searched by the checking account (gives `W033` whatever is behind it, even under `root`, before the target's type or owner is known). Test search permission on each parent directory with `sudo -u miraserve test -x <parent> && echo ok`, use `namei -l <socket path>` to see owners and modes, and fix the directory permission; do **not** change `listen.group` or add `miraserve` to a socket group for this diagnostic (section 2). |
-| `WARN` naming a Unix socket path as not a socket at start | Linux only: an exact `fastcgi-pass "unix:..."` or `keyd-socket` path exists at start-up and is not a Unix socket. A plain wrong-type path gets no socket rule (`WARN`); a directory that is also another configured grant keeps its previous rule (`WARN`); an individually granted file keeps read access only (`WARN`); a directory configured as `socket-tree` keeps its rule with no warning. Fix the socket path and restart. |
+| `WARN` naming a Unix socket path as not a socket at start | Linux only: an exact `fastcgi-pass "unix:..."` or `keyd-socket` path exists at start-up and is not a Unix socket. A plain wrong-type path gets no socket rule (`WARN`); a directory that is also another configured grant keeps its previous rule (`WARN`); an individually granted file keeps read access only (`WARN`); a directory configured as `socket-tree` keeps its rule with no warning. Correct the socket path and run the strict check. Reload if the corrected socket is covered by the start-up policy (for example it lies under a configured `socket-tree`); arrange a restart with the user if it needs a new grant (or if `keyd-socket` changed). |
 | `systemctl restart` succeeded but nothing answers | The server refused to start and is retrying. `systemctl is-active miraserve` prints `activating`; read the journal (section 5). |
 | `404` on `.php` files | Can mean: (a) the script is missing or unreadable inside `root` (check with `sudo -u miraserve test -r <script>` and `ls -l`, never `cat`); (b) `preset "wordpress-hardened"` deliberately returns `404` for sensitive files like `wp-config.php`; or (c) no FastCGI route matches that script (MiraServe never serves `.php` source statically). Inspect existing routes, preset, and script path first; do **not** blindly add a site-wide `route "*.php"` handler, and preserve narrow allow-lists and upload execution blocks. |
 | Browser warns about the certificate | The self-signed starter certificate is still in use, or ACME has not issued yet. See section 3 and the journal. |
-| `openat2 is refused in this process` at start (`INFO`, or `WARN` with enabled `file-cache` / non-`"shared"` `workers`) | Usually caused by the default unit's `RestrictSUIDSGID=yes`; an outer seccomp filter or a kernel older than Linux 5.6 gives the same notice (may not appear at all when nothing configured depends on `openat2`). Logged at `WARN` only when a site `file-cache` is enabled with a non-zero `file-cache-bytes` budget or `workers` is not `"shared"`, and at `INFO` otherwise; not an error unless you rely on those features. |
+| `openat2 is refused in this process` at start (`INFO`, or `WARN` with enabled `file-cache` / non-`"shared"` `workers`) | Usually caused by the default unit's `RestrictSUIDSGID=yes`, an outer seccomp filter, or a kernel older than Linux 5.6 behind an outer filter; a kernel older than Linux 5.6 without an outer filter prints a different message, `openat2 is not supported by this kernel` (neither appears when nothing configured depends on `openat2`). Logged at `WARN` only when a site `file-cache` is enabled with a non-zero `file-cache-bytes` budget or `workers` is not `"shared"`, and at `INFO` otherwise; not an error unless you rely on those features. |
 | `miraserve check` passes from a root shell but the service fails | Check as the service account (section 4); the unit also hides `/home` and makes most of the system read-only. |
 
 Logs: `journalctl -u miraserve`. Version and build features: `miraserve version` (0.1.6 prints `features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless`).
@@ -487,14 +491,17 @@ Logs: `journalctl -u miraserve`. Version and build features: `miraserve version`
 
 **Ask the user whether they want to remove the package and keep its files, or purge.**
 
-`sudo dpkg --remove miraserve` removes the program and stops and disables the services
-(`miraserve.service` and `miraserve-keyd.service`); it keeps `/etc/miraserve/conf/miraserve.kdl`, the
+`sudo dpkg --remove miraserve` removes the program; the package attempts to stop and disable both units
+(`miraserve.service` and `miraserve-keyd.service`) and ignores a failure of either step, so afterwards
+verify with `systemctl is-active miraserve miraserve-keyd` and by checking that nothing listens on the
+ports any more before declaring the server retired. It keeps `/etc/miraserve/conf/miraserve.kdl`, the
 starter certificate and key, and `/var/www/miraserve/index.html`.
 
 `sudo dpkg --purge miraserve` additionally deletes those four files whatever they contain by then, and
 backup copies next to the home page (names such as `index.html.bak`, `index.html~`,
 `index.html.dpkg-old`), following a symbolic link if `index.html` is one; before a purge, copy what may
-be needed to a directory outside `/etc/miraserve` and `/var/www/miraserve`.
+be needed to a private directory outside `/etc/miraserve`, `/var/www/miraserve`, and the directory the
+home page really lives in when `index.html` is a symbolic link.
 
 Both remove the files the package itself installed (its units under `/usr/lib/systemd/system`, its
 sysusers and tmpfiles files under `/usr/lib`, and files under `/usr/share/miraserve` and
