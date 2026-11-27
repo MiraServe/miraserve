@@ -273,9 +273,9 @@ fn cgi_response_parser_rejects_1xx_whitespace_colon_and_strips_framing_headers()
     Ok(())
 }
 
-/// When a backend closes a connection without answering, `replay-safe-methods` retries a safe
-/// request once on a fresh connection while never sending a POST twice. Without the setting
-/// (the default), nothing that reached the backend is sent again.
+/// When a backend closes a connection without answering, `replay-safe-methods` retries GET once
+/// on a fresh connection and does not retry POST; without the setting (the default), GET is not
+/// retried.
 #[tokio::test]
 async fn connection_dropped_by_backend_is_replayed_only_when_enabled_and_never_for_post()
 -> TestResult {

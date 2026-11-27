@@ -3832,7 +3832,7 @@ server {
 }
 
 /// R7-MIG-8, R7-MIG-13, R7-MIG-14, R7-MIG-16, R7-MIG-17 & R7-CFG-2:
-/// - Caddy snippet expansion bomb fails cleanly at the expansion limit (never OOMs or silently truncates).
+/// - Caddy snippet expansion bomb fails with an expansion-limit error.
 /// - `MigrateOptions { source_root }` remaps `/etc/nginx/conf.d/*.conf` inside a copied tree.
 /// - Attacker-controlled text actually reaches the `// INSECURE:` comment sanitizer (`R7-MIG-14`,
 ///   revert-checkable!).

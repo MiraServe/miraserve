@@ -1945,9 +1945,10 @@ async fn review4_health_probe_uses_configured_host_on_preserve_host_route() -> T
     Ok(())
 }
 
-/// Two upstreams with one down (and no active health-check) must fail over on connect errors
-/// (including non-empty POST bodies before any bytes are sent), passively cool down the dead
-/// backend, retry after cooldown expires, and never duplicate a POST whose body was already read.
+/// Two upstreams with one down (and no active health-check) fail over on connect errors
+/// (including a non-empty POST after the cooldown window), place the dead backend in passive
+/// cooldown, and return 502 without hitting the sibling backend when an accepted connection
+/// closes without a response on a POST.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_duplicates_sent_post()
@@ -2047,8 +2048,7 @@ async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_d
     );
     assert_eq!(live_hits.load(Ordering::Acquire), 10);
 
-    // 2. Non-empty POST targeting dead backend (after cooldown expires) fails over with its FULL
-    //    body intact because TCP connect failed before any body bytes were sent!
+    // 2. Non-empty POST after cooldown expires succeeds on the live backend with its full body.
     tokio::time::sleep(Duration::from_millis(250)).await;
     let post_body = Full::new(Bytes::from_static(b"payload=hello-failover"))
         .map_err(|never| match never {})
@@ -2068,8 +2068,8 @@ async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_d
     let post_bytes = post_resp.into_body().collect().await?.to_bytes();
     assert_eq!(post_bytes.as_ref(), b"live-ok:payload=hello-failover");
 
-    // 3. A backend that ACCEPTS TCP and reads the POST body before dropping the socket MUST NOT
-    //    cause a duplicate POST to the sibling backend.
+    // 3. A backend that accepts TCP and drops the socket without responding returns 502 without
+    //    hitting the sibling backend.
     let drop_listener = TcpListener::bind("127.0.0.1:0").await?;
     let drop_addr = drop_listener.local_addr()?;
     let drop_task = tokio::spawn(async move {
@@ -2077,7 +2077,7 @@ async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_d
             use tokio::io::AsyncReadExt as _;
             let mut buf = [0_u8; 512];
             let _ = stream.read(&mut buf).await;
-            // Drop socket without sending an HTTP response after reading the request!
+            // Drop socket without sending an HTTP response.
         }
     });
     let live_hits_before_drop = live_hits.load(Ordering::Acquire);

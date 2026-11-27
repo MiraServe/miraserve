@@ -600,7 +600,7 @@ site "wasm-fifo.example" {{
             ..ServerOptions::default()
         },
         Duration::from_secs(5),
-        "MiraServeServer::start stalled on tenant FIFO",
+        "MiraServeServer::start timed out",
     )
     .await?;
 

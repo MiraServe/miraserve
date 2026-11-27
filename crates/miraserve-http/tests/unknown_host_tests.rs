@@ -92,9 +92,9 @@ server {
     Ok(())
 }
 
-/// A custom error page that is missing or is a symlink leaving the site root must not fail
-/// `HttpEngine::from_config`; the site keeps serving and that status falls back to the built-in
-/// page without exposing the symlink target.
+/// A config with a missing custom 503 page and a 404 symlink leaving the site root must not
+/// fail `HttpEngine::from_config`; the site keeps serving and a 404 response does not contain
+/// the symlink target's body.
 #[cfg(unix)]
 #[tokio::test]
 async fn unloadable_custom_error_pages_fall_back_instead_of_failing_the_engine() -> TestResult {
@@ -191,8 +191,9 @@ site "a.example.test" {{
     Ok(())
 }
 
-/// A symlinked absolute `error-pages` path is refused, inside or outside the site root, and the
-/// built-in page is used instead of the symlink target.
+/// With symlinked absolute `error-pages` paths configured (404 inside root, 410 outside root),
+/// `HttpEngine::from_config` succeeds and a 404 response does not contain the symlink target's
+/// body.
 #[cfg(unix)]
 #[tokio::test]
 async fn absolute_error_page_symlink_is_never_served() -> TestResult {

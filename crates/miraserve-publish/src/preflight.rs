@@ -34,12 +34,12 @@ const MAX_ATTRS_PER_ELEMENT: usize = 1_024;
 const MAX_TOTAL_ATTR_BYTES: usize = 4 * 1024 * 1024;
 /// Per-file active markup size cap (2 MiB) to bound parser memory/CPU (`R5-PUB-8`).
 const MAX_MARKUP_FILE_BYTES: usize = 2 * 1024 * 1024;
-/// Chunk size fed to `html5ever` per step so limit/fatal aborts trigger immediately (`R5-PUB-8`).
+/// Target chunk size fed to `html5ever` per step (`R5-PUB-8`).
 const HTML_FEED_CHUNK_BYTES: usize = 4_096;
-/// Hard per-file CPU budget for HTML/XML preflight scanning (`R7-SCAN-3`), measured with
+/// Hard per-file scan budget for HTML/XML preflight scanning (`R7-SCAN-3`), measured with
 /// [`scan_clock_now`].
 const MAX_FILE_MARKUP_SCAN_DURATION: Duration = Duration::from_secs(1);
-/// Base whole-bundle CPU budget across all active markup files (`R7-SCAN-3`).
+/// Base whole-bundle scan budget across all active markup files (`R7-SCAN-3`).
 const MAX_BUNDLE_MARKUP_SCAN_DURATION: Duration = Duration::from_secs(5);
 /// Extra whole-bundle budget per MiB of active markup (`R8-SCAN-1`). A fixed 5 s budget rejected
 /// large legitimate sites; the per-file budget above still bounds any single hostile file.
@@ -208,7 +208,7 @@ pub fn run_preflight_checks(
     // 3. Real HTML5 (`html5ever`) + strict XML (`roxmltree`, DTD subset disabled) tree inspection
     //    driven by exact served MIME type (`R4-PUB-1`, `R4-PUB-4`, `R4-PUB-6`, `R5-PUB-8..14`).
     //    R5-PUB-8: Skip expensive markup parsing when bundle `max-size` / `max-files` already failed.
-    //    R7-SCAN-3 & R8-SCAN-1: Enforce a whole-bundle CPU-time budget across all markup files.
+    //    R7-SCAN-3 & R8-SCAN-1: Enforce a whole-bundle scan budget across all markup files.
     if (check_no_inline || check_csp_valid) && !size_or_file_limit_failed {
         let markup_bytes: u64 = bundle
             .files
@@ -1364,8 +1364,8 @@ impl TreeSink for HtmlDomSink {
     }
 }
 
-/// `TokenSink` wrapper enforcing per-tag attribute count and wall-clock CPU budget directly on
-/// `html5ever`'s token stream (`R7-SCAN-3`) before tokens ever reach `TreeBuilder`.
+/// `TokenSink` wrapper enforcing per-tag attribute count and scan deadline directly on
+/// `html5ever`'s token stream (`R7-SCAN-3`) before tokens reach `TreeBuilder`.
 struct BoundedTokenSink {
     inner: TreeBuilder<NodeId, HtmlDomSink>,
     state: Rc<RefCell<ArenaState>>,
@@ -1409,8 +1409,8 @@ impl TokenSink for BoundedTokenSink {
     }
 }
 
-/// Parses HTML5 in bounded 4 KiB chunks (`R5-PUB-8`, `R7-SCAN-3`) and aborts immediately on the
-/// first fatal parse error, DOM depth/node/attribute cap, or scan deadline.
+/// Parses HTML5 in chunks (`R5-PUB-8`, `R7-SCAN-3`) and stops on a fatal parse error, DOM
+/// depth/node/attribute cap, or scan deadline.
 fn parse_html_dom(markup: &str, scripting_enabled: bool, deadline: Duration) -> ArenaState {
     let abort_flag = Rc::new(Cell::new(false));
     let shared_state = Rc::new(RefCell::new(ArenaState::new(Rc::clone(&abort_flag))));
@@ -1472,8 +1472,7 @@ fn parse_html_dom(markup: &str, scripting_enabled: bool, deadline: Duration) -> 
             }
         }
         if abort_flag.get() {
-            // Drop tokenizer directly without flushing EOF so aborted deeply-nested or timed-out
-            // parses do not trigger `html5ever` EOF tree-closing work.
+            // Drop tokenizer directly without calling `tokenizer.end()` on abort.
             drop(tokenizer);
             let fallback_flag = Rc::new(Cell::new(true));
             return std::mem::replace(

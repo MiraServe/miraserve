@@ -2504,7 +2504,7 @@ site "a.example" { root "/var/www/a.example" }
     Ok(())
 }
 
-/// `check --fs` reports a warning (`W023`) and exits 0 when a custom error page is missing or is
+/// `check --fs` reports `W023` (not `E301`) and exits 0 when a custom error page is missing or is
 /// a symlink leaving the site root.
 #[cfg(unix)]
 #[test]
@@ -3112,9 +3112,9 @@ site "localhost" {{
     Ok(())
 }
 
-/// Exercises the real CLI binary with a non-rotating access log in an ungranted parent directory
-/// under Landlock, sends distinct HTTPS requests before and after a live CLI `reload`, and
-/// asserts the access log contains BOTH distinct request paths.
+/// Exercises the CLI binary with a non-rotating access log in an ungranted parent directory,
+/// sends distinct HTTPS requests before and after a live CLI `reload`, and asserts the HTTPS
+/// responses and that the access log contains BOTH distinct request paths.
 #[cfg(unix)]
 #[test]
 #[cfg_attr(

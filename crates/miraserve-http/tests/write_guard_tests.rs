@@ -418,9 +418,8 @@ dual_runtime_test!(
     -> io::Result<()>
 );
 
-/// On Linux `for_tcp_stream` sets `TCP_NOTSENT_LOWAT` to 32 KiB, so a stalled TCP peer is cut
-/// on `write-idle + 32 KiB / min-rate` (here 1 s + 0.5 s, asserted in 900 ms..=8 s) even with a
-/// 4 MiB `SO_SNDBUF`.
+/// On Linux `for_tcp_stream` sets `TCP_NOTSENT_LOWAT` to 32 KiB and cuts a TCP peer that never
+/// reads with `TimedOut` within `900 ms..=8 s`.
 #[cfg(target_os = "linux")]
 async fn real_socket_reader_that_stops_is_cut_on_a_fixed_schedule_impl() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

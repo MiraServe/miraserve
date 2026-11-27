@@ -1077,10 +1077,7 @@ fn verify_allocator_attribution_is_exact() {
     );
 
     // Non-excluded thread allocations must register exact count and bytes.
-    // Signal with lock-free atomics (never `std::sync::Barrier` / `Mutex` / `Condvar` inside the
-    // counting window): on macOS `std` lazily boxes a pthread mutex (64 B) and condvar (48 B) the
-    // first time a `Barrier` is waited on, which would attribute +2 allocs / +112 B whenever the
-    // counted thread reaches `b_done` first.
+    // Signal with atomic flags so synchronization does not allocate inside the counting window.
     let ready = Arc::new(AtomicBool::new(false));
     let go = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
@@ -1132,7 +1129,7 @@ fn verify_allocator_attribution_is_exact() {
 
     // Profiler reentrancy guard: profiling a single allocation must count and profile ONLY the
     // target allocation, never the backtrace/HashMap allocations made inside `profile_hit`.
-    // Uses atomic flags for the same lazy-pthread-init reason as the check above.
+    // Uses atomic flags so synchronization does not allocate inside the counting window.
     let prof_ready = Arc::new(AtomicBool::new(false));
     let prof_go = Arc::new(AtomicBool::new(false));
     let prof_done = Arc::new(AtomicBool::new(false));

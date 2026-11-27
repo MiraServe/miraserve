@@ -846,9 +846,8 @@ mod tests {
         }
     }
 
-    /// Direct black-box check against `looks_like_secret_token` (with no counter scaffolding):
-    /// on 20,000 repeated `eyJ` markers, the best-of-5 scan time stays within 30x of a
-    /// same-length non-`eyJ` control string (floored at 1 ms).
+    /// Direct black-box check against `looks_like_secret_token`: on 20,000 repeated `eyJ` markers,
+    /// the best-of-5 scan time stays within the larger of 30 times the control time and 1 ms.
     #[test]
     fn looks_like_secret_token_direct_scaling_rejects_quadratic_suffix_scan() {
         use std::time::{Duration, Instant};

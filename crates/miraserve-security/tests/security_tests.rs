@@ -1170,13 +1170,13 @@ async fn round5_wave4_shared_ip_nat_idle_returning_keys_atomic_cap_paused_upload
 }
 
 /// R6-RL-1: One attacker behind a shared NAT/CDN IP must not starve sibling users via either
-/// slot exhaustion (64 keys kept alive) OR aggregate ceiling exhaustion (20 noisy keys blasting
+/// slot exhaustion (64 attacker keys) OR aggregate ceiling exhaustion (20 noisy keys blasting
 /// > 1000/min), and rejected per-key requests must never drain the shared IP ceiling.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn r6_rl_1_shared_ip_slot_eviction_and_fair_share_ceiling_prevent_single_user_starvation()
 -> TestResult {
-    // Part A: Slot exhaustion — attacker mints 64 keys and keeps them alive at 1 req/s;
+    // Part A: Slot exhaustion — attacker seeds 64 keys and sends 1 req/s cycling through them;
     // victim sends 300 requests over 5 minutes (1 req/s) and must get at least 290 admitted.
     let slot_rl = GcraRateLimiter::from_config(&RateLimitConfig {
         requests: 100,
@@ -1203,7 +1203,7 @@ fn r6_rl_1_shared_ip_slot_eviction_and_fair_share_ceiling_prevent_single_user_st
     let start_s = t0 + Duration::from_secs(40);
     for sec in 0..300_u64 {
         let now = start_s + Duration::from_secs(sec);
-        // Attacker keeps ~1 of its 64 keys alive every second (~60 req/min).
+        // Attacker sends 1 req/s cycling through its 64 keys.
         let atk_idx = sec % 64;
         let mut h_atk = HeaderMap::new();
         h_atk.insert(

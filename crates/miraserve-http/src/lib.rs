@@ -1358,12 +1358,9 @@ impl HttpEngine {
             .max_pending_accept_reset_streams(Some(
                 usize::try_from(settings.limits.max_h2_rst_stream_per_sec).unwrap_or(50),
             ));
-        // No HTTP/2 keep-alive PINGs. A PING queues behind the response data already sent, so
-        // a client reading slowly answers it only after draining that data and can be closed
-        // despite staying above the configured minimum response rate. The cases PINGs were meant
-        // for are covered without them: an idle connection closes at `idle-keepalive` (`h2_watch`),
-        // a peer that stops reading blocks the socket and is cut by the TCP write guard, and a
-        // stream whose window stays closed is released by the stall watchdog.
+        // No HTTP/2 keep-alive PINGs: idle connections are closed by `h2_watch` at
+        // `idle-keepalive`, stalled streams by `h2_streams.expire_stalled`, and write-blocked
+        // TCP peers by `WriteGuardedIo`.
 
         let limits_snap = settings.limits.clone();
         let timeouts_snap = settings.timeouts.clone();
@@ -1771,12 +1768,8 @@ async fn h2_watch(
             streams.changed().await;
             continue;
         }
-        // A body counts as produced once its last piece is handed to hyper, but hyper and the
-        // HTTP/2 layer can still hold a good part of it, waiting for the client's flow-control
-        // window, so a slow download would otherwise be closed as idle before buffered DATA
-        // finishes draining. While DATA is still on its way the connection is neither idle nor a
-        // candidate for per-IP eviction; idle time counts from when the last of it was written.
-        // Control frames do not count as delivery.
+        // While buffered DATA is still being written, the connection is neither idle nor a
+        // candidate for per-IP eviction; control frames do not count as delivery.
         // `idle_since_ms` is 0 while DATA is still on its way and otherwise counts from the
         // later of the last request and the last DATA written (see `attach_transport`).
         let idle_since = idle_state.idle_since_ms();
@@ -2015,9 +2008,10 @@ thread_local! {
     static ACCESS_LINE: std::cell::RefCell<String> = std::cell::RefCell::new(String::with_capacity(512));
 }
 
-/// Sends access-log lines straight to `sink`, formatted by MiraServe itself, instead of through
-/// the general `tracing` formatter, producing the same text byte for byte. Lines are still written
-/// only when INFO is enabled for `miraserve::access`. Returns `false` if a sink was already set.
+/// Registers a direct access-log `sink` used instead of the `tracing` formatter when INFO is
+/// enabled for `miraserve::access`, no `tracing` span is entered, and the timestamp is at or
+/// after `UNIX_EPOCH` (falling back to `tracing` otherwise). Returns `false` if a sink was
+/// already set.
 pub fn set_access_log_sink(sink: AccessLogSink) -> bool {
     ACCESS_LOG_SINK.set(sink).is_ok()
 }
@@ -2632,13 +2626,8 @@ impl AccessLogRecord {
     }
 }
 
-/// Upper bound on the size of the future hyper gets for one request.
-///
-/// On HTTP/2, hyper moves that future by value through `H2Stream::new` into `InTaskExec::execute`
-/// before boxing it into `Driven`'s `FuturesUnordered` (or a spawned Tokio task). Keeping the
-/// request pipeline's state machine inline would move the entire state machine by value on every
-/// HTTP/2 request entry, so the pipeline's future is boxed inside the service future and only the
-/// small wrapper is moved by value.
+/// Upper bound on the size of the per-request service future passed to hyper (checked in
+/// `debug_assert!` where the boxed request pipeline future is returned).
 const SERVICE_FUTURE_MAX_BYTES: usize = 2048;
 
 const TRANSPORT_OUTCOME_PENDING: u8 = 0;
@@ -3472,21 +3461,16 @@ pub fn text_response(status: StatusCode, text: impl Into<String>) -> Response<Ht
 pub type SendBufferProbe<I> = Box<dyn Fn(&I) -> Option<usize> + Send + Sync>;
 
 /// Largest send-buffer allowance the guard grants where the kernel cannot bound its unsent
-/// queue (`R8-HTTP-1`; not Linux, see [`NOTSENT_LOWAT_BYTES`]). There a client that stops
-/// reading entirely can hold a connection for `response-write-idle` plus
-/// `MAX_SEND_BUFFER_SLACK_BYTES / min-response-rate-bps` (about 17 minutes at the defaults).
+/// queue (`R8-HTTP-1`; not Linux, see [`NOTSENT_LOWAT_BYTES`]).
 const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 
 /// `TCP_NOTSENT_LOWAT` set on every accepted connection on Linux, and the guard's kernel
 /// allowance there.
 ///
 /// With it the kernel accepts a write only while roughly this much data is queued but not yet
-/// sent (it can overshoot by one buffer), whatever size it has grown the send buffer to. So the
-/// server's own side of the connection hides at most about this much progress, and a client
-/// that stops reading is cut after `response-write-idle + NOTSENT_LOWAT_BYTES /
-/// min-response-rate-bps` (62 s at the defaults) instead of an amount that depends on kernel
-/// buffer autotuning. It limits only unsent data, not data in flight, so it does not cap
-/// throughput.
+/// sent (it can overshoot by one buffer), whatever size it has grown the send buffer to,
+/// instead of basing the kernel allowance on kernel buffer autotuning. It limits only unsent
+/// data, not data in flight, so it does not cap throughput.
 ///
 /// It says nothing about the **client's** side: a receiver reopens its window in steps (one
 /// segment, or a sixteenth of its receive buffer on Linux), so accepted writes arrive in lumps
@@ -3514,8 +3498,8 @@ const MAX_READER_LEAD_BYTES: u64 = 1024 * 1024;
 /// The guard only acts during write backpressure, so idle keep-alive connections and quiet SSE
 /// streams are never closed. During backpressure two rules apply:
 ///
-/// - **Silence.** No write accepted for `write_idle_timeout` (plus the time the minimum rate
-///   needs for the kernel allowance): the client has stopped reading.
+/// - **Silence.** No write accepted for `write_idle_timeout` plus the time the minimum rate
+///   needs for the kernel allowance and client lead (`idle_limit`).
 /// - **Rate.** Over the blocked time of the episode the kernel must have accepted at least
 ///   `min_response_rate_bps`, less two allowances: the kernel allowance (one send buffer, or
 ///   `NOTSENT_LOWAT_BYTES` where the unsent queue is bounded), and `write_idle_timeout` worth
@@ -3681,7 +3665,6 @@ impl<I> WriteGuardedIo<I> {
         u64::try_from(expected).unwrap_or(u64::MAX).max(1)
     }
 
-    /// Longest tolerated gap with no accepted write.
     /// How far the client is ahead of the minimum rate in this backpressure episode: bytes it
     /// took beyond what the minimum rate required (capped, see [`MAX_READER_LEAD_BYTES`]).
     fn reader_lead(&self) -> u64 {
@@ -3762,9 +3745,8 @@ impl<I> WriteGuardedIo<I> {
         None
     }
 
-    /// Caps how far ahead of the minimum rate a client can get. Without the cap a client could
-    /// read quickly for a while and then trickle a byte at a time for as long as the surplus
-    /// lasts. The cap is `write_idle_timeout` worth of minimum-rate data.
+    /// Caps how far ahead of the minimum rate a client can get at the larger of
+    /// `write_idle_timeout` worth of minimum-rate data and [`MAX_READER_LEAD_BYTES`].
     fn clamp_surplus(&mut self) {
         if self.min_response_rate_bps == 0 {
             return;

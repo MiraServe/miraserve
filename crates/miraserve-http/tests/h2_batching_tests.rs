@@ -1400,15 +1400,14 @@ async fn run_burst_scenario(vectored: bool, max_write_chunk: usize) -> TestResul
     let _ = tokio::time::timeout(Duration::from_secs(5), server_task).await;
 
     // Phase B (unsplit transport, flush gate open): assert what the patch actually changes.
-    // Queue N = 12 ready 1 KiB responses (each ~1,048 B on the wire: HEADERS + 9 B DATA header
-    // + 1,024 B payload) behind WriteMode::Blocked while FlushMode::Open stays open, then release
-    // the write gate once all 12 handlers have queued their responses into h2.
+    // Queue N = 12 ready responses (1,024 B DATA payload each) behind WriteMode::Blocked while
+    // FlushMode::Open stays open, then release the write gate once all 12 handlers have queued
+    // their responses into h2.
     //
     // Bound rationale:
-    // - Patched h2 (COPY_LIMIT = 4096, initial buffer = 16,384 B, min_buffer_capacity = 4,105 B)
-    //   copies 1 KiB DATA frames into the shared write buffer before draining, so N = 12 ready
-    //   1 KiB responses stay within the 4 DATA-carrying transport write regression ceiling even
-    //   when an early response occupies the first write before the remaining streams queue.
+    // - Patched h2 (`COPY_LIMIT = 4096`, initial buffer `16,384 B`, `min_buffer_capacity = 4,105 B`)
+    //   copies 1 KiB DATA frames into the shared write buffer before draining; this test asserts
+    //   at most `MAX_PATCHED_DATA_WRITES` (4) DATA-carrying transport writes for N = 12 responses.
     // - Unpatched upstream h2 (CHAIN_THRESHOLD = 256 vectored, 1024 scalar) chains EVERY 1,024 B
     //   DATA frame into Next::Data, occupying `next` and forcing a transport write per stream:
     //   mathematically >= 12 DATA-carrying writes on both scalar and vectored transports.
@@ -3518,8 +3517,8 @@ site "mixed.example.test" {{
     let local: SocketAddr = "127.0.0.1:8443".parse()?;
     let (_shut_tx, shut_rx) = watch::channel(false);
 
-    // Connection A: slow steady reader (~4 KiB every 15 ms -> ~510 ms for 137 KiB) carrying mixed
-    // large (64 KiB chained) and small (1 KiB copied) responses concurrently under WriteGuardedIo.
+    // Connection A: paced reader (4 KiB every 15 ms) carrying mixed 64 KiB and 1 KiB responses
+    // concurrently under WriteGuardedIo.
     let a_bytes_written = Arc::new(AtomicUsize::new(0));
     let a_progress_notify = Arc::new(Notify::new());
     let (client_a, server_a) = tokio::io::duplex(256 * 1024);
@@ -3614,8 +3613,8 @@ site "mixed.example.test" {{
             .body(http_body_util::Empty::<Bytes>::new())
     };
 
-    // Start mixed large + small burst on slow Connection A (137 KiB total -> ~510 ms paced)
-    // and collect it concurrently in a background task so we can observe real overlap with B.
+    // Start mixed large + small burst on slow Connection A (134 KiB payload total)
+    // and collect it concurrently in a background task so we can observe overlap with B.
     let slow_started = Instant::now();
     let mut a_futs = Vec::new();
     for path in [
@@ -3673,8 +3672,8 @@ site "mixed.example.test" {{
         Ok::<(), String>(())
     });
 
-    // Wait until Connection A is demonstrably in flight (has written at least its first paced
-    // burst, while remaining far short of completing the 137 KiB transfer).
+    // Wait until Connection A is in flight (has written at least 4 KiB while remaining below
+    // `MIXED_TOTAL_PAYLOAD`, 134 KiB).
     let a_start_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while a_bytes_written.load(Ordering::Acquire) < 4_096 {
         let notified = a_progress_notify.notified();

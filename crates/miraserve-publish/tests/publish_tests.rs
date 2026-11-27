@@ -2464,8 +2464,8 @@ fn publish_round5_wave2_site_id_rebind_x509_dn_v2_allowlist_replay_and_preflight
 
 /// Round 5 Wave 3 scanner regressions (`R5-PUB-8, 9, 10, 13, 14`):
 /// - `R5-PUB-8`: 1 MB of nested `<div>` hits the depth cap within 5 s (best of 3), 50k
-///   foster-parented `<table><i></i>` completes within 10 s, `max-size` short-circuits markup
-///   scanning, and >2 MiB single markup files are rejected.
+///   foster-parented `<table><i></i>` completes within 10 s, and `max-size` short-circuits
+///   markup scanning.
 /// - `R5-PUB-9`: Ordinary valid pages pass without false positives (XHTML 1.0 DOCTYPE, `a < b`,
 ///   `&nbsp`, `<div/>`, duplicate `class`, stray `</p>`, nested `<a>`, empty `.html`,
 ///   `data:image/svg+xml` in `srcset`/`poster`/SVG `<image>`, `<script type="text/template">`,
@@ -2920,8 +2920,8 @@ fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() 
 
     // 3. HTML5 adoption-agency attribute amplification bomb (`<p>` followed by 95 `<b>` × 20 × 900 B
     //    attributes, then 2,500 `<p>t`): each `<p>` closes the previous `<p>` and reconstructs all
-    //    95 active formatting `<b>` elements with cloned attributes (~4.3 GB RAM uncapped). Must
-    //    abort cleanly on the 4 MiB expanded attribute memory budget.
+    //    95 active formatting `<b>` elements with cloned attributes. Must abort cleanly on the
+    //    4 MiB expanded attribute memory budget.
     let mut bomb = String::with_capacity(1_900_000);
     bomb.push_str("<!doctype html><html><body><p>");
     let big_val = "x".repeat(900);
@@ -3764,10 +3764,9 @@ fn r7_scan_2_importmap_enforces_url_like_relative_specifier_rule() {
     assert!(miraserve_publish::run_preflight_checks(&ok, &checks).is_empty());
 }
 
-/// R7-SCAN-3: Prescan tracks HTML5 RCDATA/RAWTEXT (`<title>`, `<textarea>`, etc.) and `<svg>`/`<math>`
-/// foreign-content depth so `<title><!--</title><g a0 ...>`, `<textarea><!--</textarea><g a0 ...>`,
-/// and `<svg><script><g a0 ...></script></svg>` with 250k attributes reject at the attribute cap
-/// instead of entering `html5ever`'s quadratic attribute loop.
+/// R7-SCAN-3: `<title><!--</title><g a0 ...>`, `<textarea><!--</textarea><g a0 ...>`, and
+/// `<svg><script><g a0 ...></script></svg>` with 250k attributes reject at the attribute cap
+/// within 250 ms.
 #[test]
 fn r7_scan_3_prescan_rcdata_rawtext_and_svg_script_cannot_be_desynchronized() {
     use std::fmt::Write as _;

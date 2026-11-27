@@ -1015,13 +1015,11 @@ site "fair.h2it.test" {{
     })
 }
 
-/// CPU-heavy single-connection multiplexing characterization (SPEC §4 trade-off):
-/// Runs a deterministic compute-heavy WASM plugin (looping inside the guest, yielding every
-/// 10,000 instructions via `fuel_async_yield_interval` on the connection task) over:
-/// - 1 HTTP/2 TLS connection carrying 8 concurrent requests (executes on 1 core at a time), vs.
-/// - 4 HTTP/2 TLS connections carrying 2 concurrent requests each (fans out across cores).
+/// Runs a compute-heavy WASM plugin over:
+/// - 1 HTTP/2 TLS connection carrying 8 concurrent requests, and
+/// - 4 HTTP/2 TLS connections carrying 2 concurrent requests each.
 ///
-/// Asserts correctness on all requests and records elapsed timings for reporting.
+/// Asserts 200 OK and expected body on all requests.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn h2_tls_single_conn_vs_multi_conn_wasm_cpu_bound() -> TestResult {
@@ -1686,10 +1684,9 @@ site "compress.h2it.test" {{
     })
 }
 
-/// On one real TCP + TLS 1.3 HTTP/2 connection running in-task, N concurrent WASM plugin requests
-/// (each comfortably within its wall-clock deadline when run alone, yet exceeding that deadline if
-/// serialized on a single core) ALL succeed because each WASM invocation runs as its own Tokio
-/// task; also verifies cancellation on stream reset and trap reporting.
+/// On one TCP + TLS 1.3 HTTP/2 connection, runs `CONCURRENT` WASM plugin requests concurrently
+/// against a calibrated per-request timeout, checks executor spawn counters, and verifies
+/// cancellation on stream reset and trap reporting.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn h2_tls_wasm_concurrent_requests_meet_deadlines_cancel_and_trap() -> TestResult {

@@ -223,11 +223,8 @@ pub async fn serve_h3_connection_with_control(
                 }
             }
             Some(_) = active_streams.join_next(), if !active_streams.is_empty() => {
-                // See `h3_quic::Shared`: the client is told to open a new connection for what
-                // follows. Nothing is cut: the requests in flight are served to their end,
-                // and the GOAWAY names the first request that is NOT taken (the library's
-                // `shutdown(0)` would name the last one taken, which a client may then send
-                // again although it ran). From then on no request is taken here.
+                // See `h3_quic::Shared`: send GOAWAY and stop accepting further requests on this
+                // connection while letting in-flight requests finish.
                 if !replacing && quic.stale_notifications() >= MAX_STALE_STOP_NOTIFICATIONS {
                     debug!(peer = %peer_addr, "replacing an HTTP/3 connection with many reset streams");
                     let _ = tokio::time::timeout(GOAWAY_WRITE_TIMEOUT, conn.shutdown(1)).await;
@@ -307,8 +304,8 @@ pub async fn serve_h3_connection_with_control(
 }
 
 /// How many streams of one connection may be reset by the server while Quinn holds a stop
-/// notification for them (kept until the connection closes) before the connection takes no
-/// further requests (the client opens a new one).
+/// notification for them (kept until the connection closes) before the server sends GOAWAY and
+/// stops accepting further requests on that connection.
 const MAX_STALE_STOP_NOTIFICATIONS: u32 = 512;
 
 /// How long the peer's acknowledgement of an answer is waited for once its end is queued: a

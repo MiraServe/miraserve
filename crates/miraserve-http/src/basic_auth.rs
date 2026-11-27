@@ -2216,8 +2216,8 @@ mod tests {
         Ok(())
     }
 
-    /// Twenty correct logins in flight at once from one address with nothing cached yet: all are
-    /// allowed, no failures are recorded, and no in-flight entries remain afterward.
+    /// Spawns 20 concurrent login tasks for one address with nothing cached yet: all are allowed,
+    /// no failures are recorded, and no in-flight entries remain afterward.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parallel_first_logins_share_one_check() -> TestResult {
         let users = TempUsersFile::new("first-burst")?;

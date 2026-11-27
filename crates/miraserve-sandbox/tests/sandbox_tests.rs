@@ -673,7 +673,7 @@ site "safe.example.test" {{ root "{}"; }}
     // `/usr/bin/id -u` succeeds cleanly on Unix.
     #[cfg(unix)]
     {
-        // Retry `/usr/bin/id -u` up to 3 times and record each attempt's elapsed duration for
+        // Run `/usr/bin/id -u` up to 3 attempts and record each attempt's elapsed duration for
         // failure diagnostics.
         let mut attempts = Vec::new();
         let mut uid_out = None;
@@ -888,10 +888,9 @@ site "sym.example" {{ root "{}" }}
     Ok(())
 }
 
-/// Regression test: `/etc/ssl/certs/*.pem` may symlink into `/usr/share/ca-certificates/...` and
-/// `/etc/resolv.conf` may symlink to a regular file such as `/run/systemd/resolve/stub-resolv.conf`.
-/// Landlock must include public distro CA target trees and canonical regular-file symlink targets
-/// without widening to `/etc/ssl/private`.
+/// Verifies `SandboxPolicy::from_config` includes `/usr/share/ca-certificates` (when present)
+/// and the canonical regular-file target of `/etc/resolv.conf` in `read_only_paths`, without
+/// including `/etc/ssl/private` or `/etc/ssl`.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_landlock_includes_distro_ca_symlink_targets_without_private_keys()
