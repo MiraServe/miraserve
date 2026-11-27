@@ -1776,7 +1776,7 @@ async fn h2_watch(
         // window, so a slow download would otherwise be closed as idle before buffered DATA
         // finishes draining. While DATA is still on its way the connection is neither idle nor a
         // candidate for per-IP eviction; idle time counts from when the last of it was written.
-        // Control frames (keep-alive PING replies) do not count as delivery.
+        // Control frames do not count as delivery.
         // `idle_since_ms` is 0 while DATA is still on its way and otherwise counts from the
         // later of the last request and the last DATA written (see `attach_transport`).
         let idle_since = idle_state.idle_since_ms();
@@ -3495,13 +3495,13 @@ const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 const NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 
 /// Largest lead over the minimum rate a client can bank in one backpressure episode, and so the
-/// longest extra silence it can buy: `MAX_READER_LEAD_BYTES / min-response-rate` (about 8.5
-/// minutes at 2048 bytes per second, 17 at the default 1024).
+/// longest extra silence it can buy on a blocked TCP write:
+/// `MAX_READER_LEAD_BYTES / min-response-rate` (about 8.5 minutes at 2048 bytes per second, 17 at
+/// the default 1024).
 ///
-/// A slow HTTP/2 reader over a high-BDP or tunneled path can accept substantial data ahead of what
-/// it has drained and then leave its receive window closed longer than `response-write-idle` while
-/// still reading. A lead of this size covers such paths; it also bounds how long a client that
-/// downloads fast and then stops reading can hold a connection.
+/// Caps the TCP write-idle allowance credited for bytes already accepted ahead of the minimum rate
+/// (`WriteGuardedIo::reader_lead`, `WriteGuardedIo::idle_limit`), bounding how long a client that
+/// downloads fast and then stops reading can hold a backpressured TCP connection.
 const MAX_READER_LEAD_BYTES: u64 = 1024 * 1024;
 
 /// Outbound `AsyncWrite` wrapper defending connections against slow-reader DoS (`R7-DOS-1`,
@@ -3696,10 +3696,10 @@ impl<I> WriteGuardedIo<I> {
     /// Longest tolerated gap with no accepted write.
     ///
     /// `response-write-idle`, plus the time the minimum rate needs for the kernel allowance and
-    /// for the client's lead. A client that took data faster than the minimum rate may hold it
-    /// in its own buffers and along the path (on a long path with a large receive window, half a
-    /// megabyte), and a steady reader works through it before the window reopens: that silence
-    /// is the lead being spent, not a stall.
+    /// for the client's lead (capped at `MAX_READER_LEAD_BYTES`). A client that took data faster
+    /// than the minimum rate may hold it in its own buffers and along the path, and a steady
+    /// reader works through it before the window reopens: that silence is the lead being spent,
+    /// not a stall.
     fn idle_limit(&self, slack: u64) -> Duration {
         self.write_idle_timeout
             .saturating_add(self.time_to_send(slack.saturating_add(self.reader_lead())))

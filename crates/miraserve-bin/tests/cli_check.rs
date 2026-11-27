@@ -2504,9 +2504,8 @@ site "a.example" { root "/var/www/a.example" }
     Ok(())
 }
 
-/// Regression test: `check --fs` must agree with the server about custom error
-/// pages. A missing page, or one that is a symlink leaving the site root, makes the server use
-/// its built-in page, so `check --fs` reports a warning (`W023`) and still exits 0.
+/// `check --fs` reports a warning (`W023`) and exits 0 when a custom error page is missing or is
+/// a symlink leaving the site root.
 #[cfg(unix)]
 #[test]
 fn check_fs_reports_unloadable_error_pages_as_warnings_not_errors() -> TestResult {
@@ -3113,9 +3112,9 @@ site "localhost" {{
     Ok(())
 }
 
-/// Enforced Linux regression test: exercises the real CLI binary with a non-rotating access log in an
-/// ungranted parent directory under Landlock, sends distinct HTTPS requests before and after a
-/// live CLI `reload`, and asserts the access log contains BOTH distinct request paths.
+/// Exercises the real CLI binary with a non-rotating access log in an ungranted parent directory
+/// under Landlock, sends distinct HTTPS requests before and after a live CLI `reload`, and
+/// asserts the access log contains BOTH distinct request paths.
 #[cfg(unix)]
 #[test]
 #[cfg_attr(

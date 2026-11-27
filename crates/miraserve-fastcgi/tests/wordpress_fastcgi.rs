@@ -273,10 +273,9 @@ fn cgi_response_parser_rejects_1xx_whitespace_colon_and_strips_framing_headers()
     Ok(())
 }
 
-/// Regression test: a graceful PHP-FPM reload drops connections for a moment and in-flight
-/// requests got 502. With `replay-safe-methods` a request without side effects is tried once
-/// more on a fresh connection; a POST is never sent twice. Without the setting (the default)
-/// nothing that reached the backend is sent again, because the backend may have run it.
+/// When a backend closes a connection without answering, `replay-safe-methods` retries a safe
+/// request once on a fresh connection while never sending a POST twice. Without the setting
+/// (the default), nothing that reached the backend is sent again.
 #[tokio::test]
 async fn connection_dropped_by_backend_is_replayed_only_when_enabled_and_never_for_post()
 -> TestResult {

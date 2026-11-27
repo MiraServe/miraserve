@@ -183,8 +183,8 @@ async fn wasm_audit_regressions_epoch_timeout_header_hygiene_and_offset0_preserv
     let timeout_cfg = WasmPluginConfig {
         module_path: "<timeout-test.wat>".to_owned(),
         max_memory: ByteSize::from_bytes(1024 * 1024),
-        // Give enough fuel (~several seconds of tight JIT loop even on fast Linux CPUs) so the
-        // 60ms preemptive epoch interruption ALWAYS wins deterministically over FuelExhausted.
+        // Set a large `max_fuel` budget so the 60 ms preemptive epoch timeout triggers
+        // `WasmError::Timeout` before fuel exhaustion.
         max_fuel: 5_000_000_000,
         timeout: Duration::from_millis(60),
         allow_outbound_hosts: Vec::new(),

@@ -1359,7 +1359,7 @@ impl AcmeManager {
                         &last_order_at,
                     )
                     .await;
-                // R5-ACME-2: Never spin at 100% CPU if no domain was ordered on the previous
+                // R5-ACME-2: Never busy-loop if no domain was ordered on the previous
                 // immediate pass; enforce a hard ceiling of 1 immediate re-entry before sleeping.
                 if newly_due_ready && consecutive_no_order_continues == 0 {
                     consecutive_no_order_continues += 1;

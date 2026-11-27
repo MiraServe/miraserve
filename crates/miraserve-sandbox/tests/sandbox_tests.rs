@@ -673,11 +673,8 @@ site "safe.example.test" {{ root "{}"; }}
     // `/usr/bin/id -u` succeeds cleanly on Unix.
     #[cfg(unix)]
     {
-        // This asserts that a quick command's output comes back, not how reliably a loaded test
-        // machine starts processes: on a box running a release build and a load generator the
-        // helper returned nothing twice (it cannot say whether the spawn failed, the command
-        // failed or the bound was hit). So it gets three attempts, and the failure message says
-        // how long each took.
+        // Retry `/usr/bin/id -u` up to 3 times and record each attempt's elapsed duration for
+        // failure diagnostics.
         let mut attempts = Vec::new();
         let mut uid_out = None;
         for _ in 0..3 {
@@ -891,10 +888,10 @@ site "sym.example" {{ root "{}" }}
     Ok(())
 }
 
-/// Real Linux Debian 12 VM catch: `/etc/ssl/certs/*.pem` are symlinks into
-/// `/usr/share/ca-certificates/...` and `/etc/resolv.conf` is often a symlink to
-/// `/run/systemd/resolve/stub-resolv.conf`. Landlock must include public distro CA target trees
-/// and canonical regular-file symlink targets without ever widening to `/etc/ssl/private`.
+/// Regression test: `/etc/ssl/certs/*.pem` may symlink into `/usr/share/ca-certificates/...` and
+/// `/etc/resolv.conf` may symlink to a regular file such as `/run/systemd/resolve/stub-resolv.conf`.
+/// Landlock must include public distro CA target trees and canonical regular-file symlink targets
+/// without widening to `/etc/ssl/private`.
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_landlock_includes_distro_ca_symlink_targets_without_private_keys()
@@ -1161,9 +1158,8 @@ site "a.example" {{
     Ok(())
 }
 
-/// Regression test: a reloaded site `root` that is a symlink inside a granted `read-tree`
-/// but points outside it was treated as covered, so the reload succeeded and the site answered
-/// 404. Coverage is decided on the real location, as the kernel does.
+/// A site `root` that is a symlink inside a granted `read-tree` pointing outside it must be
+/// reported as uncovered by `SandboxPolicy::uncovered_paths_in`.
 #[cfg(unix)]
 #[test]
 fn reload_coverage_follows_symlinks_out_of_a_granted_tree() -> TestResult {

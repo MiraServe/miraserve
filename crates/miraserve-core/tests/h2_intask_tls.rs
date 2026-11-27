@@ -1030,7 +1030,7 @@ fn h2_tls_single_conn_vs_multi_conn_wasm_cpu_bound() -> TestResult {
         let _mode = enter_in_task_h2_test_mode();
         let tmp = TempDir::new("wasm-cpu")?;
         let wat_path = tmp.path.join("burn.wat");
-        // Pure CPU loop (~200,000 iterations, ~1.2M fuel instructions) returning 200 OK.
+        // Pure CPU loop (400,000 iterations, within the 10,000,000 `max-fuel` cap) returning 200 OK.
         fs::write(
             &wat_path,
             r#"
@@ -1702,9 +1702,9 @@ fn h2_tls_wasm_concurrent_requests_meet_deadlines_cancel_and_trap() -> TestResul
         let trap_wat = tmp.path.join("trap.wat");
         let slow_wat = tmp.path.join("slow.wat");
 
-        // 2.5M iterations (within the 50M max-fuel cap): enough CPU work that 8 serialized on
-        // 1 core miss the calibrated deadline while 8 fanned across 4 worker threads finish inside
-        // it.
+        // 2,500,000-iteration CPU loop (within the 50,000,000 `max-fuel` cap). The test runs
+        // `CONCURRENT` requests concurrently against a calibrated per-request timeout and checks
+        // that all concurrent responses succeed and the executor counters record spawned streams.
         fs::write(
             &burn_wat,
             r#"
@@ -1833,8 +1833,7 @@ site "wasm-dl.h2it.test" {{
         }
         solo_samples.sort_unstable();
         let solo_ms = solo_samples.get(1).copied().unwrap_or(30).max(15);
-        // 5x solo: comfortably above 1 solo run (and ~2x solo across 4 cores), yet strictly below
-        // ~8x solo when 8 interleaved requests share 1 core.
+        // Calibrate the per-request timeout as 5x solo, clamped to 120..=5_000 ms.
         let deadline_ms = (solo_ms.saturating_mul(5)).clamp(120, 5_000);
         server.reload_from_str("h2it-wasm-dl-tight.kdl", &make_kdl(deadline_ms))?;
 

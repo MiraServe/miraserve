@@ -307,8 +307,8 @@ pub async fn serve_h3_connection_with_control(
 }
 
 /// How many streams of one connection may be reset by the server while Quinn holds a stop
-/// notification for them (about 100 bytes each, kept until the connection closes) before the
-/// connection takes no further requests (the client opens a new one).
+/// notification for them (kept until the connection closes) before the connection takes no
+/// further requests (the client opens a new one).
 const MAX_STALE_STOP_NOTIFICATIONS: u32 = 512;
 
 /// How long the peer's acknowledgement of an answer is waited for once its end is queued: a

@@ -1205,9 +1205,8 @@ async fn r8_sta_1_script_extension_token_rule_blocks_every_separator_and_keeps_r
     Ok(())
 }
 
-/// Regression test: `try-files "{path}" "{path}/" "=404"` previously answered
-/// 404 for `/` when the document root holds `index.php`, while `/sub/` worked. The site root
-/// must resolve its script index exactly like any subdirectory.
+/// With `try-files "{path}" "{path}/" "=404"` and a document root holding `index.php`, `/` must
+/// resolve to `/index.php` just as `/sub/` resolves to `/sub/index.php`.
 #[tokio::test]
 async fn try_files_resolves_script_index_for_the_site_root_like_a_subdirectory() -> TestResult {
     let tmp = TempDir::new("root-idx")?;

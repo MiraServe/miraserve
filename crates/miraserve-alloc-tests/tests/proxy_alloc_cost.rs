@@ -1196,14 +1196,17 @@ fn verify_allocator_attribution_is_exact() {
     );
 }
 
-/// Returns `(max_ops_per_req, max_bytes_per_req)` regression ceilings for `label` on platforms
-/// with configured ceilings (Linux and macOS). Returns `None` on other platforms so the harness
-/// still prints the table without asserting platform-specific ceilings.
+/// Returns `(max_ops_per_req, max_bytes_per_req)` regression ceilings for `label` on Linux and
+/// macOS, or `None` if `label` is absent from the platform table.
+///
+/// This function and its caller's ceiling assertions are compiled only on Linux and macOS; on
+/// other platforms the harness prints the measured table without asserting ceilings.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn regression_ceiling(label: &str) -> Option<(f64, f64)> {
     #[cfg(target_os = "linux")]
     let table: &[(&str, f64, f64)] = &[
-        // Regression ceilings guarding against per-request allocation ops/bytes regressions on Linux.
+        // Per-request (ops/req, bytes/req) regression ceilings on Linux; run this test with
+        // `--nocapture` to print current per-row values when updating ceilings.
         ("proxy_get_h1_shared", 22.5, 31_500.0),
         ("proxy_get_h2_shared", 21.0, 24_900.0),
         ("proxy_post_4k_h1_shared", 27.5, 47_100.0),
@@ -1219,7 +1222,8 @@ fn regression_ceiling(label: &str) -> Option<(f64, f64)> {
 
     #[cfg(target_os = "macos")]
     let table: &[(&str, f64, f64)] = &[
-        // Regression ceilings guarding against per-request allocation ops/bytes regressions on macOS.
+        // Per-request (ops/req, bytes/req) regression ceilings on macOS; run this test with
+        // `--nocapture` to print current per-row values when updating ceilings.
         ("proxy_get_h1_shared", 24.0, 31_500.0),
         ("proxy_get_h2_shared", 22.5, 24_800.0),
         ("proxy_post_4k_h1_shared", 39.0, 48_100.0),

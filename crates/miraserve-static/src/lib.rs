@@ -2607,11 +2607,11 @@ impl StaticServer {
 
     /// Whether a lookup may run on the calling thread.
     ///
-    /// On Linux a file below the document root is found with one confined `openat2` call (see
-    /// [`fast_open`]) without hopping to the blocking pool when the file is already cached. On
-    /// storage where a lookup turns out to be repeatedly slow (a cold disk, a network mount),
-    /// inline serving is paused for [`INLINE_PAUSE`] and every request goes through the blocking
-    /// pool; see [`Self::note_inline_lookup`].
+    /// On Linux an eligible hot lookup can use a confined `openat2` call (see [`fast_open`]) and
+    /// avoid a pool handoff; nonblocking callers also require `openat2` and `RESOLVE_CACHED`
+    /// support (see [`Self::inline_mode`]). When inline lookups are repeatedly slow, inline
+    /// serving is paused for [`INLINE_PAUSE`] and requests go through the blocking pool; see
+    /// [`Self::note_inline_lookup`].
     fn inline_allowed(&self) -> bool {
         FAST_LOOKUP_AVAILABLE
             && self.breaker_monotonic_ms() >= self.inline_paused_until_ms.load(Ordering::Acquire)
@@ -6910,9 +6910,8 @@ fn has_extension_token(leaf: &str, dot_ext: &str) -> bool {
     if dot_ext.len() < 2 {
         return false;
     }
-    // Every forbidden extension starts with '.', so an occurrence can only start at a '.' in
-    // the name: test those positions directly instead of building a substring searcher for each
-    // extension and each request (that was a few percent of a small static request).
+    // For extensions starting with '.', an occurrence can only start at a '.' in the name: test
+    // those positions directly instead of building a substring searcher for each extension.
     if dot_ext.starts_with('.') {
         let bytes = leaf.as_bytes();
         let ext = dot_ext.as_bytes();

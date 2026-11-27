@@ -3841,7 +3841,7 @@ server {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn r7_mig_8_13_14_16_17_snippet_bomb_source_root_sanitizer_bidi_and_nginx_dot_root() -> TestResult {
-    // 1. R7-MIG-8 & R7-MIG-17: Exponential Caddy snippet bomb fails at the expansion cap within the test bound.
+    // 1. R7-MIG-8 & R7-MIG-17: Exponential Caddy snippet bomb fails at the expansion cap within 250 ms.
     let mut bomb = String::from("(s0) {\n}\n");
     for n in 1..=7 {
         use std::fmt::Write as _;

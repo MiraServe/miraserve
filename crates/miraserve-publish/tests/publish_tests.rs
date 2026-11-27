@@ -1478,7 +1478,7 @@ fn publish_round3_preflight_site_binding_jti_replay_and_sync_hardening() -> Test
         "legitimate markup should pass preflight: {clean_v:?}"
     );
 
-    // 2. R3-PUB-6: 5,000 repeated unclosed `<style>` tags MUST reject in < 50ms (O(N), never O(N²))!
+    // 2. R3-PUB-6: 5,000 repeated unclosed `<style>` tags must reject within the 200 ms bound.
     let quad_payload = "<style>".repeat(5_000);
     let quad_bundle = SiteBundle {
         files: BTreeMap::from([("dos.html".to_owned(), quad_payload.into_bytes())]),
@@ -2463,9 +2463,9 @@ fn publish_round5_wave2_site_id_rebind_x509_dn_v2_allowlist_replay_and_preflight
 }
 
 /// Round 5 Wave 3 scanner regressions (`R5-PUB-8, 9, 10, 13, 14`):
-/// - `R5-PUB-8`: Eliminates quadratic DoS — 1 MB of nested `<div>` fails on the depth cap without
-///   quadratic backtracking, foster-parented `<table><i></i>` runs in linear time via O(1) linked
-///   sibling pointers, `max-size` short-circuits markup scanning, and >2 MiB single markup files fail fast.
+/// - `R5-PUB-8`: 1 MB of nested `<div>` hits the depth cap within 5 s (best of 3), 50k
+///   foster-parented `<table><i></i>` completes within 10 s, `max-size` short-circuits markup
+///   scanning, and >2 MiB single markup files are rejected.
 /// - `R5-PUB-9`: Ordinary valid pages pass without false positives (XHTML 1.0 DOCTYPE, `a < b`,
 ///   `&nbsp`, `<div/>`, duplicate `class`, stray `</p>`, nested `<a>`, empty `.html`,
 ///   `data:image/svg+xml` in `srcset`/`poster`/SVG `<image>`, `<script type="text/template">`,
@@ -2485,7 +2485,7 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
         PreflightCheck::CspValid,
     ];
 
-    // 1. R5-PUB-8: 1 MB of deeply nested `<div>` must hit the depth cap within the test bound.
+    // 1. R5-PUB-8: 1 MB of deeply nested `<div>` must hit the depth cap within the 5 s bound.
     let nested_divs = "<div>".repeat(210_000);
     assert!(nested_divs.len() > 1_000_000);
     let div_bundle = SiteBundle {
@@ -2509,14 +2509,13 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
             "expected depth limit violation, got: {div_v:?}"
         );
     }
-    // Use a generous 5 s wall-clock bound so unoptimised builds on loaded hosts do not flake,
-    // while still catching a regression to quadratic backtracking.
+    // Best-of-3 wall-clock bound (5 s) to tolerate unoptimised builds on loaded hosts.
     assert!(
         div_elapsed < std::time::Duration::from_secs(5),
         "1 MB nested <div> took {div_elapsed:?} at best of 3 (expected well under 5 s, R5-PUB-8)"
     );
 
-    // 1b. R5-PUB-8: Foster-parenting `<table>` + `<i></i>` x 50k runs in linear O(N) time within the bound.
+    // 1b. R5-PUB-8: Foster-parenting `<table>` + `<i></i>` x 50k completes within the 10 s bound.
     let foster = format!("<table>{}</table>", "<i></i>".repeat(50_000));
     let foster_bundle = SiteBundle {
         files: BTreeMap::from([("foster.html".to_owned(), foster.into_bytes())]),
@@ -2831,17 +2830,17 @@ fn r6_pub_3_importmap_and_speculationrules_enforce_same_origin_targets() {
     assert!(miraserve_publish::run_preflight_checks(&ok, &checks).is_empty());
 }
 
-/// R6-PUB-6: Bounds all four scanner DoS paths to linear/capped work and bounded RAM:
-/// 1. 190k-sibling SVG (1.9 MB) — no O(N^2) `text_pos_at` rescan
+/// R6-PUB-6: Exercises all four scanner DoS protections:
+/// 1. 180k-sibling SVG (< 2 MiB) — ratio check against a 45k-sibling SVG
 /// 2. Deeply nested XML/SVG (>512 depth) — explicit depth cap
-/// 3. HTML adoption-agency formatting-element attribute amplification (95 `<b>` × 20 × 1 KB + 2500 `<p>`)
+/// 3. HTML adoption-agency formatting-element attribute amplification (95 `<b>` × 20 × 900 B + 2,500 `<p>`)
 /// 4. Excessive attributes on a single HTML or SVG element (>1024 attrs)
 #[test]
 #[allow(clippy::too_many_lines)]
 fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() {
     let checks = vec![PreflightCheck::NoInlineScripts, PreflightCheck::CspValid];
 
-    // 1. 180k sibling `<g a="1"/>` SVG (~1.9 MB) must scan cleanly without quadratic hang. The
+    // 1. 180k sibling `<g a="1"/>` SVG (< 2 MiB) must scan cleanly without quadratic hang. The
     //    bound is a ratio against a quarter-size document scanned right before, so a loaded
     //    machine slows both alike: linear work gives about 4x, quadratic about 16x.
     let svg_with = |siblings: usize| {
@@ -3817,8 +3816,8 @@ fn r7_scan_3_prescan_rcdata_rawtext_and_svg_script_cannot_be_desynchronized() {
         );
     }
 
-    // Valid SVG `<title>` HTML-integration-point comment containing `<g ...>` is treated as a
-    // comment by BOTH prescan and html5ever and completes within the test bound.
+    // SVG `<title>` HTML-integration-point comment containing `<g ...>` with 2,000 attributes
+    // completes within the 250 ms bound.
     let svg_title_comment = format!(
         "<!doctype html><html><body><svg><title><!--</title><g{}>--></title></svg></body></html>",
         " a=1".repeat(2_000)

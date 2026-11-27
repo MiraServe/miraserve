@@ -2600,8 +2600,8 @@ site "{bad}" {{
     Ok(())
 }
 
-/// Regression test: W021 ("non-standard backend port without trusted-proxies") previously fired for an
-/// extra listener port next to :443 on a directly exposed server, and for `site "[::1]"`.
+/// Verifies that W021 does not fire for an extra listener port beside `:443` or for a bracketed
+/// IPv6 literal (`site "[::1]"`), while still warning for a non-standard port with a hostname.
 #[test]
 fn w021_ignores_an_extra_port_beside_443_and_bracketed_ipv6_site_names() {
     let has_w021 = |kdl: &str| match parse_kdl("w021.kdl", kdl) {

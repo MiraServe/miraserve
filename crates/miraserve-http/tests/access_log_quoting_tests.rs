@@ -1,7 +1,6 @@
-//! Access-log field forgery regression tests: `user_agent` and `referer` were previously written unquoted,
-//! so a visitor could send `User-Agent: x status=500 host=victim.test` and forge fields for any
-//! parser (statistics, fail2ban, bot detection). Client-supplied text must reach the logger as
-//! string values, which the formatter quotes and escapes.
+//! Access-log field quoting tests: client-supplied fields (`host`, `method`, `target`,
+//! `user_agent`, `referer`) must reach the logger as string values so the formatter quotes and
+//! escapes embedded spaces and quotes instead of allowing forged `key=value` tokens.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;

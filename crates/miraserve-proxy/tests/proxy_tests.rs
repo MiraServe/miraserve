@@ -1945,10 +1945,9 @@ async fn review4_health_probe_uses_configured_host_on_preserve_host_route() -> T
     Ok(())
 }
 
-/// Regression test: Two upstreams with one down (and no active health-check) must NOT
-/// return 502 on every second request; connect errors fail over transparently (including
-/// non-empty POST bodies before any bytes are polled), passively cool down the dead backend,
-/// recover after cooldown, and NEVER duplicate a POST whose body was already read by a backend.
+/// Two upstreams with one down (and no active health-check) must fail over on connect errors
+/// (including non-empty POST bodies before any bytes are sent), passively cool down the dead
+/// backend, retry after cooldown expires, and never duplicate a POST whose body was already read.
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn upstream_failover_retries_on_connect_error_ejects_passively_and_never_duplicates_sent_post()

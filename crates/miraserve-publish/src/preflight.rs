@@ -1410,8 +1410,7 @@ impl TokenSink for BoundedTokenSink {
 }
 
 /// Parses HTML5 in bounded 4 KiB chunks (`R5-PUB-8`, `R7-SCAN-3`) and aborts immediately on the
-/// first fatal parse error, DOM depth/node/attribute cap, or CPU-time deadline so adversarial
-/// inputs cannot trigger unbounded quadratic parsing.
+/// first fatal parse error, DOM depth/node/attribute cap, or scan deadline.
 fn parse_html_dom(markup: &str, scripting_enabled: bool, deadline: Duration) -> ArenaState {
     let abort_flag = Rc::new(Cell::new(false));
     let shared_state = Rc::new(RefCell::new(ArenaState::new(Rc::clone(&abort_flag))));

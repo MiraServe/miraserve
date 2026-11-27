@@ -936,7 +936,7 @@ async fn tls_round4_wave1_acme_ari_rollback_dir_mode_and_keyd_peer_uid() -> Test
 /// - `R5-ACME-3`: Crash-atomic `.bundle.pem` survives corrupted `.crt`/`.key` pairs on reload.
 /// - `R5-ACME-1` & `R5-ACME-2` & `R5-ACME-4`: Runs the REAL `run_renewal_loop_with_reload_check`
 ///   supervisor proving (a) a fresh in-memory cert suppresses re-ordering over a stale disk cert,
-///   (b) a fresher disk cert over an older in-memory cert does NOT spin at 100% CPU, and
+///   (b) a fresher disk cert over an older in-memory cert does NOT busy-loop, and
 ///   (c) `reload_notify` + `config_changed_fn` cleanly wakes and exits the supervisor for rebuild.
 /// - `R4-KEYD-1` / `R5-KEYD-1`: Live Unix `KeydServer` with `ExactPeerUid` rejects an unauthorized
 ///   UID via real kernel `SO_PEERCRED`/`LOCAL_PEERCRED` while admitting the exact authorized UID.
@@ -1103,7 +1103,7 @@ async fn tls_round5_wave1_acme_loop_bundle_atomicity_and_keyd_peer_rejection() -
 
     // 4. R5-ACME-2 & R5-ACME-4: Run the REAL `run_renewal_loop_with_reload_check` supervisor with
     //    both domains (one where memory is fresher than disk, one where disk is fresher than
-    //    memory). Verify it does NOT spin at 100% CPU (domains_fn called at most twice over
+    //    memory). Verify it does NOT busy-loop (`domains_fn` called at most twice over
     //    200ms) and exits cleanly when `reload_notify` fires with `config_changed_fn == true`!
     // Create a second domain where disk is fresher than memory:
     let (disk_fresh_cert, disk_fresh_key) = make_cert("diskfresh.example.test", 80 * 86_400)?;

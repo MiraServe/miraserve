@@ -73,9 +73,8 @@ mod tests {
     const WRITE_IDLE: Duration = Duration::from_secs(30);
     const CHUNK: u64 = 16 * 1024;
 
-    /// Regression test: a bursty HTTP/3 client reading well above `MIN_RATE` was cut prematurely
-    /// when flow control opened in periodic bursts (the first send of each burst waited while the
-    /// remaining seven chunks returned immediately).
+    /// Bursty delivery well above `MIN_RATE` (one chunk after 1.1 s followed by seven chunks at
+    /// 1 ms each, repeated for 120 bursts) must not trigger a cut.
     #[test]
     fn bursty_delivery_far_above_the_minimum_rate_is_not_cut() {
         let mut budget = StreamRateBudget::new(MIN_RATE, WRITE_IDLE);

@@ -359,11 +359,9 @@ dual_runtime_test!(
     -> Result<(), String>
 );
 
-/// Regression test: an HTTP/2 reader that buffers a large lead ahead of what it has drained and
-/// then leaves its window closed longer than `response-write-idle` while still reading must not be
-/// cut. Scaled parameters: minimum 100 kB/s, a reader at 150 kB/s that first takes 400 kB in one
-/// go, then gets 300 kB every 2 s (silences of 2 s, ten times `WRITE_IDLE`). It is never behind
-/// the minimum rate and must not be cut.
+/// A reader that banks a burst ahead of `MIN_RATE_BPS` and then pauses longer than `WRITE_IDLE`
+/// between bursts while staying above the minimum rate must not be cut: minimum 100 kB/s, initial
+/// 400 kB burst, then 300 kB every 2 s (10x `WRITE_IDLE`) for 9 s.
 async fn review_round6_reader_spending_its_lead_through_long_silences_is_not_cut_impl() {
     let io = WriteGuardedIo::new(
         BurstyKernel::new(vec![
@@ -420,10 +418,9 @@ dual_runtime_test!(
     -> io::Result<()>
 );
 
-/// Regression test: an HTTP/1.1 client that stopped reading a large download remained connected
-/// far past `write-idle` when the allowance followed the kernel's autotuned send buffer.
-/// On Linux `for_tcp_stream` bounds the unsent queue (`TCP_NOTSENT_LOWAT`, 32 KiB), so the cut
-/// comes at `write-idle + 32 KiB / min-rate` whatever the send buffer is: here 1 s + 0.5 s.
+/// On Linux `for_tcp_stream` sets `TCP_NOTSENT_LOWAT` to 32 KiB, so a stalled TCP peer is cut
+/// on `write-idle + 32 KiB / min-rate` (here 1 s + 0.5 s, asserted in 900 ms..=8 s) even with a
+/// 4 MiB `SO_SNDBUF`.
 #[cfg(target_os = "linux")]
 async fn real_socket_reader_that_stops_is_cut_on_a_fixed_schedule_impl() -> Result<(), String> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

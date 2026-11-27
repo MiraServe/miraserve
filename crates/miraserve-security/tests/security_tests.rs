@@ -1176,8 +1176,8 @@ async fn round5_wave4_shared_ip_nat_idle_returning_keys_atomic_cap_paused_upload
 #[allow(clippy::too_many_lines)]
 fn r6_rl_1_shared_ip_slot_eviction_and_fair_share_ceiling_prevent_single_user_starvation()
 -> TestResult {
-    // Part A: Slot exhaustion — attacker mints 64 keys in 38s and keeps all 64 alive with 64 req/min;
-    // victim sends 300 requests over 5 minutes (1 req/sec) and MUST NOT be starved (0/300 -> 300/300)!
+    // Part A: Slot exhaustion — attacker mints 64 keys and keeps them alive at 1 req/s;
+    // victim sends 300 requests over 5 minutes (1 req/s) and must get at least 290 admitted.
     let slot_rl = GcraRateLimiter::from_config(&RateLimitConfig {
         requests: 100,
         per: Duration::from_secs(60),

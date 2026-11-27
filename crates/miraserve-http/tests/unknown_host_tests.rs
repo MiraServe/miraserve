@@ -1,6 +1,5 @@
-//! A server that hosts sites must not answer for hostnames it does not serve, and must not
-//! describe itself to them. Regression: an unknown hostname over HTTPS
-//! got `200` and the built-in welcome page, which shows the TLS and sandbox state.
+//! A server that hosts sites must not answer for hostnames it does not serve (returns `421`),
+//! and must not describe itself to them. A configuration with no sites still returns `200`.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -93,9 +92,9 @@ server {
     Ok(())
 }
 
-/// Regression test: a custom error page that is missing, or is a symlink leaving the
-/// site root, stopped the whole server at the next start. The file belongs to the site owner,
-/// so the engine must still build and that status must fall back to the built-in page.
+/// A custom error page that is missing or is a symlink leaving the site root must not fail
+/// `HttpEngine::from_config`; the site keeps serving and that status falls back to the built-in
+/// page without exposing the symlink target.
 #[cfg(unix)]
 #[tokio::test]
 async fn unloadable_custom_error_pages_fall_back_instead_of_failing_the_engine() -> TestResult {
@@ -192,9 +191,8 @@ site "a.example.test" {{
     Ok(())
 }
 
-/// Regression test: an ABSOLUTE `error-pages` path that is a symlink to another account's file
-/// was followed, and that file's content became the 404 body. A symlinked absolute page is
-/// refused, inside or outside the site root, and the built-in page is used.
+/// A symlinked absolute `error-pages` path is refused, inside or outside the site root, and the
+/// built-in page is used instead of the symlink target.
 #[cfg(unix)]
 #[tokio::test]
 async fn absolute_error_page_symlink_is_never_served() -> TestResult {

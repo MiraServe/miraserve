@@ -846,10 +846,9 @@ mod tests {
         }
     }
 
-    /// Direct black-box regression check against `looks_like_secret_token` itself (with no counter
-    /// scaffolding) so even an uninstrumented inner suffix `.contains(&b'.')` fails cleanly:
-    /// on 20,000 repeated `eyJ` markers (60 KiB), a quadratic suffix scan scales quadratically
-    /// while the linear scanner stays within a constant factor of a same-length non-`eyJ` string.
+    /// Direct black-box check against `looks_like_secret_token` (with no counter scaffolding):
+    /// on 20,000 repeated `eyJ` markers, the best-of-5 scan time stays within 30x of a
+    /// same-length non-`eyJ` control string (floored at 1 ms).
     #[test]
     fn looks_like_secret_token_direct_scaling_rejects_quadratic_suffix_scan() {
         use std::time::{Duration, Instant};

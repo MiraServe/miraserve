@@ -1,5 +1,5 @@
 //! Real-TCP integration tests for large streamed static files over HTTP/1.1 and HTTP/2:
-//! - Live-site deploy styles (matching 0.1.4 behaviour) with in-flight requests and
+//! - Live-site deploy styles with in-flight requests and
 //!   SHA-256 body hash verification:
 //!   1. `rsync`-style write-to-temp-and-rename
 //!   2. `rsync --inplace`-style overwrite (shorter -> protocol failed/short; equal-length ->
