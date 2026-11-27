@@ -5,11 +5,6 @@
 //! custom error pages. A file that is missing, unreadable, malformed or inside a served
 //! document root does not stop the server or a reload: that one area answers every request
 //! with 503 (fail closed) and the problem is logged; `miraserve check --fs` reports it first.
-//!
-//! Each visitor address gets [`MAX_FAILURES_PER_MINUTE`] failed
-//! attempts per area (counted for one to two minutes, see [`FailureTable`]) before it is
-//! answered with 429 without any bcrypt work. A successful check is remembered for
-//! [`VERIFIED_TTL`].
 
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasher as _;
