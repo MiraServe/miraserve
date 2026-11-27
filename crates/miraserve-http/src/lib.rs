@@ -3471,10 +3471,6 @@ const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 /// allowance in [`WriteGuardedIo`], not by this constant.
 const NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 
-/// Largest lead over the minimum rate a client can bank in one backpressure episode, and so the
-/// longest extra silence it can buy:
-/// `MAX_READER_LEAD_BYTES / min-response-rate`.
-///
 /// Caps the write-idle allowance credited for bytes already accepted ahead of the minimum rate
 /// (`WriteGuardedIo::reader_lead`, `WriteGuardedIo::idle_limit`).
 const MAX_READER_LEAD_BYTES: u64 = 1024 * 1024;

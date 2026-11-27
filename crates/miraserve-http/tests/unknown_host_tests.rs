@@ -1,5 +1,5 @@
 //! A server that hosts sites must not answer for hostnames it does not serve (returns `421`),
-//! and must not describe itself to them. A configuration with no sites still returns `200`.
+//! and must not describe itself to them.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;

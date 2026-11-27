@@ -303,9 +303,6 @@ pub async fn serve_h3_connection_with_control(
     address_view.close(H3_NO_ERROR, b"");
 }
 
-/// How many streams of one connection may be reset by the server while Quinn holds a stop
-/// notification for them before the server
-/// stops accepting further requests on that connection.
 const MAX_STALE_STOP_NOTIFICATIONS: u32 = 512;
 
 /// How long the peer's acknowledgement of an answer is waited for once its end is queued: a
