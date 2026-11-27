@@ -79,7 +79,8 @@ pub(crate) struct CheckArgs {
 
     /// Opt-in Linux-only check (requires `--fs`); its only warning code is `W034`; it also prints
     /// notes. It does not change what the server does (without it, the processing of a
-    /// configuration is the same as in 0.1.6; with it, existing `--fs` probes still run). Walks the
+    /// configuration is the same as in 0.1.6 apart from the Linux `--fs` Landlock probe `W035`;
+    /// with it, existing `--fs` probes still run). Walks the
     /// directories on the way to five kinds of configured paths and stops at the first component it
     /// reports or does not find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets,
     /// `keyd-socket` (path of the endpoint the server connects to), ACME dir (`--acme-dir` or
