@@ -1,7 +1,7 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.singleton.1.6.0.schema.json
 # WinGet singleton manifest template — updated automatically on tagged GitHub Releases.
 PackageIdentifier: MiraServe.MiraServe
-PackageVersion: 0.1.6
+PackageVersion: 0.1.7
 PackageLocale: en-US
 Publisher: MiraServe Contributors
 PublisherUrl: https://github.com/miraserve/miraserve
@@ -34,7 +34,7 @@ Installers:
     NestedInstallerFiles:
       - RelativeFilePath: miraserve.exe
         PortableCommandAlias: miraserve
-    InstallerUrl: https://github.com/miraserve/miraserve/releases/download/v0.1.6/miraserve-v0.1.6-x86_64-pc-windows-msvc.zip
+    InstallerUrl: https://github.com/miraserve/miraserve/releases/download/v0.1.7/miraserve-v0.1.7-x86_64-pc-windows-msvc.zip
     InstallerSha256: REPLACE_WITH_RELEASE_SHA256
 ManifestType: singleton
 ManifestVersion: 1.6.0

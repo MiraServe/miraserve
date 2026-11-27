@@ -2,7 +2,7 @@
 
 MiraServe is licensed under Apache-2.0 OR MIT (see `LICENSE-APACHE` and `LICENSE-MIT`). A MiraServe binary also
 contains the third-party components listed below, each under its own license. This file lists every crate in
-the dependency graph of the `miraserve` binary at version 0.1.6 (normal and build dependencies for all supported
+the dependency graph of the `miraserve` binary at version 0.1.7 (normal and build dependencies for all supported
 platforms; a given platform's binary contains a subset), followed by the license and notice texts those crates
 ship, with identical texts printed once. It was generated from `Cargo.lock` with `cargo metadata` and the license
 files inside each crate's published source.
