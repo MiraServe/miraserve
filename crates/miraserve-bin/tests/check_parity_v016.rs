@@ -1,5 +1,6 @@
-//! Byte-for-byte parity oracle comparing `miraserve check` (without `--trusted-paths`) against
-//! fixtures recorded from `v0.1.6` (`a4c2ffc`).
+//! Byte-for-byte parity oracle comparing configuration processing of `miraserve check` (without
+//! `--trusted-paths`; `check --help` lists the new flag) against fixtures recorded from `v0.1.6`
+//! (`a4c2ffc`).
 //!
 //! Run with `MIRASERVE_PARITY_BIN=/path/to/miraserve` to verify any binary (such as a `v0.1.6`
 //! build) against the committed fixtures, or with `RECORD_V016_PARITY=1` and
@@ -413,7 +414,7 @@ fn build_corpus(
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn check_without_trusted_paths_matches_v016_byte_for_byte() -> TestResult {
+fn check_config_processing_without_trusted_paths_matches_v016_byte_for_byte() -> TestResult {
     let Some(profile) = fixture_profile() else {
         return Ok(());
     };

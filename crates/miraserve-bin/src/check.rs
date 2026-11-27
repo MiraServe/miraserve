@@ -80,7 +80,11 @@ pub(crate) struct CheckArgs {
     /// Opt-in Linux-only diagnostic (requires `--fs`) emitting `W034` (reports, never enforces) on
     /// six classes: socket-tree roots, exact `fastcgi-pass` unix sockets, `keyd-socket`, ACME dir,
     /// `ai-publish` storage, and rotating log parents. Pass verifies `/` ancestors (root/service
-    /// uid, not g/o-writable; sticky allows trusted existing child), symlinks, absence, local FS.
+    /// uid, not g/o-writable; sticky allows trusted existing child), leaf type/role, symlinks, and
+    /// absent prefixes on ordinary local mounts (assumes no identity-mapped mounts and no other
+    /// writable view of the same directories); relative paths and stacked filesystems report not
+    /// verified. Performs no writes and opens no file for reading (reading a symlink can update
+    /// atime); like `--fs`, can wait on an unresponsive network or userspace filesystem.
     #[arg(long)]
     pub(crate) trusted_paths: bool,
 
@@ -712,7 +716,8 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                             | "W034"
                     )
                 }) {
-                    if args.writable_set {
+                    let san = args.writable_set || extra_warn.code == "W034";
+                    if san {
                         let _ = SanitizingLineWriter::new(&mut stderr).write_line(&format!(
                             "warning[{}]: {}",
                             extra_warn.code, extra_warn.message
@@ -727,7 +732,7 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                     if matches!(extra_warn.code.as_str(), "W033" | "W034")
                         && let Some(help) = &extra_warn.help
                     {
-                        if args.writable_set {
+                        if san {
                             let _ = SanitizingLineWriter::new(&mut stderr)
                                 .write_line(&format!("  help: {help}"));
                         } else {
@@ -737,8 +742,11 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                 }
                 // P2 #6: Print the root / indeterminate FastCGI socket access notes in text mode
                 // on failed runs too, once each, after the warnings.
+                if failed || args.writable_set || args.quiet {
+                    write_tp_notes(&mut stderr, &trusted_path_notes);
+                }
                 if failed {
-                    for note in trusted_path_notes.iter().chain(&socket_access_notes) {
+                    for note in &socket_access_notes {
                         if args.writable_set {
                             let _ = SanitizingLineWriter::new(&mut stderr)
                                 .write_line(&format!("note: {note}"));
@@ -995,7 +1003,8 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                     pqc_label,
                     summary.warnings,
                 );
-                for note in &notes {
+                write_tp_notes(&mut stdout, &trusted_path_notes);
+                for note in notes.iter().skip(trusted_path_notes.len()) {
                     let _ = writeln!(stdout, "note: {note}");
                 }
             }
@@ -2661,6 +2670,13 @@ fn collect_filesystem_issues_classified(
 }
 
 fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {
+    let err_notes: Vec<String> = if !args.trusted_paths {
+        Vec::new()
+    } else if cfg!(target_os = "linux") {
+        vec!["trusted-paths: configuration invalid; no paths were verified".into()]
+    } else {
+        vec!["--trusted-paths is Linux-only; no paths were verified".into()]
+    };
     match args.format {
         OutputFormat::Json => {
             let (source, io_error) = match err {
@@ -2676,7 +2692,7 @@ fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {
                 summary: None,
                 errors: err.validation_errors().to_vec(),
                 warnings: err.validation_warnings().to_vec(),
-                notes: Vec::new(),
+                notes: err_notes,
                 io_error,
                 config: None,
             };
@@ -2729,10 +2745,18 @@ fn handle_error(err: &ConfigError, args: &CheckArgs) -> ExitCode {
                     }
                 }
             }
+            write_tp_notes(&mut stderr, &err_notes);
         }
     }
 
     ExitCode::FAILURE
+}
+
+fn write_tp_notes(w: impl io::Write, notes: &[String]) {
+    let mut san = SanitizingLineWriter::new(w);
+    for note in notes {
+        let _ = san.write_line(&format!("note: {note}"));
+    }
 }
 
 fn write_json_report(report: &JsonCheckReport<'_>) {

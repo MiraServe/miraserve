@@ -94,7 +94,7 @@ fn flag_trusted_paths_without_fs_is_usage_error() -> TestResult {
 }
 
 #[test]
-fn check_help_documents_narrowed_scope_and_d3_without_overclaiming() -> TestResult {
+fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
     let out = Command::new(miraserve_bin())
         .args(["check", "--help"])
         .output()?;
@@ -110,14 +110,22 @@ fn check_help_documents_narrowed_scope_and_d3_without_overclaiming() -> TestResu
     assert!(help.contains("ACME"), "help:\n{help}");
     assert!(help.contains("ai-publish"), "help:\n{help}");
     assert!(help.contains("rotating log"), "help:\n{help}");
+    let norm = help.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        !help.to_ascii_lowercase().contains("race-free"),
-        "help:\n{help}"
+        norm.contains("assumes no identity-mapped mounts and no other writable view"),
+        "help:\n{norm}"
     );
+    assert!(norm.contains("stacked filesystems"), "help:\n{norm}");
+    assert!(norm.contains("atime"), "help:\n{norm}");
     assert!(
-        !help.to_ascii_lowercase().contains("secure layout"),
-        "help:\n{help}"
+        norm.contains("unresponsive network or userspace filesystem"),
+        "help:\n{norm}"
     );
+    let lower = norm.to_ascii_lowercase();
+    assert!(!lower.contains("race-free"), "help:\n{help}");
+    assert!(!lower.contains("secure layout"), "help:\n{help}");
+    assert!(!lower.contains("changes nothing"), "help:\n{help}");
+    assert!(!lower.contains("never pass"), "help:\n{help}");
     Ok(())
 }
 
@@ -139,6 +147,7 @@ fn non_linux_trusted_paths_prints_plain_note_and_zero_w034() -> TestResult {
             kdl_escape_path(&root),
         ),
     )?;
+    let note_line = "note: --trusted-paths is Linux-only; no paths were verified\n";
 
     let text = Command::new(miraserve_bin())
         .args(["check", "--fs", "--strict", "--trusted-paths"])
@@ -147,10 +156,7 @@ fn non_linux_trusted_paths_prints_plain_note_and_zero_w034() -> TestResult {
     assert_eq!(text.status.code(), Some(0));
     let stdout = String::from_utf8(text.stdout)?;
     let stderr = String::from_utf8(text.stderr)?;
-    assert!(
-        stdout.contains("note: --trusted-paths is Linux-only; no paths were verified\n"),
-        "stdout:\n{stdout}"
-    );
+    assert!(stdout.contains(note_line), "stdout:\n{stdout}");
     assert!(!stderr.contains("W034"), "stderr:\n{stderr}");
 
     let json_out = Command::new(miraserve_bin())
@@ -181,6 +187,43 @@ fn non_linux_trusted_paths_prints_plain_note_and_zero_w034() -> TestResult {
         ]))
     );
 
+    // P2-7: `--writable-set` keeps stdout machine-readable and prints the note on stderr.
+    let ws = Command::new(miraserve_bin())
+        .args(["check", "--fs", "--trusted-paths", "--writable-set"])
+        .arg(&cfg)
+        .output()?;
+    assert_eq!(ws.status.code(), Some(0));
+    let ws_out = String::from_utf8(ws.stdout)?;
+    let ws_err = String::from_utf8(ws.stderr)?;
+    assert!(ws_out.starts_with("landlock "), "stdout:\n{ws_out}");
+    assert!(!ws_out.contains("note:"), "stdout:\n{ws_out}");
+    assert_eq!(ws_err, note_line);
+
+    // P2-7: `--quiet` keeps stdout empty and prints the note on stderr.
+    let q = Command::new(miraserve_bin())
+        .args(["check", "--fs", "--trusted-paths", "--quiet"])
+        .arg(&cfg)
+        .output()?;
+    assert_eq!(q.status.code(), Some(0));
+    assert_eq!(String::from_utf8(q.stdout)?, "");
+    assert_eq!(String::from_utf8(q.stderr)?, note_line);
+
+    // P2-7: invalid KDL with `--trusted-paths` still carries the Linux-only note.
+    let bad_cfg = base.join("bad.kdl");
+    fs::write(&bad_cfg, "not valid kdl {{{")?;
+    let bad_json = Command::new(miraserve_bin())
+        .args(["check", "--fs", "--trusted-paths", "--format", "json"])
+        .arg(&bad_cfg)
+        .output()?;
+    assert_eq!(bad_json.status.code(), Some(1));
+    let bad_val: serde_json::Value = serde_json::from_slice(&bad_json.stdout)?;
+    assert_eq!(
+        bad_val.get("notes"),
+        Some(&serde_json::json!([
+            "--trusted-paths is Linux-only; no paths were verified"
+        ]))
+    );
+
     let _ = fs::remove_dir_all(&base);
     Ok(())
 }
@@ -199,6 +242,57 @@ mod linux_tests {
         read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, \
         acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, \
         mcp-gateway, wasm-plugin, or non-rotating log paths";
+
+    const TREE_WR_LITERAL: &str =
+        "group or other writable (other accounts can create or replace sockets in this tree)";
+
+    fn fs_magic_of(path: &str) -> Result<u32, std::io::Error> {
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let sf = rustix::fs::fstatfs(&fd).map_err(std::io::Error::from)?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(sf.f_type as u32)
+    }
+
+    fn is_accepted_local_fs(m: u32) -> bool {
+        matches!(
+            m,
+            0xEF53
+                | 0x5846_5342
+                | 0x9123_683E
+                | 0x0102_1994
+                | 0x2FC1_2FC1
+                | 0xF2F5_2010
+                | 0xCA45_1A4E
+                | 0x8584_58F6
+                | 0x7371_7368
+                | 0xE0F5_E1E2
+                | 0x3153_464A
+                | 0x5265_4973
+                | 0x0001_1954
+        )
+    }
+
+    /// Returns `true` when both `/` and `/tmp` sit on an accepted non-stacking local POSIX
+    /// filesystem (e.g. ext4/xfs/btrfs/tmpfs, not overlayfs). When running inside an overlayfs
+    /// container, CLI tests that must traverse past `/` report the environment and return early.
+    fn require_local_root_fs(test_name: &str) -> Result<bool, std::io::Error> {
+        for p in ["/", "/tmp"] {
+            let m = fs_magic_of(p)?;
+            if !is_accepted_local_fs(m) {
+                eprintln!(
+                    "skipping {test_name}: {p} is on filesystem 0x{m:x} (not an accepted non-stacking local POSIX filesystem)"
+                );
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 
     fn make_pub_key(dir: &Path) -> Result<PathBuf, std::io::Error> {
         let p = dir.join("publish.pub");
@@ -280,10 +374,15 @@ mod linux_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn linux_trusted_chain_all_six_classes_and_narrowed_exclusions() -> TestResult {
+        if !require_local_root_fs("linux_trusted_chain_all_six_classes_and_narrowed_exclusions")? {
+            return Ok(());
+        }
         let base = make_temp_base("clean")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let pub_key = make_pub_key(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
         let sock_dir = base.join("php");
         let acme_dir = base.join("acme");
         let store_dir = base.join("store");
@@ -302,6 +401,22 @@ mod linux_tests {
         // Stage 1a MUST NOT inspect them!
         set_mode(&uncov_bad, 0o777)?;
 
+        // When running as root, set `sandbox.user "1000"` and chown `acme_dir` to uid 1000
+        // because ACME requires service-uid ownership (P1-5).
+        let (sb_user_line, expected_obs) = if euid == 0 {
+            rustix::fs::chown(
+                &acme_dir,
+                Some(rustix::fs::Uid::from_raw(1000)),
+                Some(rustix::fs::Gid::from_raw(1000)),
+            )?;
+            (
+                "user \"1000\"; ",
+                "trusted-paths: running as root; trusting uid 0 and service uid 1000 (from server.sandbox.user '1000')".to_owned(),
+            )
+        } else {
+            ("", expected_default_observer_note())
+        };
+
         let sock = sock_dir.join("pool.sock");
         let _listener = UnixListener::bind(&sock)?;
         set_mode(&sock, 0o660)?;
@@ -313,7 +428,7 @@ mod linux_tests {
                 "server {{\n\
                      listen \":443\"\n\
                      tls {{ cert \"{}\"; key \"{}\" }}\n\
-                     sandbox {{ read-tree \"{}\"; socket-tree \"{}\" }}\n\
+                     sandbox {{ {sb_user_line}read-tree \"{}\"; socket-tree \"{}\" }}\n\
                  }}\n\
                  site \"tp.example\" {{\n\
                      root \"{}\"\n\
@@ -355,13 +470,11 @@ mod linux_tests {
         assert_eq!(code, Some(0), "clean json: {val}");
         assert_eq!(val.get("valid"), Some(&serde_json::Value::Bool(true)));
         assert!(w034s(&val).is_empty(), "expected 0 W034, got: {val}");
-        assert_eq!(
-            note_at(&val, 0),
-            Some(expected_default_observer_note().as_str())
-        );
+        assert_eq!(note_at(&val, 0), Some(expected_obs.as_str()));
         assert_eq!(note_at(&val, 1), Some(NARROWED_NOTE_LITERAL));
 
-        // Clean keyd-socket (split-daemon, absent socket in trusted parent) emits 0 W034.
+        // Clean keyd-socket (split-daemon, absent socket in trusted parent) emits 0 W034
+        // AND emits the P2-1 verified-prefix note naming `sock_dir` and `keyd.sock`.
         let keyd_sock = sock_dir.join("keyd.sock");
         let keyd_cfg = base.join("keyd.kdl");
         fs::write(
@@ -383,14 +496,32 @@ mod linux_tests {
             w034s(&kval).is_empty(),
             "clean keyd must emit 0 W034: {kval}"
         );
+        assert_eq!(
+            note_at(&kval, 2),
+            Some(
+                format!(
+                    "trusted-paths: server.tls.keyd-socket '{}': verified existing prefix '{}' \
+                     (stopped at absent component 'keyd.sock')",
+                    keyd_sock.display(),
+                    sock_dir.display()
+                )
+                .as_str()
+            )
+        );
 
         let _ = fs::remove_dir_all(&base);
         Ok(())
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn linux_group_and_other_writable_first_component_strict_allow_and_writable_set() -> TestResult
     {
+        if !require_local_root_fs(
+            "linux_group_and_other_writable_first_component_strict_allow_and_writable_set",
+        )? {
+            return Ok(());
+        }
         let base = make_temp_base("writable")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let pub_key = make_pub_key(&base)?;
@@ -484,7 +615,8 @@ mod linux_tests {
             "stderr:\n{stderr}"
         );
 
-        // 4. `--writable-set` keeps stdout strictly machine-readable (no `note:` lines on stdout).
+        // 4. `--writable-set` keeps stdout strictly machine-readable (no `note:` lines on stdout)
+        //    and emits W034 + trusted-paths notes on stderr (P2-7).
         let ws_out = Command::new(miraserve_bin())
             .args(["check", "--fs", "--trusted-paths", "--writable-set"])
             .arg(&cfg)
@@ -495,6 +627,23 @@ mod linux_tests {
         assert!(ws_stdout.starts_with("landlock "), "stdout:\n{ws_stdout}");
         assert!(!ws_stdout.contains("note:"), "stdout:\n{ws_stdout}");
         assert!(ws_stderr.contains("warning[W034]:"), "stderr:\n{ws_stderr}");
+        assert!(
+            ws_stderr.contains(&format!("note: {}\n", expected_default_observer_note())),
+            "stderr:\n{ws_stderr}"
+        );
+
+        // 5. `--quiet` keeps stdout empty and still emits W034 + trusted-paths notes on stderr (P2-7).
+        let q_out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--trusted-paths", "--quiet"])
+            .arg(&cfg)
+            .output()?;
+        assert_eq!(q_out.status.code(), Some(0));
+        assert_eq!(String::from_utf8(q_out.stdout)?, "");
+        let q_stderr = String::from_utf8(q_out.stderr)?;
+        assert!(
+            q_stderr.contains(&format!("note: {}\n", expected_default_observer_note())),
+            "stderr:\n{q_stderr}"
+        );
 
         let _ = fs::remove_dir_all(&base);
         Ok(())
@@ -503,6 +652,11 @@ mod linux_tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn linux_sticky_directory_existing_trusted_missing_child_and_sticky_leaf() -> TestResult {
+        if !require_local_root_fs(
+            "linux_sticky_directory_existing_trusted_missing_child_and_sticky_leaf",
+        )? {
+            return Ok(());
+        }
         let base = make_temp_base("sticky")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let pub_key = make_pub_key(&base)?;
@@ -570,7 +724,7 @@ mod linux_tests {
             Some(
                 format!(
                     "server.sandbox socket-tree root '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): group or other writable",
+                     (uid {euid}, mode 1777): {TREE_WR_LITERAL}",
                     sticky.display(),
                     sticky.display()
                 )
@@ -586,7 +740,7 @@ mod linux_tests {
             Some(
                 format!(
                     "site 'tp.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component under a parent where another account could create it",
+                     (uid {euid}, mode 1777): missing component 'absent_mid' under a parent where another account could create it",
                     missing_deep.display(),
                     sticky.display()
                 )
@@ -602,7 +756,7 @@ mod linux_tests {
             Some(
                 format!(
                     "ACME directory '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component under a parent where another account could create it",
+                     (uid {euid}, mode 1777): missing component 'absent_acme' under a parent where another account could create it",
                     missing_direct.display(),
                     sticky.display()
                 )
@@ -618,6 +772,10 @@ mod linux_tests {
     #[allow(clippy::too_many_lines)]
     fn linux_symlinks_relative_acme_loop_and_non_lexical_dotdot() -> TestResult {
         use std::os::unix::fs::symlink;
+
+        if !require_local_root_fs("linux_symlinks_relative_acme_loop_and_non_lexical_dotdot")? {
+            return Ok(());
+        }
 
         let base = make_temp_base("symlinks")?;
         let (cert, key) = gen_dev_cert(&base)?;
@@ -859,104 +1017,130 @@ mod linux_tests {
             )
         );
 
+        // P2-5: writable suffix AFTER a trusted symlink must NOT blame the symlink.
+        let bad_later = good_target_a.join("bad_later");
+        fs::create_dir_all(&bad_later)?;
+        set_mode(&bad_later, 0o777)?;
+        let suffix_cfg = base.join("sym_suffix.kdl");
+        fs::write(
+            &suffix_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"sf.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}/bad_later/p.sock\" }} }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&abs_ok_link),
+            ),
+        )?;
+        let (_sc, sval) = run_json(&["--fs", "--trusted-paths"], &suffix_cfg)?;
+        let sws = w034s(&sval);
+        assert_eq!(sws.len(), 1, "writable suffix must emit 1 W034: {sval}");
+        assert_eq!(
+            sws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'sf.example' FastCGI Unix socket '{}/bad_later/p.sock': first untrusted \
+                     component '{}' (uid {euid}, mode 0777): group or other writable",
+                    abs_ok_link.display(),
+                    bad_later.display()
+                )
+                .as_str()
+            )
+        );
+
         let _ = fs::remove_dir_all(&base);
         Ok(())
     }
 
     #[test]
-    fn linux_relative_paths_walk_cwd_from_root() -> TestResult {
-        let base = make_temp_base("relcwd")?;
-        let docroot = base.join("www");
-        let good_cwd = base.join("good_cwd");
-        let good_acme = good_cwd.join(".miraserve-acme");
-        let bad_cwd = base.join("bad_cwd");
-        let bad_acme = bad_cwd.join(".miraserve-acme");
+    fn linux_p2_verified_prefix_newline_sanitization_and_invalid_kdl_note() -> TestResult {
+        if !require_local_root_fs(
+            "linux_p2_verified_prefix_newline_sanitization_and_invalid_kdl_note",
+        )? {
+            return Ok(());
+        }
+        let base = make_temp_base("p2-notes")?;
+        let (cert, key) = gen_dev_cert(&base)?;
         let euid = rustix::process::geteuid().as_raw();
-        for d in [&docroot, &good_cwd, &good_acme, &bad_cwd, &bad_acme] {
+        let docroot = base.join("www");
+        let trusted_parent = base.join("trusted_state");
+        let nl_dir = base.join("nl\ndir");
+        for d in [&docroot, &trusted_parent, &nl_dir] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
-        set_mode(&good_acme, 0o700)?;
-        set_mode(&bad_acme, 0o700)?;
-        set_mode(&bad_cwd, 0o777)?;
+        set_mode(&nl_dir, 0o775)?;
 
-        let cfg = base.join("rel.kdl");
+        let cfg = base.join("p2.kdl");
         fs::write(
             &cfg,
             format!(
-                "server {{\n\
-                     listen \":443\"\n\
-                     tls {{ acme {{ email \"ops@example.com\"; challenge \"tls-alpn-01\" }} }}\n\
-                 }}\n\
-                 site \"rel.example\" {{ root \"{}\" }}\n",
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"p2.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:{}/future/pool.sock\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
                 kdl_escape_path(&docroot),
+                kdl_escape_path(&trusted_parent),
             ),
         )?;
 
-        // Relative default `.miraserve-acme` and relative `--log-file app.log` (parent `.`)
-        // under trusted `good_cwd` -> 0 W034!
-        let (ok_code, ok_val) = run_json_in(
-            &[
-                "--fs",
-                "--trusted-paths",
-                "--log-file",
-                "app.log",
-                "--log-max-bytes",
-                "1024",
-            ],
-            &cfg,
-            Some(&good_cwd),
-        )?;
-        assert_eq!(ok_code, Some(0), "good cwd json: {ok_val}");
-        assert!(
-            w034s(&ok_val).is_empty(),
-            "good cwd must emit 0 W034: {ok_val}"
+        // 1. P2-1: absent suffix under trusted parent emits verified-prefix note naming where walk stopped.
+        let (ok_code, ok_val) = run_json(&["--fs", "--strict", "--trusted-paths"], &cfg)?;
+        assert_eq!(ok_code, Some(0), "absent under trusted must pass: {ok_val}");
+        assert!(w034s(&ok_val).is_empty(), "ok_val: {ok_val}");
+        assert_eq!(
+            note_at(&ok_val, 2),
+            Some(
+                format!(
+                    "trusted-paths: site 'p2.example' FastCGI Unix socket '{}/future/pool.sock': \
+                     verified existing prefix '{}' (stopped at absent component 'future')",
+                    trusted_parent.display(),
+                    trusted_parent.display()
+                )
+                .as_str()
+            )
         );
 
-        // Same config under world-writable `bad_cwd` -> BOTH report `bad_cwd`!
-        let (_bad_code, bad_val) = run_json_in(
-            &[
-                "--fs",
-                "--trusted-paths",
-                "--log-file",
-                "app.log",
-                "--log-max-bytes",
-                "1024",
-            ],
-            &cfg,
-            Some(&bad_cwd),
-        )?;
-        let ws = w034s(&bad_val);
-        assert_eq!(ws.len(), 2, "expected 2 W034s for bad cwd: {bad_val}");
+        // 2. P2-6: rotating log parent containing `\n` stays on ONE single sanitized line in ordinary text mode!
+        let nl_log = nl_dir.join("server.log");
+        let txt = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--trusted-paths", "--log-file"])
+            .arg(&nl_log)
+            .args(["--log-max-bytes", "1024"])
+            .arg(&cfg)
+            .output()?;
+        let stderr = String::from_utf8(txt.stderr)?;
+        let w_lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("warning[W034]:"))
+            .collect();
         assert_eq!(
-            ws.first().and_then(|w| jstr(w, "path")),
-            Some("server.tls.acme")
+            w_lines.len(),
+            1,
+            "expected 1 W034 line on stderr:\n{stderr}"
         );
-        assert_eq!(
-            ws.first().and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "ACME directory '.miraserve-acme': first untrusted component '{}' \
-                     (uid {euid}, mode 0777): group or other writable",
-                    bad_cwd.display()
-                )
-                .as_str()
-            )
+        let expected_esc = format!(
+            "warning[W034]: rotating --log-file parent directory '{}/nl\\ndir': first untrusted \
+             component '{}/nl\\ndir' (uid {euid}, mode 0775): group or other writable",
+            base.display(),
+            base.display()
         );
+        assert_eq!(w_lines.first().copied(), Some(expected_esc.as_str()));
+
+        // 3. P2-7: invalid KDL with `--trusted-paths --format json` includes the diagnostic note.
+        let bad_cfg = base.join("bad.kdl");
+        fs::write(&bad_cfg, "broken {{{")?;
+        let (bcode, bval) = run_json(&["--fs", "--trusted-paths"], &bad_cfg)?;
+        assert_eq!(bcode, Some(1));
         assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "path")),
-            Some("server.log-file")
-        );
-        assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "rotating --log-file parent directory '.': first untrusted component '{}' \
-                     (uid {euid}, mode 0777): group or other writable",
-                    bad_cwd.display()
-                )
-                .as_str()
-            )
+            bval.get("notes"),
+            Some(&serde_json::json!([
+                "trusted-paths: configuration invalid; no paths were verified"
+            ]))
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -968,6 +1152,12 @@ mod linux_tests {
     fn linux_absent_uninspectable_fs_guard_two_sites_all_json_paths_and_w029_frozen() -> TestResult
     {
         use std::os::unix::fs::symlink;
+
+        if !require_local_root_fs(
+            "linux_absent_uninspectable_fs_guard_two_sites_all_json_paths_and_w029_frozen",
+        )? {
+            return Ok(());
+        }
 
         let base = make_temp_base("matrix")?;
         let (cert, key) = gen_dev_cert(&base)?;
@@ -989,6 +1179,7 @@ mod linux_tests {
             set_mode(d, 0o750)?;
         }
         fs::write(&not_a_dir, b"x")?;
+        set_mode(&not_a_dir, 0o644)?;
         let proc_link = good.join("proc_link");
         symlink("/proc/self", &proc_link)?;
         set_mode(&bad, 0o775)?;
@@ -1117,10 +1308,22 @@ mod linux_tests {
             Some(
                 format!(
                     "site 's1.example' FastCGI Unix socket '{}/child.sock': first untrusted component \
-                     '{}' (uid unknown, mode unknown): could not be inspected \
+                     '{}' (uid {euid}, mode 0644): could not be inspected \
                      (Not a directory (os error 20))",
                     not_a_dir.display(),
                     not_a_dir.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            note_at(&val_with, 2),
+            Some(
+                format!(
+                    "trusted-paths: site 's0.example' FastCGI Unix socket '{}': verified existing \
+                     prefix '{}' (stopped at absent component 'absent.sock')",
+                    absent_good.display(),
+                    good.display()
                 )
                 .as_str()
             )
@@ -1171,6 +1374,12 @@ mod linux_tests {
         use std::collections::BTreeMap;
 
         const SYS_OPENAT2: i64 = 437;
+
+        if !require_local_root_fs(
+            "linux_cli_trusted_paths_succeeds_under_openat2_enosys_and_kill_process",
+        )? {
+            return Ok(());
+        }
         let base = make_temp_base("openat2-cli")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let pub_key = make_pub_key(&base)?;
@@ -1259,6 +1468,11 @@ mod linux_tests {
             eprintln!(
                 "skipping linux_root_second_uid_ownership_socket_producer_and_sandbox_user: requires root"
             );
+            return Ok(());
+        }
+        if !require_local_root_fs(
+            "linux_root_second_uid_ownership_socket_producer_and_sandbox_user",
+        )? {
             return Ok(());
         }
 
@@ -1387,6 +1601,14 @@ mod linux_tests {
             )
         );
         assert_eq!(
+            ws1.first().and_then(|w| jstr(w, "help")),
+            Some(
+                "set the socket-tree directory owner to root or the service account, or \
+                 pass --allow-warning W034 if you trust that socket producer (--allow-warning \
+                 W034 applies to all W034 warnings under --strict)"
+            )
+        );
+        assert_eq!(
             ws1.get(1).and_then(|w| jstr(w, "path")),
             Some("site[0].route[0].fastcgi-pass")
         );
@@ -1468,7 +1690,18 @@ mod linux_tests {
             )
         );
 
-        // 2. Running as root WITH `server.sandbox.user "1000"`: uid 0 and 1000 trusted, 1001 fails!
+        // 2. Running as root WITH `server.sandbox.user " 1000 "` (P2-4 trimmed): uid 0 and 1000 trusted, 1001 fails!
+        //    Also test P2-2: producer-owned 0775 socket-tree AND sticky-dir producer-owned socket-tree
+        //    must not mask the producer note!
+        let php_gw = base.join("php_gw_u1001");
+        let sticky_php = sticky_dir.join("php_sticky_u1001");
+        fs::create_dir_all(&php_gw)?;
+        fs::create_dir_all(&sticky_php)?;
+        set_mode(&php_gw, 0o775)?;
+        set_mode(&sticky_php, 0o755)?;
+        chown(&php_gw, u1001, g1001)?;
+        chown(&sticky_php, u1001, g1001)?;
+
         let cfg2 = base.join("root_user1000.kdl");
         fs::write(
             &cfg2,
@@ -1476,13 +1709,15 @@ mod linux_tests {
                 "server {{\n\
                      listen \":443\"\n\
                      tls {{ cert \"{}\"; key \"{}\" }}\n\
-                     sandbox {{ user \"1000\"; socket-tree \"{}\" }}\n\
+                     sandbox {{ user \" 1000 \"; socket-tree \"{}\" \"{}\" \"{}\" }}\n\
                  }}\n\
                  site \"ok.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n\
                  site \"bad.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&php_dir),
+                kdl_escape_path(&php_gw),
+                kdl_escape_path(&sticky_php),
                 kdl_escape_path(&u1000_store),
                 kdl_escape_path(&pub_key),
                 kdl_escape_path(&u1001_store),
@@ -1497,19 +1732,719 @@ mod linux_tests {
             )
         );
         let ws2 = w034s(&val2);
-        assert_eq!(ws2.len(), 1, "only uid 1001 should fail: {ws2:#?}");
         assert_eq!(
-            ws2.first().and_then(|w| jstr(w, "path")),
-            Some("site[1].ai-publish.storage")
+            ws2.len(),
+            3,
+            "expected 3 W034s (php_gw, sticky_php, u1001_store): {ws2:#?}"
         );
         assert_eq!(
             ws2.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid 1001, mode 0775): {TREE_WR_LITERAL}; directory is controlled by uid 1001 \
+                     (the socket producer)",
+                    php_gw.display(),
+                    php_gw.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws2.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid 1001, mode 0755): owner not trusted in sticky directory; directory is \
+                     controlled by uid 1001 (the socket producer)",
+                    sticky_php.display(),
+                    sticky_php.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws2.get(2).and_then(|w| jstr(w, "path")),
+            Some("site[1].ai-publish.storage")
+        );
+        assert_eq!(
+            ws2.get(2).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "site 'bad.example' ai-publish storage '{}': first untrusted component '{}' \
                      (uid 1001, mode 0750): owner not trusted",
                     u1001_store.display(),
                     u1001_store.display()
+                )
+                .as_str()
+            )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_p1_1_keyd_leading_space_walks_trimmed_endpoint() -> TestResult {
+        if !require_local_root_fs("linux_p1_1_keyd_leading_space_walks_trimmed_endpoint")? {
+            return Ok(());
+        }
+        let base = make_temp_base("p1-keyd-space")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
+        let good_cwd = base.join("good_cwd");
+        let bad_dir = base.join("bad_keyd_dir");
+        for d in [&docroot, &good_cwd, &bad_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&bad_dir, 0o775)?;
+        let keyd_sock = bad_dir.join("keyd.sock");
+
+        let cfg = base.join("keyd_space.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ key-isolation \"split-daemon\"; keyd-socket \" {}\"; cert \"{}\"; key \"{}\" }}\n\
+                 }}\n\
+                 site \"ks.example\" {{ root \"{}\" }}\n",
+                kdl_escape_path(&keyd_sock),
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+
+        let (_code, val) = run_json_in(&["--fs", "--trusted-paths"], &cfg, Some(&good_cwd))?;
+        let ws = w034s(&val);
+        assert_eq!(
+            ws.len(),
+            1,
+            "leading-space keyd-socket must emit W034: {val}"
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("server.tls.keyd-socket")
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.tls.keyd-socket '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0775): group or other writable",
+                    keyd_sock.display(),
+                    bad_dir.display()
+                )
+                .as_str()
+            )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_p1_3_overlayfs_root_reported_not_verified() -> TestResult {
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            "/",
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let sf = rustix::fs::fstatfs(&fd)?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let magic = sf.f_type as u32;
+        if magic != 0x794C_7630 {
+            eprintln!(
+                "skipping linux_p1_3_overlayfs_root_reported_not_verified: / is 0x{magic:x}, not overlayfs"
+            );
+            return Ok(());
+        }
+        let base = make_temp_base("p1-overlay")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let docroot = base.join("www");
+        let store = base.join("store");
+        let pub_key = make_pub_key(&base)?;
+        for d in [&docroot, &store] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        let cfg = base.join("ovl.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"ovl.example\" {{ root \"{}\"; ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&store),
+                kdl_escape_path(&pub_key),
+            ),
+        )?;
+        let (_code, val) = run_json(&["--fs", "--trusted-paths"], &cfg)?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 1, "overlayfs root must emit W034: {val}");
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'ovl.example' ai-publish storage '{}': first untrusted component '/' \
+                     (uid 0, mode 0755): could not be verified on this filesystem (filesystem 0x794c7630)",
+                    store.display()
+                )
+                .as_str()
+            )
+        );
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    fn linux_p1_4_relative_paths_reported_not_verified() -> TestResult {
+        let base = make_temp_base("p1-rel")?;
+        let docroot = base.join("www");
+        let good_cwd = base.join("good_cwd");
+        let good_acme = good_cwd.join(".miraserve-acme");
+        let sock_dir = good_cwd.join("sockets");
+        for d in [&docroot, &good_cwd, &good_acme, &sock_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&good_acme, 0o700)?;
+
+        let cfg = base.join("rel.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ acme {{ email \"ops@example.com\"; challenge \"tls-alpn-01\" }} }}\n\
+                 }}\n\
+                 site \"rel.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:sockets/pool.sock\" }}\n\
+                 }}\n",
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+
+        let (_code, val) = run_json_in(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--log-file",
+                "app.log",
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg,
+            Some(&good_cwd),
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 3, "all 3 relative paths must report W034: {val}");
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                "site 'rel.example' FastCGI Unix socket 'sockets/pool.sock': first untrusted \
+                 component 'sockets/pool.sock' (uid unknown, mode unknown): not verified: \
+                 relative path depends on the working directory of the server"
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                "ACME directory '.miraserve-acme': first untrusted component '.miraserve-acme' \
+                 (uid unknown, mode unknown): not verified: relative path depends on the \
+                 working directory of the server"
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                "rotating --log-file parent directory 'app.log': first untrusted component \
+                 'app.log' (uid unknown, mode unknown): not verified: relative path depends on \
+                 the working directory of the server"
+            )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_p1_5_wrong_leaf_types_reported_and_0660_socket_accepted() -> TestResult {
+        if !require_local_root_fs("linux_p1_5_wrong_leaf_types_reported_and_0660_socket_accepted")?
+        {
+            return Ok(());
+        }
+        let base = make_temp_base("p1-leaves")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let pub_key = make_pub_key(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
+        let good_dir = base.join("good_dir");
+        for d in [&docroot, &good_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        let reg_tree = base.join("reg_tree");
+        let reg_store = base.join("reg_store");
+        let reg_log_parent = base.join("reg_log_parent");
+        let reg_acme = base.join("reg_acme");
+        let reg_fcgi = base.join("reg_fcgi");
+        let reg_keyd = base.join("reg_keyd");
+        for f in [
+            &reg_tree,
+            &reg_store,
+            &reg_log_parent,
+            &reg_acme,
+            &reg_fcgi,
+            &reg_keyd,
+        ] {
+            fs::write(f, b"not-a-dir-or-sock")?;
+            set_mode(f, 0o644)?;
+        }
+        let real_sock = good_dir.join("ok.sock");
+        let _listener = UnixListener::bind(&real_sock)?;
+        set_mode(&real_sock, 0o660)?;
+
+        let cfg = base.join("leaves.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ key-isolation \"split-daemon\"; keyd-socket \"{}\"; cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ socket-tree \"{}\" }}\n\
+                 }}\n\
+                 site \"lf.example\" {{\n\
+                     root \"{}\"\n\
+                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+                     route \"/ok/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/reg/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/dir/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&reg_keyd),
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&reg_tree),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&reg_store),
+                kdl_escape_path(&pub_key),
+                kdl_escape_path(&real_sock),
+                kdl_escape_path(&reg_fcgi),
+                kdl_escape_path(&good_dir),
+            ),
+        )?;
+
+        let log_under_reg = reg_log_parent.join("server.log");
+        let (_code, val) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &reg_acme.to_string_lossy(),
+                "--log-file",
+                &log_under_reg.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg,
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(
+            ws.len(),
+            7,
+            "all 7 wrong leaves must fail, 0660 sock must pass: {val}"
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a directory",
+                    reg_tree.display(),
+                    reg_tree.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'lf.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a socket",
+                    reg_fcgi.display(),
+                    reg_fcgi.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'lf.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0750): exists but is not a socket",
+                    good_dir.display(),
+                    good_dir.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(3).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'lf.example' ai-publish storage '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a directory",
+                    reg_store.display(),
+                    reg_store.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(4).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.tls.keyd-socket '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a socket",
+                    reg_keyd.display(),
+                    reg_keyd.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(5).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "ACME directory '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a directory",
+                    reg_acme.display(),
+                    reg_acme.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(6).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "rotating --log-file parent directory '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0644): exists but is not a directory",
+                    reg_log_parent.display(),
+                    reg_log_parent.display()
+                )
+                .as_str()
+            )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_p1_5_acme_dotdot_and_owner_rules() -> TestResult {
+        let base = make_temp_base("p1-acme")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let docroot = base.join("www");
+        let a_dir = base.join("a");
+        let state_dir = base.join("state");
+        for d in [&docroot, &a_dir, &state_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&state_dir, 0o700)?;
+
+        let cfg = base.join("acme.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"ac.example\" {{ root \"{}\" }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+
+        // 1. Trusted path containing `..` MUST be reported for ACME!
+        let dotdot = a_dir.join("../state");
+        let (_c, val) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &dotdot.to_string_lossy(),
+            ],
+            &cfg,
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 1, "ACME path with .. must emit W034: {val}");
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "ACME directory '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): private state path must not contain '..'",
+                    dotdot.display(),
+                    dotdot.display()
+                )
+                .as_str()
+            )
+        );
+
+        // 1b. Root `/` MUST be refused as ACME dir!
+        let (_cr, val_r) = run_json(&["--fs", "--trusted-paths", "--acme-dir", "/"], &cfg)?;
+        let wsr = w034s(&val_r);
+        assert_eq!(wsr.len(), 1, "ACME / must emit W034: {val_r}");
+        assert_eq!(
+            wsr.first().and_then(|w| jstr(w, "message")),
+            Some(
+                "ACME directory '/': first untrusted component '/' (uid unknown, mode unknown): \
+                 refusing filesystem root as private state path"
+            )
+        );
+
+        // 2. Root-owned 0700 ACME dir MUST fail when service uid is 1000 (or unknown),
+        //    and uid-1000-owned 0700 ACME dir MUST pass when service uid is 1000!
+        if rustix::process::geteuid().is_root()
+            && require_local_root_fs("linux_p1_5_acme_dotdot_and_owner_rules(owner)")?
+        {
+            let root_cfg = base.join("acme_u1000.kdl");
+            fs::write(
+                &root_cfg,
+                format!(
+                    "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }}; sandbox {{ user \"1000\" }} }}\n\
+                     site \"ac.example\" {{ root \"{}\" }}\n",
+                    kdl_escape_path(&cert),
+                    kdl_escape_path(&key),
+                    kdl_escape_path(&docroot),
+                ),
+            )?;
+            let (_c2, val2) = run_json(
+                &[
+                    "--fs",
+                    "--trusted-paths",
+                    "--acme-dir",
+                    &state_dir.to_string_lossy(),
+                ],
+                &root_cfg,
+            )?;
+            let ws2 = w034s(&val2);
+            assert_eq!(
+                ws2.len(),
+                1,
+                "root-owned ACME dir with service uid 1000 must emit W034: {val2}"
+            );
+            assert_eq!(
+                ws2.first().and_then(|w| jstr(w, "message")),
+                Some(
+                    format!(
+                        "ACME directory '{}': first untrusted component '{}' \
+                         (uid 0, mode 0700): ACME directory must be owned by service uid 1000 (owned by uid 0)",
+                        state_dir.display(),
+                        state_dir.display()
+                    )
+                    .as_str()
+                )
+            );
+
+            // Unknown service uid (root without sandbox.user) must also fail!
+            let (_c3, val3) = run_json(
+                &[
+                    "--fs",
+                    "--trusted-paths",
+                    "--acme-dir",
+                    &state_dir.to_string_lossy(),
+                ],
+                &cfg,
+            )?;
+            let ws3 = w034s(&val3);
+            assert_eq!(
+                ws3.len(),
+                1,
+                "ACME dir with unknown service uid must emit W034: {val3}"
+            );
+            assert_eq!(
+                ws3.first().and_then(|w| jstr(w, "message")),
+                Some(
+                    format!(
+                        "ACME directory '{}': first untrusted component '{}' \
+                         (uid 0, mode 0700): not verified: service uid is unknown; cannot verify ACME directory owner",
+                        state_dir.display(),
+                        state_dir.display()
+                    )
+                    .as_str()
+                )
+            );
+
+            // Service-uid-owned 0700 ACME dir MUST pass (0 W034)!
+            rustix::fs::chown(
+                &state_dir,
+                Some(rustix::fs::Uid::from_raw(1000)),
+                Some(rustix::fs::Gid::from_raw(1000)),
+            )?;
+            let (c4, val4) = run_json(
+                &[
+                    "--fs",
+                    "--strict",
+                    "--trusted-paths",
+                    "--acme-dir",
+                    &state_dir.to_string_lossy(),
+                ],
+                &root_cfg,
+            )?;
+            assert_eq!(
+                c4,
+                Some(0),
+                "uid-1000 ACME dir with sandbox.user 1000 must pass: {val4}"
+            );
+            assert!(w034s(&val4).is_empty(), "val4: {val4}");
+        }
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_p1_6_sticky_symlink_uses_service_uid_and_unknown_service_uid_fails() -> TestResult {
+        use rustix::fs::{AtFlags, CWD, Gid, Uid, chown, chownat};
+        use std::os::unix::fs::symlink;
+
+        if !rustix::process::geteuid().is_root() {
+            eprintln!(
+                "skipping linux_p1_6_sticky_symlink_uses_service_uid_and_unknown_service_uid_fails: requires root"
+            );
+            return Ok(());
+        }
+        if !require_local_root_fs(
+            "linux_p1_6_sticky_symlink_uses_service_uid_and_unknown_service_uid_fails",
+        )? {
+            return Ok(());
+        }
+
+        let base = make_temp_base("p1-sticky-sym")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let docroot = base.join("www");
+        let sock_dir = base.join("socks");
+        let sticky_u1000 = base.join("sticky_u1000");
+        let sticky_root = base.join("sticky_root");
+        for d in [&docroot, &sock_dir, &sticky_u1000, &sticky_root] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o755)?;
+        }
+        set_mode(&sticky_u1000, 0o1777)?;
+        set_mode(&sticky_root, 0o1777)?;
+
+        let sock = sock_dir.join("pool.sock");
+        let _listener = UnixListener::bind(&sock)?;
+        set_mode(&sock, 0o660)?;
+
+        // 1. 1000-owned sticky dir with root-owned symlink -> blocked for service uid 1000!
+        let root_sym_in_u1000 = sticky_u1000.join("root_link");
+        symlink(&sock, &root_sym_in_u1000)?;
+        // 2. root-owned sticky dir with 1000-owned symlink -> ALLOWED for service uid 1000!
+        let u1000_sym_in_root = sticky_root.join("u1000_link");
+        symlink(&sock, &u1000_sym_in_root)?;
+        // 3. root-owned sticky dir with root-owned symlink -> NOT VERIFIED when service uid unknown!
+        let root_sym_in_root = sticky_root.join("root_link");
+        symlink(&sock, &root_sym_in_root)?;
+
+        let u1000 = Some(Uid::from_raw(1000));
+        let g1000 = Some(Gid::from_raw(1000));
+        chown(&sticky_u1000, u1000, g1000)?;
+        chownat(
+            CWD,
+            &u1000_sym_in_root,
+            u1000,
+            g1000,
+            AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+
+        let named_cfg = base.join("named.kdl");
+        fs::write(
+            &named_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }}; sandbox {{ user \"1000\" }} }}\n\
+                 site \"s.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"/blocked/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/allowed/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&root_sym_in_u1000),
+                kdl_escape_path(&u1000_sym_in_root),
+            ),
+        )?;
+        let (_c1, val1) = run_json(&["--fs", "--trusted-paths"], &named_cfg)?;
+        let ws1 = w034s(&val1);
+        assert_eq!(
+            ws1.len(),
+            1,
+            "only root_sym_in_u1000 must warn, u1000_sym_in_root must pass: {val1}"
+        );
+        assert_eq!(
+            ws1.first().and_then(|w| jstr(w, "path")),
+            Some("site[0].route[0].fastcgi-pass")
+        );
+        assert_eq!(
+            ws1.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 's.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid 0, mode 0777): symbolic link whose own parent or target chain is untrusted \
+                     (blocked by fs.protected_symlinks for service uid)",
+                    root_sym_in_u1000.display(),
+                    root_sym_in_u1000.display()
+                )
+                .as_str()
+            )
+        );
+
+        let unknown_cfg = base.join("unknown.kdl");
+        fs::write(
+            &unknown_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"u.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"/unk/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&root_sym_in_root),
+            ),
+        )?;
+        let (_c2, val2) = run_json(&["--fs", "--trusted-paths"], &unknown_cfg)?;
+        let ws2 = w034s(&val2);
+        assert_eq!(
+            ws2.len(),
+            1,
+            "sticky symlink with unknown service uid must warn: {val2}"
+        );
+        assert_eq!(
+            ws2.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'u.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid 0, mode 0777): symbolic link whose own parent or target chain is untrusted \
+                     (not verified: service uid is unknown in sticky world-writable directory)",
+                    root_sym_in_root.display(),
+                    root_sym_in_root.display()
                 )
                 .as_str()
             )
