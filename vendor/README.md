@@ -18,7 +18,7 @@ workspace-root `[patch.crates-io]` (`h2 = { path = "vendor/h2" }`).
 
 ### Vendored Version History
 
-- **`0.4.20`** (first vendored version; archive SHA-256 `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118`, upstream git rev `b0e890842ac16d3c76836fd4fcc06421acb15fa7`, patched tree SHA-256 `60ee394cc4270b31c53729a370af6ae311f6de58a4d3a6cfad711c14b475f7c0`): initial adoption of the `COPY_LIMIT = 4096` encoder patch; all prototype throughput and `sendto` measurements below were recorded against `0.4.20`.
+- **`0.4.20`** (first vendored version; archive SHA-256 `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118`, upstream git rev `b0e890842ac16d3c76836fd4fcc06421acb15fa7`, patched tree SHA-256 `60ee394cc4270b31c53729a370af6ae311f6de58a4d3a6cfad711c14b475f7c0`): initial adoption of the `COPY_LIMIT = 4096` encoder patch.
 - **`0.4.21`** (`2026-11-25`, current; archive SHA-256 `b634322c4924093fe6a6e05ecbe5717cd3c6014934455f4ae8e5cf14ba3264a8`, upstream git rev `ea0a5d529280a74f133f9b2ab7ca689f2e378820`, patched tree SHA-256 `f894599822e7f2b6f357f90ae58b6ffbbbf828c8b98abfc313473f4f15df405c`): refreshed so 100 uploads with an empty non-final DATA frame no longer close the HTTP/2 connection with `GOAWAY(ENHANCE_YOUR_CALM)`; `src/codec/framed_write.rs` and `vendor/h2.patch` were byte-identical across `0.4.20` and `0.4.21`.
 
 `vendor/h2` is unpacked directly from the checksum-verified crates.io `.crate`
@@ -31,70 +31,21 @@ Both `vendor/h2` and `vendor/h2-audit` are listed in `[workspace].exclude` in
 the root `Cargo.toml` so neither is a workspace member and neither is formatted
 by `cargo fmt --all` or linted by MiraServe's workspace Clippy / rustdoc gates.
 
-## Reason & Measurement
+## Reason
 
 In upstream `h2 0.4.21` (unchanged from `0.4.20`, the first vendored version),
-`FramedWrite` chains any selected `DATA` piece of
-256 bytes or more on vectored transports (1,024 bytes on scalar transports) into
-`Next::Data`, which forces a codec flush before the next frame can enter the
-encoder. With `COPY_LIMIT = 4096`, each selected `DATA` piece (already bounded
-by `max_frame_size` and flow-control credit) strictly smaller than 4,096 bytes
-uses `h2`'s existing copy path into its encoder write buffer (16 KiB initial
-capacity). This applies to both downstream HTTP/2 response `DATA` and upstream
-HTTP/2 reverse-proxy request `DATA`, with zero changes to MiraServe's own
-runtime code and no batching timer or added wait for a lone response.
-
-**Important scope distinction:** All measured numbers below come from earlier
-prototype builds measured with `h2 0.4.20` on 2 pinned CPU cores (TLS 1.3,
-`h2load -t4 -c64`, unpatched `h2 0.4.20` vs. `h2 0.4.20` with
-`COPY_LIMIT = 4096`), **not** this standalone `perf/h2-batch` branch (which
-carries only `vendor/h2` on `v0.1.3` without per-core workers or file cache).
-Final measurements for this standalone branch and the 10,000-connection panel
-capacity soak are tracked separately. Two distinct prototype configurations were
-measured and are labelled separately below:
-
-**Combined prototype (`workers 2 + 1 s file cache`, `miraserve-cw` vs. `ms-h2t4`):**
-
-- **Throughput (`h2load -t4 -c64 -D 10`, 3 interleaved rounds, scratchpad
-  `h2t_bench.out`):**
-  - 1 KiB file, `-m10` (`m10_1k`): unpatched median **121,939.00 req/s**
-    (`0.82×` Nginx; rounds `121,939.00`, `121,661.00`, `123,720.00`) vs.
-    `COPY_LIMIT = 4096` median **158,665.00 req/s** (`1.07×` Nginx; rounds
-    `158,665.00`, `157,036.00`, `158,707.00`), against Nginx median
-    **148,195.60 req/s** (rounds `148,789.60`, `148,195.60`, `146,793.50`).
-    In the separate two-core comparison (`bench_h2.out`, 3 rounds, `h2m10_1k`),
-    `ms workers2+cache` median was **120,840.00 req/s** vs.
-    `ms workers2+cache+h2limit4k` median **158,712.00 req/s** (ahead of Nginx
-    median **146,601.10 req/s** in all 3 rounds).
-  - 1 KiB file, `-c64 -m1` (`m1_1k`, one outstanding stream per connection
-    across 64 connections): unpatched median **76,972.80 req/s** vs.
-    `COPY_LIMIT = 4096` median **98,290.50 req/s** (Nginx median
-    **112,297.30 req/s**).
-  - **Measured cost at 100 KiB (`m10_100k`, `h2t_bench.out`):** `COPY_LIMIT =
-    4096` was **2.8% slower by median** than its matched unpatched pair and
-    slower in all 3 rounds — unpatched median **28,810.00 req/s** (rounds
-    `28,810.00`, `28,297.00`, `28,998.00`) vs. `limit 4k` median
-    **28,000.00 req/s** (rounds `28,000.00`, `27,609.00`, `28,707.00`). In
-    `bench_h2.out` (`h2m10_100k`), medians were **28,711.00 req/s**
-    (`workers2+cache`) vs. **28,177.00 req/s** (`workers2+cache+h2limit4k`,
-    **−1.9% by median**).
-- **Socket `sendto` syscalls per completed response (`perf stat`
-  `syscalls:sys_enter_sendto`, `h2load -t4 -c64 -D 3`, `h2t_count.out`):**
-  at `-m10`, `255b.txt` **0.101 -> 0.101**; `256b.txt`, `1023b.txt`, `1k.txt`,
-  and `1025b.txt` **1.102 -> 0.101**; `4095b.txt` **1.102 -> 0.401**;
-  `4096b.txt` **1.103 -> 1.103**; `100k.txt` **7.149 -> 7.129**
-  `sendto`/response. At `-c64 -m1` on `1k.txt` (one stream per connection
-  across 64 connections; a warm single-connection count is not yet measured),
-  **2.002 -> 1.002** `sendto`/response. (Caveat: `h2t_count.sh` mislabelled
-  `h2load`'s `succeeded`/`failed` fields as `done`/`ok`, so `ok=0` in
-  `h2t_count.out` does not certify HTTP status codes.)
-
-**Shared Tokio runtime prototype with file cache off (`h2t_count_shared.sh` / `h2t_count_shared.out`):**
-
-- **Socket `sendto` syscalls per completed response (`perf stat`
-  `syscalls:sys_enter_sendto`, `h2load -t4 -c64 -D 3`):** at `-m10`, `1k.txt`
-  **1.365 -> 0.363** and `4095b.txt` **1.363 -> 0.599** `sendto`/response; at
-  `-c64 -m1`, `1k.txt` **2.004 -> 1.004** `sendto`/response.
+`FramedWrite` chains any selected `DATA` piece of 256 bytes or more on vectored
+transports (1,024 bytes on scalar transports) into `Next::Data`, which forces a
+codec flush before the next frame can enter the encoder. With
+`COPY_LIMIT = 4096`, each selected `DATA` piece (already bounded by
+`max_frame_size` and flow-control credit) strictly smaller than 4,096 bytes uses
+`h2`'s existing copy path into its encoder write buffer (16 KiB initial
+capacity) so that several ready small responses can share one transport write,
+reducing the number of write calls for small responses. `DATA` pieces of 4,096
+bytes or more stay on the chained path. This applies to both downstream HTTP/2
+response `DATA` and upstream HTTP/2 reverse-proxy request `DATA`, with zero
+changes to MiraServe's own runtime code and no batching timer or added wait for
+a lone response.
 
 ## Invariants to Recheck on Every Refresh
 
@@ -165,7 +116,7 @@ appears in the crates.io sparse index (`https://index.crates.io/2/h2`):
    reapply and review the minimal patch, update `vendor/h2-source.env` and
    `vendor/README.md`, and run all provenance, graph, advisory, upstream `h2`,
    MiraServe, and archive-build gates.
-2. **Emergency fast path (scripted):** If refreshing and re-verifying the patch
+2. **Emergency fallback path (scripted):** If refreshing and re-verifying the patch
    would delay a security release, switch directly to the fixed crates.io
    release with:
    ```sh
@@ -213,37 +164,13 @@ appears in the crates.io sparse index (`https://index.crates.io/2/h2`):
    ```sh
    ./scripts/h2-use-registry.sh --vendored
    ```
-   **Cost of switching to the registry crate:** Removing the `[patch.crates-io]`
-   override disables MiraServe's `COPY_LIMIT = 4096` patch. The figures below
-   reflect the measured behaviour of **upstream `h2 0.4.20`** (the version
-   measured in those prototypes; `src/codec/framed_write.rs` is byte-identical
-   in `0.4.21`, still chaining `DATA` pieces of 256 bytes or more on vectored
-   transports / 1,024 bytes scalar and copying at most a prefix) in the earlier
-   prototype workloads
-   (`workers 2 + 1 s file cache` in `h2t_bench.out`, `bench_h2.out`, and
-   `h2t_count.out`, and shared Tokio runtime with file cache off in
-   `h2t_count_shared.out`; not yet measured on this standalone branch). **A
-   future fixed upstream registry release may change `h2`'s encoder behaviour
-   and have a different throughput or syscall cost:**
-   - 1 KiB file at `-m10` (`h2t_bench.out`, `workers 2 + 1 s file cache`, 3
-     rounds): median throughput drops from **158,665.00** to **121,939.00
-     req/s** (`1.07×` to `0.82×` Nginx's **148,195.60 req/s** median;
-     `bench_h2.out` `h2m10_1k`: **158,712.00** to **120,840.00 req/s** vs.
-     Nginx **146,601.10 req/s**), and `sendto` calls per response rise from
-     **0.101** to **1.102** (`h2t_count.out`; shared Tokio runtime with file
-     cache off in `h2t_count_shared.out`: **0.363** to **1.365**
-     `sendto`/response).
-   - 1 KiB file at `-c64 -m1` (one outstanding stream per connection across 64
-     connections; no warm single-connection count measured yet): median
-     throughput drops from **98,290.50** to **76,972.80 req/s** (`h2t_bench.out`,
-     `workers 2 + 1 s file cache`), and `sendto`/response rises from **1.002**
-     to **2.002** (`h2t_count.out`; shared Tokio runtime with file cache off in
-     `h2t_count_shared.out`: **1.004** to **2.004**).
-   - 100 KiB file at `-m10` (`h2t_bench.out`, `workers 2 + 1 s file cache`, 3
-     rounds): unpatched `h2 0.4.20` median was **28,810.00 req/s** vs.
-     **28,000.00 req/s** with `COPY_LIMIT = 4096` (the patched prototype was
-     **2.8% slower** by median at 100 KiB; `bench_h2.out` `h2m10_100k`:
-     **28,711.00** vs. **28,177.00 req/s**, **−1.9% by median**).
+   **Effect of switching to the registry crate:** Removing the
+   `[patch.crates-io]` override disables MiraServe's `COPY_LIMIT = 4096` patch,
+   reverting to upstream `h2`'s own `FramedWrite` chaining thresholds (in
+   `0.4.21`, chaining `DATA` pieces of 256 bytes or more on vectored transports
+   and 1,024 bytes on scalar transports instead of copying pieces smaller than
+   4,096 bytes into the encoder write buffer; a future upstream release may
+   change `h2`'s encoder behaviour).
 
 ## Patch New-File Allow-List
 
