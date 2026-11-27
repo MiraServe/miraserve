@@ -86,8 +86,9 @@ pub(crate) struct CheckArgs {
     /// (`--log-file`/`--access-log` when `--log-max-bytes > 0`); other configured paths, including
     /// `ai-publish` storage, are not looked at yet. For each path it considers untrusted or cannot
     /// verify, it reports `W034` giving the component (when reported), its owner and mode (when
-    /// known), and the reason (another account than root and the service account may be able to
-    /// replace that path while the server starts; fix ownership or mode, or move the path). No
+    /// known), and the reason. A warning means the check found something to fix on that path, or
+    /// could not verify it; the reason in the warning says which, and the usual fixes are to
+    /// correct the ownership, mode or type of the named component, or to move the path. No
     /// warning is not a guarantee. Sees checker's view; assumes same root/mount view (unit isolates
     /// `/tmp`, restricts `/home`), ordinary local filesystems (no idmap, stacking, name-hiding
     /// encryption, or other writable view), stable mounts, no shared service account. Run as the

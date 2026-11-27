@@ -120,7 +120,8 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "ACME",
         "rotating log",
         "other configured paths, including `ai-publish` storage, are not looked at yet",
-        "For each path it considers untrusted or cannot verify, it reports `W034`",
+        "For each path it considers untrusted or cannot verify, it reports `W034` giving the component (when reported), its owner and mode (when known), and the reason.",
+        "A warning means the check found something to fix on that path, or could not verify it; the reason in the warning says which, and the usual fixes are to correct the ownership, mode or type of the named component, or to move the path.",
         "No warning is not a guarantee.",
         "/tmp",
         "/home",
@@ -158,6 +159,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "in a sticky directory owned by root",
         "owned by another account, group/other-writable",
         "when the configuration names a service account different",
+        "may be able to replace that path while the server starts",
     ] {
         assert!(
             !lower.contains(forbidden),
@@ -988,12 +990,18 @@ mod linux_tests {
             ws.get(2).and_then(|w| jstr(w, "path")),
             Some("site[2].route[0].fastcgi-pass")
         );
-        assert!(
-            ws.get(2).and_then(|w| jstr(w, "message")).is_some_and(
-                |m| m.contains("could not be inspected (Too many levels of symbolic links")
-            ),
-            "loop msg: {:?}",
-            ws.get(2)
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'l.example' FastCGI Unix socket '{}/p.sock': first untrusted component '{}' \
+                     (uid {euid}, mode 0777): could not be inspected \
+                     (Too many levels of symbolic links (os error 40))",
+                    loop_a.display(),
+                    loop_a.display()
+                )
+                .as_str()
+            )
         );
         assert_eq!(
             ws.get(3).and_then(|w| jstr(w, "path")),
@@ -2857,6 +2865,268 @@ mod linux_tests {
                 .as_str()
             )
         );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_small2_missing_created_dirs_and_non_utf8_components() -> TestResult {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt as _;
+        use std::os::unix::fs::symlink;
+
+        if !require_local_root_fs("linux_small2_missing_created_dirs_and_non_utf8_components")? {
+            return Ok(());
+        }
+        let base = make_temp_base("small2")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
+        let trusted = base.join("trusted");
+        for d in [&docroot, &trusted] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+
+        // 1. Missing directory components that startup creates (rotating log parent with missing
+        //    intermediate dir and leaf dir, and ACME dir with missing intermediate and leaf dir)
+        //    MUST give W034 with the exact reason; absent leaves for socket-tree / fastcgi-pass /
+        //    keyd-socket under the same trusted prefix keep verified-prefix notes (0 W034).
+        let miss_tree = trusted.join("future_tree");
+        let miss_fcgi = trusted.join("future_fcgi.sock");
+        let miss_keyd = trusted.join("future_keyd.sock");
+        let miss_log_mid = trusted.join("new/logs/server.log");
+        let miss_acc_leaf = trusted.join("absent_acc/access.log");
+        let miss_acme_mid = trusted.join("new_acme/state");
+        let miss_acme_leaf = trusted.join("absent_acme");
+
+        let cfg = base.join("small2_missing.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ key-isolation \"split-daemon\"; keyd-socket \"{}\"; cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ socket-tree \"{}\" }}\n\
+                 }}\n\
+                 site \"m.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&miss_keyd),
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&miss_tree),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&miss_fcgi),
+            ),
+        )?;
+
+        let reason = "not found; the server would create it at start \
+            and the permissions it would inherit are not verified";
+        let (_code, val) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &miss_acme_mid.to_string_lossy(),
+                "--log-file",
+                &miss_log_mid.to_string_lossy(),
+                "--access-log",
+                &miss_acc_leaf.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg,
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 3, "expected 3 W034s (acme, log, access): {ws:#?}");
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("server.tls.acme")
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "ACME directory '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    miss_acme_mid.display(),
+                    trusted.join("new_acme").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "path")),
+            Some("server.log-file")
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "rotating --log-file parent directory '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    trusted.join("new/logs").display(),
+                    trusted.join("new").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "path")),
+            Some("server.access-log")
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "rotating --access-log parent directory '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    trusted.join("absent_acc").display(),
+                    trusted.join("absent_acc").display(),
+                )
+                .as_str()
+            )
+        );
+        // The three non-created classes keep verified-prefix notes (0 W034 for them).
+        assert_eq!(
+            note_at(&val, 2),
+            Some(
+                format!(
+                    "trusted-paths: server.sandbox socket-tree root '{}': inspected existing \
+                     prefix '{}' (stopped at 'future_tree', not found by this lookup)",
+                    miss_tree.display(),
+                    trusted.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            note_at(&val, 3),
+            Some(
+                format!(
+                    "trusted-paths: site 'm.example' FastCGI Unix socket '{}': inspected existing \
+                     prefix '{}' (stopped at 'future_fcgi.sock', not found by this lookup)",
+                    miss_fcgi.display(),
+                    trusted.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            note_at(&val, 4),
+            Some(
+                format!(
+                    "trusted-paths: server.tls.keyd-socket '{}': inspected existing prefix '{}' \
+                     (stopped at 'future_keyd.sock', not found by this lookup)",
+                    miss_keyd.display(),
+                    trusted.display()
+                )
+                .as_str()
+            )
+        );
+
+        // Missing leaf ACME directory also emits W034 with the same exact reason.
+        let (_c_leaf, val_leaf) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &miss_acme_leaf.to_string_lossy(),
+            ],
+            &cfg,
+        )?;
+        let ws_leaf = w034s(&val_leaf);
+        assert_eq!(
+            ws_leaf.len(),
+            1,
+            "expected 1 W034 for absent ACME leaf: {ws_leaf:#?}"
+        );
+        assert_eq!(
+            ws_leaf.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "ACME directory '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    miss_acme_leaf.display(),
+                    miss_acme_leaf.display(),
+                )
+                .as_str()
+            )
+        );
+
+        // 2. Non-UTF-8 symlink target bytes vs U+FFFD vs literal `\xff`: four distinct byte
+        //    strings MUST render to four distinct warning component names.
+        let dir_high_ff = trusted.join(OsString::from_vec(b"bad_\xff".to_vec()));
+        let dir_alt_fe = trusted.join(OsString::from_vec(b"bad_\xfe".to_vec()));
+        let dir_fffd = trusted.join("bad_\u{FFFD}");
+        let dir_esc = trusted.join("bad_\\xff");
+        for d in [&dir_high_ff, &dir_alt_fe, &dir_fffd, &dir_esc] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o775)?;
+        }
+        let sym_high_ff = trusted.join("link_ff");
+        let sym_alt_fe = trusted.join("link_fe");
+        let sym_fffd = trusted.join("link_fffd");
+        let sym_esc = trusted.join("link_esc");
+        symlink(&dir_high_ff, &sym_high_ff)?;
+        symlink(&dir_alt_fe, &sym_alt_fe)?;
+        symlink(&dir_fffd, &sym_fffd)?;
+        symlink(&dir_esc, &sym_esc)?;
+
+        let ncfg = base.join("non_utf8.kdl");
+        fs::write(
+            &ncfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"u.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"/a/*\" {{ fastcgi-pass \"unix:{}/p.sock\" }}\n\
+                     route \"/b/*\" {{ fastcgi-pass \"unix:{}/p.sock\" }}\n\
+                     route \"/c/*\" {{ fastcgi-pass \"unix:{}/p.sock\" }}\n\
+                     route \"/d/*\" {{ fastcgi-pass \"unix:{}/p.sock\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&sym_high_ff),
+                kdl_escape_path(&sym_alt_fe),
+                kdl_escape_path(&sym_fffd),
+                kdl_escape_path(&sym_esc),
+            ),
+        )?;
+        let (_nc, nval) = run_json(&["--fs", "--trusted-paths"], &ncfg)?;
+        let nws = w034s(&nval);
+        assert_eq!(
+            nws.len(),
+            4,
+            "expected 4 W034s for distinct byte targets: {nws:#?}"
+        );
+        let expected_msgs = [
+            (&sym_high_ff, format!("{}/bad_\\xff", trusted.display())),
+            (&sym_alt_fe, format!("{}/bad_\\xfe", trusted.display())),
+            (&sym_fffd, format!("{}/bad_\u{FFFD}", trusted.display())),
+            (&sym_esc, format!("{}/bad_\\\\xff", trusted.display())),
+        ];
+        for (idx, (lnk, rendered_comp)) in expected_msgs.iter().enumerate() {
+            assert_eq!(
+                nws.get(idx).and_then(|w| jstr(w, "message")),
+                Some(
+                    format!(
+                        "site 'u.example' FastCGI Unix socket '{}/p.sock': first untrusted \
+                         component '{rendered_comp}' (uid {euid}, mode 0775): symbolic link \
+                         whose own parent or target chain is untrusted (via '{}': group or other \
+                         writable)",
+                        lnk.display(),
+                        lnk.display(),
+                    )
+                    .as_str()
+                )
+            );
+        }
 
         let _ = fs::remove_dir_all(&base);
         Ok(())

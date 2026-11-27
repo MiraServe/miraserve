@@ -1,6 +1,6 @@
 //! Opt-in Linux trusted-path diagnostic (`--trusted-paths`, `W034`); roles: 0=tree, 1=sock, 2=acme, 3=dir.
 
-use crate::check::CheckArgs;
+use crate::check::{CheckArgs, is_c0_del_c1};
 use miraserve_config::{ConfigIssue, FastCgiTarget, LoadedConfig, RouteHandler, Severity};
 use miraserve_tls::{KeydEndpoint, resolve_unix_user_uid};
 use rustix::fd::{AsFd, OwnedFd};
@@ -8,6 +8,7 @@ use rustix::fs::{CWD, FileType, Mode, OFlags, Stat, fstat, fstatfs, openat, read
 use rustix::io::Errno;
 use rustix::path::Arg;
 use std::ffi::{OsStr, OsString};
+use std::fmt::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
@@ -24,6 +25,8 @@ const SYM_BAD: &str = "symbolic link whose own parent or target chain is untrust
 const TREE_WR: &str = "group or other writable \
     (other accounts with search permission may be able to create or replace sockets)";
 const STKY_OWN: &str = "owner not trusted in sticky directory";
+const MISS_CRE: &str = "not found; the server would create it at start \
+    and the permissions it would inherit are not verified";
 type WalkRes = Result<Option<(PathBuf, OsString)>, Fail>;
 struct Ctx(Option<u32>, bool, Option<u32>, bool);
 struct Fail(PathBuf, Option<(u32, u32)>, String, u8);
@@ -42,6 +45,20 @@ fn fmeta(p: &Path, st: &Stat, d: impl std::fmt::Display) -> Fail {
 fn prod(u: u32) -> String {
     format!("directory is controlled by uid {u} (the socket producer)")
 }
+fn fmt_os(s: impl AsRef<OsStr>) -> String {
+    let mut o = String::with_capacity(s.as_ref().len());
+    for ch in s.as_ref().as_bytes().utf8_chunks() {
+        ch.valid().chars().for_each(|c| match c {
+            '\\' => o.push_str("\\\\"),
+            c if is_c0_del_c1(c) => o.extend(c.escape_default()),
+            _ => o.push(c),
+        });
+        for &b in ch.invalid() {
+            let _ = write!(o, "\\x{b:02x}");
+        }
+    }
+    o
+}
 fn op(d: impl AsFd, p: impl Arg, f: OFlags) -> Result<OwnedFd, Errno> {
     openat(d, p, OFlags::PATH | OFlags::CLOEXEC | f, Mode::empty())
 }
@@ -56,29 +73,23 @@ pub(crate) fn is_identity_uid_map(s: &str) -> bool {
 }
 pub(crate) fn obs(eu: u32, u: Option<&str>, r: fn(&str) -> Option<u32>) -> (Option<u32>, String) {
     let (fk, tr) = ("server.sandbox.user", "trusting uid 0 and service uid");
-    let res = u.map(|nm| (nm.trim(), r(nm)));
-    if eu == 0 {
-        let u0 = "service uid is unknown, so only uid 0 is trusted";
-        let m = match res {
-            Some((nm, Some(id))) => format!("{tr} {id} (from {fk} '{nm}')"),
-            Some((nm, None)) => format!("{fk} '{nm}' could not be resolved; {u0}"),
-            None => format!("{u0} ({fk} is unset)"),
-        };
-        let out = format!("trusted-paths: running as root; {m}");
-        return (res.and_then(|(_, id)| id), out);
-    }
-    let (id, msg) = match res {
-        Some((nm, Some(id))) if id != eu => {
+    let u0 = "service uid is unknown, so only uid 0 is trusted";
+    let rt = "running as root; ";
+    let (id, msg) = match (eu, u.map(|nm| (nm.trim(), r(nm)))) {
+        (0, Some((nm, Some(id)))) => (Some(id), format!("{rt}{tr} {id} (from {fk} '{nm}')")),
+        (0, Some((nm, None))) => (None, format!("{rt}{fk} '{nm}' could not be resolved; {u0}")),
+        (0, None) => (None, format!("{rt}{u0} ({fk} is unset)")),
+        (_, Some((nm, Some(id)))) if id != eu => {
             let s = format!("checked as uid {eu}, but {fk} '{nm}' resolves to uid {id}");
-            (id, format!("{s}; {tr} {id}"))
+            (Some(id), format!("{s}; {tr} {id}"))
         }
-        Some((nm, None)) => {
+        (_, Some((nm, None))) => {
             let e = format!("effective uid of this check; {fk} '{nm}' could not be resolved");
-            (eu, format!("{tr} {eu} ({e})"))
+            (Some(eu), format!("{tr} {eu} ({e})"))
         }
-        _ => (eu, format!("{tr} {eu} (effective uid of this check)")),
+        _ => (Some(eu), format!("{tr} {eu} (effective uid of this check)")),
     };
-    (Some(id), format!("trusted-paths: {msg}"))
+    (id, format!("trusted-paths: {msg}"))
 }
 pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs) -> Vec<String> {
     let (cfg, euid) = (&l.config, rustix::process::geteuid().as_raw());
@@ -95,11 +106,10 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
         let mut fs = Vec::new();
         match r.and_then(|x| walk_at(&ctx, Path::new("/"), p, x)) {
             Ok(Some((pr, ms))) if mis.is_none() => {
-                let (pd, rd, md) = (p.display(), pr.display(), ms.to_string_lossy());
-                let pre = format!("trusted-paths: {lb} '{pd}': inspected existing prefix '{rd}'");
-                notes.push(format!(
-                    "{pre} (stopped at '{md}', not found by this lookup)"
-                ));
+                let (pd, rd, md) = (fmt_os(p), fmt_os(&pr), fmt_os(&ms));
+                let s = format!("trusted-paths: {lb} '{pd}': inspected existing prefix '{rd}'");
+                let e = format!("(stopped at '{md}', not found by this lookup)");
+                notes.push(format!("{s} {e}"));
             }
             Ok(_) => {}
             Err(f) => fs.push(f),
@@ -110,7 +120,7 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
             fs.push(Fail(p.into(), None, m, 5));
         }
         for Fail(comp, meta, reason, fl) in fs {
-            let (uk, pd, cd) = ("uid unknown, mode unknown", p.display(), comp.display());
+            let (uk, pd, cd) = ("uid unknown, mode unknown", fmt_os(p), fmt_os(&comp));
             let m = meta.map_or_else(|| uk.into(), |(u, d)| format!("uid {u}, mode {d:04o}"));
             let d = format!("first untrusted component '{cd}' ({m}): ");
             let message = format!("{lb} '{pd}': {}{reason}", if fl & 4 != 0 { "" } else { &d });
@@ -195,11 +205,10 @@ fn inspect_fd(c: &Ctx, fd: &OwnedFd, p: &Path) -> Result<(Stat, bool), Fail> {
     }
     let sf = fstatfs(fd).map_err(|e| fmeta(p, &st, e))?;
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let m = sf.f_type as u32;
-    if !is_local_posix_fs(m) {
-        return fse(&format!("filesystem 0x{m:x}"));
+    match sf.f_type as u32 {
+        m if !is_local_posix_fs(m) => fse(&format!("filesystem 0x{m:x}")),
+        _ => Ok((st, (sf.f_flags & 0x2000) != 0)),
     }
-    Ok((st, (sf.f_flags & 0x2000) != 0))
 }
 fn check_node(ctx: &Ctx, leaf: Option<u8>, path: &Path, st: &Stat) -> Result<bool, Fail> {
     let ft = FileType::from_raw_mode(st.st_mode);
@@ -247,7 +256,7 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
     let (mut hops, mut via, mut sym_rem) = (0_usize, None::<PathBuf>, 0_usize);
     let wrap = |v: &Option<PathBuf>, mut f: Fail| {
         if let (Some(l), 0) = (v, f.3 & 1) {
-            f.2 = format!("{SYM_BAD} (via '{}': {})", l.display(), f.2);
+            f.2 = format!("{SYM_BAD} (via '{}': {})", fmt_os(l), f.2);
         }
         f
     };
@@ -257,10 +266,8 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
             .map_err(|f| wrap(v, f))
     };
     while let Some(seg) = pending.pop() {
-        sym_rem = sym_rem.checked_sub(1).unwrap_or_else(|| {
-            via = None;
-            0
-        });
+        via = via.filter(|_| sym_rem > 0);
+        sym_rem = sym_rem.saturating_sub(1);
         let Some(cur) = stack.last() else { break };
         if seg == "." {
             op(&cur.0, ".", OFlags::DIRECTORY).map_err(|e| fmeta(&cur.1, &cur.2, e))?;
@@ -269,14 +276,12 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
         if seg == ".." {
             let dp = cur.1.join("..");
             let pfd = op(&cur.0, "..", OFlags::NOFOLLOW).map_err(|e| fin(&dp, e))?;
-            let (pst, _) = inspect_fd(c, &pfd, &cur.1)?;
+            let (pst, _) = inspect_fd(c, &pfd, &dp)?;
             let exp = stack.get(stack.len().saturating_sub(2)).or(stack.first());
             if !exp.is_some_and(|e| e.2.st_dev == pst.st_dev && e.2.st_ino == pst.st_ino) {
-                return Err(fin(&dp, "parent changed during walk"));
+                return Err(fmeta(&dp, &pst, "parent changed during walk"));
             }
-            if stack.len() > 1 {
-                stack.pop();
-            }
+            stack.truncate(stack.len().saturating_sub(1).max(1));
             continue;
         }
         let cp = cur.1.join(&seg);
@@ -284,9 +289,10 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
             Ok(fd) => fd,
             Err(Errno::NOENT) if cur.3 => {
                 let m = "under a parent where another account could create it";
-                let r = format!("missing component '{}' {m}", seg.to_string_lossy());
+                let r = format!("missing component '{}' {m}", fmt_os(&seg));
                 return Err(wrap(&via, fst(&cur.1, &cur.2, r, 0)));
             }
+            Err(Errno::NOENT) if role >= 2 => return Err(Fail(cp, None, MISS_CRE.into(), 1)),
             Err(Errno::NOENT) => return Ok(Some((cur.1.clone(), seg))),
             Err(e) => return Err(fin(&cp, e)),
         };
@@ -318,17 +324,15 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
             }
             hops += 1;
             if hops > 40 {
-                return Err(fin(&cp, Errno::LOOP));
+                return Err(fmeta(&cp, &st, Errno::LOOP));
             }
-            let tgt = readlinkat(&fd, "", Vec::new()).map_err(|e| fin(&cp, e))?;
+            let tgt = readlinkat(&fd, "", Vec::new()).map_err(|e| fmeta(&cp, &st, e))?;
             if tgt.as_bytes().is_empty() {
-                return Err(fin(&cp, "empty symbolic link target"));
+                return Err(fmeta(&cp, &st, "empty symbolic link target"));
             }
             via.get_or_insert(cp);
             let (abs, tsegs) = split_segs(OsStr::from_bytes(tgt.as_bytes()));
-            if abs {
-                stack.truncate(1);
-            }
+            stack.truncate(if abs { 1 } else { stack.len() });
             sym_rem += tsegs.len();
             pending.extend(tsegs);
             continue;

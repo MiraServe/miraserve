@@ -367,6 +367,41 @@ fn walk_at_enforces_fs_guard_leaves_acme_sticky_symlink_and_p2_rules() -> TestRe
         "missing component 'missing_mid' under a parent where another account could create it"
     );
 
+    // 10. Small pass 2: missing created dirs (role 2 ACME & role 3 rotating log) fail with W034
+    //     reason; role 0/1 absent leaves still return verified prefix; fmt_os is injective.
+    for role in [2_u8, 3] {
+        let m_mid = walk_at(&ctx, &root, Path::new("/good/new/sub"), role)
+            .err()
+            .ok_or("missing created intermediate dir must fail")?;
+        assert_eq!(m_mid.0, good.join("new"));
+        assert_eq!(m_mid.1, None);
+        assert_eq!(m_mid.2, MISS_CRE);
+        let m_leaf = walk_at(&ctx, &root, Path::new("/good/absent_leaf"), role)
+            .err()
+            .ok_or("missing created leaf dir must fail")?;
+        assert_eq!(m_leaf.0, good.join("absent_leaf"));
+        assert_eq!(m_leaf.1, None);
+        assert_eq!(m_leaf.2, MISS_CRE);
+    }
+    let tree_abs = walk_at(&ctx, &root, Path::new("/good/absent_tree"), 0).map_err(|f| f.2)?;
+    assert_eq!(
+        tree_abs,
+        Some((good.clone(), OsString::from("absent_tree")))
+    );
+
+    assert_eq!(
+        fmt_os(OsStr::from_bytes(b"/tmp/bad_\xff")),
+        "/tmp/bad_\\xff"
+    );
+    assert_eq!(
+        fmt_os(OsStr::from_bytes(b"/tmp/bad_\xfe")),
+        "/tmp/bad_\\xfe"
+    );
+    assert_eq!(fmt_os(OsStr::new("/tmp/bad_\u{FFFD}")), "/tmp/bad_\u{FFFD}");
+    assert_eq!(fmt_os(OsStr::new("/tmp/bad_\\xff")), "/tmp/bad_\\\\xff");
+    assert_eq!(fmt_os(OsStr::new("/tmp/nl\ndir")), "/tmp/nl\\ndir");
+    assert_eq!(fmt_os(OsStr::new("/tmp/nl\\ndir")), "/tmp/nl\\\\ndir");
+
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
@@ -401,7 +436,10 @@ fn walk_at_makes_zero_openat2_calls_under_seccomp_kill_thread() -> TestResult {
         let ctx = Ctx(Some(euid), true, Some(65_534), true);
         walk_at(&ctx, &root_c, Path::new("/real"), 3).map_err(|f| f.2)?;
         walk_at(&ctx, &root_c, Path::new("/link"), 3).map_err(|f| f.2)?;
-        walk_at(&ctx, &root_c, Path::new("/real/absent"), 3).map_err(|f| f.2)?;
+        walk_at(&ctx, &root_c, Path::new("/real/absent.sock"), 1).map_err(|f| f.2)?;
+        if walk_at(&ctx, &root_c, Path::new("/real/absent"), 3).is_ok() {
+            return Err("expected missing created log dir to return Err".to_owned());
+        }
         walk_at(&ctx, &root_c, Path::new("/real/../real"), 3).map_err(|f| f.2)?;
         walk_at(&ctx, &root_c, Path::new("/real"), 0).map_err(|f| f.2)?;
         walk_at(&ctx, &root_c, Path::new("/real"), 2).map_err(|f| f.2)?;
