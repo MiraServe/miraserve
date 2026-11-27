@@ -62,17 +62,28 @@ pub const LANDLOCK_TARGET_ABI_VERSION: u32 = 5;
 /// Minimum Linux Landlock ABI required for `run` to start (`ABI::V1`).
 pub const LANDLOCK_MIN_REQUIRED_ABI_VERSION: u32 = 1;
 
-/// Outcome of a query-only Linux Landlock availability probe.
+/// Outcome of a query-only Linux Landlock version query in the calling process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LandlockProbe {
-    /// Kernel supports Landlock at the reported ABI version.
+    /// The version query succeeded and reported the given Landlock ABI version.
     Available(u32),
-    /// Landlock is disabled in the kernel LSM list (`EOPNOTSUPP`).
+    /// The version query returned `EOPNOTSUPP` (Landlock disabled or query refused).
     Disabled,
-    /// Landlock is not available on this kernel (`ENOSYS` or filtered).
+    /// The version query failed without `EOPNOTSUPP` (Landlock not available or query refused).
     NotImplemented,
-    /// Probing Landlock availability failed.
+    /// Probing Landlock availability returned an unexpected error or ABI.
     ProbeError(String),
+}
+
+impl LandlockProbe {
+    /// Returns the probed Landlock ABI version when available, or `None` otherwise.
+    #[must_use]
+    pub const fn available_abi(&self) -> Option<u32> {
+        match *self {
+            Self::Available(abi) => Some(abi),
+            Self::Disabled | Self::NotImplemented | Self::ProbeError(_) => None,
+        }
+    }
 }
 #[cfg(target_os = "linux")]
 pub use linux::probe_landlock_availability;
@@ -4679,10 +4690,7 @@ mod linux {
     }
 
     pub(crate) fn probe_host_landlock_abi() -> Option<u32> {
-        match probe_landlock_availability() {
-            crate::LandlockProbe::Available(abi) => Some(abi),
-            _ => None,
-        }
+        probe_landlock_availability().available_abi()
     }
 
     const LINUX_EPERM: u32 = 1;

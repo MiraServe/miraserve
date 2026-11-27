@@ -11188,20 +11188,111 @@ fn compile_landlock_syscall_filter(
     Ok(SeccompFilter::new(rules, SeccompAction::Allow, action, arch)?.try_into()?)
 }
 
+#[cfg(target_os = "linux")]
+fn host_supports_landlock_for_run() -> bool {
+    // Independent of `probe_landlock_availability`: exercises the real runtime `Ruleset::default()`
+    // enforcement path on a disposable thread so a regression breaking the probe cannot silently
+    // skip the capable-host test.
+    std::thread::spawn(|| {
+        let Ok((cfg, _)) = miraserve_config::parse_kdl(
+            "probe.kdl",
+            r#"server { listen "127.0.0.1:8443"; sandbox { landlock #true; seccomp "off" } }"#,
+        ) else {
+            return false;
+        };
+        let mut policy = miraserve_core::SandboxPolicy::from_config_with_file(&cfg, None, None);
+        policy.finalize_grants().is_ok()
+            && miraserve_core::apply_landlock_current_thread(&policy).is_ok()
+    })
+    .join()
+    .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn compile_query_only_landlock_filter()
+-> Result<seccompiler::BpfProgram, Box<dyn std::error::Error>> {
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
+    use std::collections::BTreeMap;
+
+    const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    const SYS_LANDLOCK_ADD_RULE: i64 = 445;
+    const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
+    const LANDLOCK_CREATE_RULESET_VERSION: u64 = 1;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+
+    let arch = TargetArch::try_from(std::env::consts::ARCH)?;
+    let sys_prctl: i64 = match arch {
+        TargetArch::x86_64 => 157,
+        TargetArch::aarch64 | TargetArch::riscv64 => 167,
+    };
+
+    // Allow ONLY `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
+    // Kill on any ruleset creation, `landlock_add_rule`, `landlock_restrict_self`, or
+    // `prctl(PR_SET_NO_NEW_PRIVS, ...)`.
+    let non_version_create_rules = vec![
+        SeccompRule::new(vec![SeccompCondition::new(
+            0,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Ne,
+            0,
+        )?])?,
+        SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Qword,
+            SeccompCmpOp::Ne,
+            0,
+        )?])?,
+        SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Ne,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )?])?,
+    ];
+    let nnp_rules = vec![SeccompRule::new(vec![SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        PR_SET_NO_NEW_PRIVS,
+    )?])?];
+
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    rules.insert(
+        SYS_LANDLOCK_CREATE_RULESET,
+        non_version_create_rules.clone(),
+    );
+    rules.insert(SYS_LANDLOCK_ADD_RULE, Vec::new());
+    rules.insert(SYS_LANDLOCK_RESTRICT_SELF, Vec::new());
+    rules.insert(sys_prctl, nnp_rules.clone());
+    if arch == TargetArch::x86_64 {
+        rules.insert(
+            SYS_LANDLOCK_CREATE_RULESET | 0x4000_0000,
+            non_version_create_rules,
+        );
+        rules.insert(SYS_LANDLOCK_ADD_RULE | 0x4000_0000, Vec::new());
+        rules.insert(SYS_LANDLOCK_RESTRICT_SELF | 0x4000_0000, Vec::new());
+        rules.insert(sys_prctl | 0x4000_0000, nnp_rules);
+    }
+    Ok(SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        arch,
+    )?
+    .try_into()?)
+}
+
 /// On Linux with Landlock available, `check --fs` on both example configurations and a generated
-/// valid configuration emits no `W035`, and never calls `landlock_add_rule` or
-/// `landlock_restrict_self` (query-only probe).
+/// valid configuration emits no `W035`, and never creates a ruleset, adds a rule, restricts the
+/// process, or sets `PR_SET_NO_NEW_PRIVS` (query-only probe).
 #[cfg(target_os = "linux")]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
-    const SYS_LANDLOCK_ADD_RULE: i64 = 445;
-    const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
-
-    if !matches!(
-        miraserve_core::probe_landlock_availability(),
-        miraserve_core::LandlockProbe::Available(abi) if abi >= 1
-    ) {
+    if !host_supports_landlock_for_run() {
         return Ok(());
     }
 
@@ -11244,8 +11335,9 @@ fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
         );
     }
 
-    // 2. Generated valid config under KILL_PROCESS on add_rule/restrict_self: succeeds with 0
-    //    warnings, proving `check --fs` is query-only and never restricts the checking process.
+    // 2. Generated valid config under KILL_PROCESS on non-version create_ruleset, add_rule,
+    //    restrict_self, and prctl(PR_SET_NO_NEW_PRIVS): succeeds with 0 warnings for both
+    //    `check --fs --strict --format json` and `check --fs --strict --writable-set`.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -11281,13 +11373,10 @@ fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
         ),
     )?;
 
-    let kill_restrict = compile_landlock_syscall_filter(
-        &[SYS_LANDLOCK_ADD_RULE, SYS_LANDLOCK_RESTRICT_SELF],
-        seccompiler::SeccompAction::KillProcess,
-    )?;
+    let kill_non_query = compile_query_only_landlock_filter()?;
     let cfg_c = cfg.clone();
     std::thread::spawn(move || -> Result<(), String> {
-        seccompiler::apply_filter(&kill_restrict).map_err(|e| e.to_string())?;
+        seccompiler::apply_filter(&kill_non_query).map_err(|e| e.to_string())?;
         let out = Command::new(miraserve_bin())
             .args(["check", "--fs", "--strict", "--format", "json"])
             .arg(&cfg_c)
@@ -11295,7 +11384,7 @@ fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
             .map_err(|e| e.to_string())?;
         if !out.status.success() {
             return Err(format!(
-                "check --fs --strict failed under KILL add_rule/restrict_self: status={:?} stderr={}",
+                "check --fs --strict failed under query-only filter: status={:?} stderr={}",
                 out.status,
                 String::from_utf8_lossy(&out.stderr)
             ));
@@ -11309,6 +11398,30 @@ fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
         if !empty {
             return Err(format!("expected 0 warnings, got: {parsed}"));
         }
+
+        let ws = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--strict", "--writable-set"])
+            .arg(&cfg_c)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !ws.status.success() {
+            return Err(format!(
+                "check --fs --strict --writable-set failed under query-only filter: status={:?} stderr={}",
+                ws.status,
+                String::from_utf8_lossy(&ws.stderr)
+            ));
+        }
+        let ws_out = String::from_utf8_lossy(&ws.stdout);
+        let first = ws_out.lines().next().unwrap_or("");
+        if !(first.starts_with("landlock enforced abi=")
+            || first.starts_with("landlock partial abi="))
+            || !ws.stderr.is_empty()
+        {
+            return Err(format!(
+                "unexpected --fs --writable-set output: stdout={ws_out:?} stderr={:?}",
+                String::from_utf8_lossy(&ws.stderr)
+            ));
+        }
         Ok(())
     })
     .join()
@@ -11321,16 +11434,25 @@ fn check_fs_landlock_available_emits_no_w035_and_is_query_only() -> TestResult {
 
 /// On Linux, uses the existing in-tree `seccompiler` thread-filter technique (cf.
 /// `compile_openat2_errno_filter` and `check_fs_fastcgi_unix_socket_never_calls_faccessat2_*`)
-/// to make `landlock_create_ruleset(2)` return `ENOSYS`, `EOPNOTSUPP`, or `KILL_PROCESS` and
-/// verifies: `W035` text & JSON output, `--strict`, `--allow-warning W035`, omitted `sandbox`
-/// block, unchanged `check` without `--fs`, and zero probe when Landlock is disabled.
+/// to make `landlock_create_ruleset(2)` return `ENOSYS`, `EPERM`, `EOPNOTSUPP`, or `KILL_PROCESS`
+/// and verifies: `W035` exact text & JSON output, `--strict`, `--allow-warning W035`, omitted
+/// `sandbox` block, unchanged `check` without `--fs`, and zero probe when Landlock is disabled.
 #[cfg(target_os = "linux")]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> TestResult {
     const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
+    const LINUX_EPERM: u32 = 1;
     const LINUX_ENOSYS: u32 = 38;
     const LINUX_EOPNOTSUPP: u32 = 95;
+    const EXP_HELP: &str = "ensure Landlock is available to the service, or disable via \
+        `sandbox { landlock #false }` or `--no-sandbox`";
+    const EXP_NOT_CONFIRMED: &str = "Linux Landlock could not be confirmed for this process \
+        (not available, disabled, or query refused); \
+        `miraserve run` refuses to start when Landlock is unavailable";
+    const EXP_DISABLED: &str = "Linux Landlock could not be confirmed for this process \
+        (disabled or query refused with EOPNOTSUPP); \
+        `miraserve run` refuses to start when Landlock is unavailable";
 
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -11399,7 +11521,7 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
         .output()?;
     assert!(plain_baseline.status.success());
 
-    // 1. ENOSYS on landlock_create_ruleset -> W035 ("not available on this kernel"),
+    // 1. ENOSYS on landlock_create_ruleset -> W035 (exact lines & JSON),
     //    `--strict` fails, `--allow-warning W035` accepts, `check` without `--fs` byte-identical.
     let enosys_bpf = compile_landlock_syscall_filter(
         &[SYS_LANDLOCK_CREATE_RULESET],
@@ -11422,10 +11544,12 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
             return Err("check without --fs changed under ENOSYS".to_owned());
         }
 
-        let exp_msg = "Linux Landlock LSM not available on this kernel; \
-            `miraserve run` will refuse to start on this kernel";
+        let expected_stderr_lines = vec![
+            format!("warning[W035]: {EXP_NOT_CONFIRMED}"),
+            format!("  help: {EXP_HELP}"),
+        ];
 
-        // `check --fs` (non-strict, text): exits 0 (warning, never error), emits exact W035.
+        // `check --fs` (non-strict, text): exits 0 (warning, never error), exact stderr lines.
         let fs_text = Command::new(miraserve_bin())
             .args(["check", "--fs"])
             .arg(&on_c)
@@ -11435,8 +11559,11 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
             return Err(format!("non-strict check --fs exited {:?}", fs_text.status));
         }
         let err_s = String::from_utf8_lossy(&fs_text.stderr);
-        if !err_s.contains(&format!("warning[W035]: {exp_msg}")) || !err_s.contains("  help: ") {
-            return Err(format!("unexpected W035 text stderr:\n{err_s}"));
+        let actual_lines: Vec<String> = err_s.lines().map(ToOwned::to_owned).collect();
+        if actual_lines != expected_stderr_lines {
+            return Err(format!(
+                "unexpected W035 text stderr lines:\nactual:   {actual_lines:?}\nexpected: {expected_stderr_lines:?}"
+            ));
         }
 
         // `check --fs --format json`: valid=true, 1 W035 with exact message & path.
@@ -11461,7 +11588,8 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
         if w.get("code").and_then(serde_json::Value::as_str) != Some("W035")
             || w.get("severity").and_then(serde_json::Value::as_str) != Some("warning")
             || w.get("path").and_then(serde_json::Value::as_str) != Some("server.sandbox.landlock")
-            || w.get("message").and_then(serde_json::Value::as_str) != Some(exp_msg)
+            || w.get("message").and_then(serde_json::Value::as_str) != Some(EXP_NOT_CONFIRMED)
+            || w.get("help").and_then(serde_json::Value::as_str) != Some(EXP_HELP)
         {
             return Err(format!("unexpected W035 JSON entry: {w}"));
         }
@@ -11501,13 +11629,12 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
             .arg(&on_c)
             .output()
             .map_err(|e| e.to_string())?;
-        if !allow_text.status.success()
-            || !String::from_utf8_lossy(&allow_text.stderr).contains("warning[W035]:")
-        {
+        let allow_err_s = String::from_utf8_lossy(&allow_text.stderr);
+        let allow_lines: Vec<String> = allow_err_s.lines().map(ToOwned::to_owned).collect();
+        if !allow_text.status.success() || allow_lines != expected_stderr_lines {
             return Err(format!(
-                "--allow-warning W035 text failed: status={:?} stderr={}",
-                allow_text.status,
-                String::from_utf8_lossy(&allow_text.stderr)
+                "--allow-warning W035 text failed: status={:?} lines={allow_lines:?}",
+                allow_text.status
             ));
         }
         let allow_json = Command::new(miraserve_bin())
@@ -11571,7 +11698,43 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
     .map_err(|_| "ENOSYS W035 thread panicked")?
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // 2. EOPNOTSUPP on landlock_create_ruleset -> W035 ("disabled in LSM list").
+    // 2. EPERM on landlock_create_ruleset -> W035 with narrowed wording (never asserts kernel
+    //    absence when a filter refuses the query).
+    let eperm_bpf = compile_landlock_syscall_filter(
+        &[SYS_LANDLOCK_CREATE_RULESET],
+        seccompiler::SeccompAction::Errno(LINUX_EPERM),
+    )?;
+    let on_c_eperm = on_cfg.clone();
+    std::thread::spawn(move || -> Result<(), String> {
+        seccompiler::apply_filter(&eperm_bpf).map_err(|e| e.to_string())?;
+        let out = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--format", "json"])
+            .arg(&on_c_eperm)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("EPERM non-strict exited {:?}", out.status));
+        }
+        let j: serde_json::Value =
+            serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+        let w = j
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|ws| ws.first())
+            .ok_or("missing W035 for EPERM")?;
+        if w.get("code").and_then(serde_json::Value::as_str) != Some("W035")
+            || w.get("path").and_then(serde_json::Value::as_str) != Some("server.sandbox.landlock")
+            || w.get("message").and_then(serde_json::Value::as_str) != Some(EXP_NOT_CONFIRMED)
+        {
+            return Err(format!("unexpected EPERM W035: {w}"));
+        }
+        Ok(())
+    })
+    .join()
+    .map_err(|_| "EPERM W035 thread panicked")?
+    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+
+    // 3. EOPNOTSUPP on landlock_create_ruleset -> W035 (disabled or refused with EOPNOTSUPP).
     let eopnotsupp_bpf = compile_landlock_syscall_filter(
         &[SYS_LANDLOCK_CREATE_RULESET],
         seccompiler::SeccompAction::Errno(LINUX_EOPNOTSUPP),
@@ -11594,11 +11757,9 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
             .and_then(serde_json::Value::as_array)
             .and_then(|ws| ws.first())
             .ok_or("missing W035 for EOPNOTSUPP")?;
-        let exp_dis = "Linux Landlock LSM not available (disabled in LSM list); \
-            `miraserve run` will refuse to start on this kernel";
         if w.get("code").and_then(serde_json::Value::as_str) != Some("W035")
             || w.get("path").and_then(serde_json::Value::as_str) != Some("server.sandbox.landlock")
-            || w.get("message").and_then(serde_json::Value::as_str) != Some(exp_dis)
+            || w.get("message").and_then(serde_json::Value::as_str) != Some(EXP_DISABLED)
         {
             return Err(format!("unexpected EOPNOTSUPP W035: {w}"));
         }
@@ -11608,7 +11769,7 @@ fn check_fs_landlock_unavailable_seccomp_w035_strict_allow_and_sandbox_off() -> 
     .map_err(|_| "EOPNOTSUPP W035 thread panicked")?
     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // 3. KILL_PROCESS on landlock_create_ruleset: proves NO probe syscall is made when
+    // 4. KILL_PROCESS on landlock_create_ruleset: proves NO probe syscall is made when
     //    `sandbox { landlock #false }`, when `--no-sandbox` is passed, or without `--fs`.
     let kill_create = compile_landlock_syscall_filter(
         &[SYS_LANDLOCK_CREATE_RULESET],

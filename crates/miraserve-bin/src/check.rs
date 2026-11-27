@@ -596,11 +596,17 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
     filtered_warnings.extend(fs_warnings);
 
     #[cfg(target_os = "linux")]
-    if args.fs && loaded.config.server.sandbox.landlock && !args.no_sandbox {
-        let probe = miraserve_core::probe_landlock_availability();
-        let req = miraserve_core::LANDLOCK_MIN_REQUIRED_ABI_VERSION;
-        filtered_warnings.extend(landlock_availability_warning(&probe, req, loaded));
-    }
+    let landlock_probe = {
+        let (probe, warn) = probe_fs_landlock_once(
+            args.fs,
+            loaded.config.server.sandbox.landlock,
+            args.no_sandbox,
+            loaded,
+            miraserve_core::probe_landlock_availability,
+        );
+        filtered_warnings.extend(warn);
+        probe
+    };
 
     let trusted_path_notes = if args.trusted_paths {
         #[cfg(target_os = "linux")]
@@ -881,6 +887,13 @@ fn handle_valid(loaded: &LoadedConfig, args: &CheckArgs) -> ExitCode {
                     ));
                     return ExitCode::FAILURE;
                 }
+                #[cfg(target_os = "linux")]
+                let enforcement = resolve_landlock_enforcement(
+                    prepared.policy.landlock,
+                    landlock_probe.as_ref(),
+                    miraserve_core::probe_landlock_availability,
+                );
+                #[cfg(not(target_os = "linux"))]
                 let enforcement = miraserve_core::probe_landlock_enforcement(&prepared.policy);
                 let mut lines: Vec<String> = vec![enforcement.state_line()];
                 if enforcement.is_enforcing() {
@@ -2792,6 +2805,54 @@ fn make_report_handler() -> GraphicalReportHandler {
     GraphicalReportHandler::new_themed(GraphicalTheme::unicode_nocolor())
 }
 
+/// Evaluates the `--fs` Landlock version query (`W035`) and returns the probe outcome so a later
+/// `--writable-set` classification in the same `check` invocation reuses it without a second query.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn probe_fs_landlock_once<F>(
+    fs: bool,
+    landlock_enabled: bool,
+    no_sandbox: bool,
+    loaded: &LoadedConfig,
+    probe_fn: F,
+) -> (Option<miraserve_core::LandlockProbe>, Option<ConfigIssue>)
+where
+    F: FnOnce() -> miraserve_core::LandlockProbe,
+{
+    if !(fs && landlock_enabled && !no_sandbox) {
+        return (None, None);
+    }
+    let probe = probe_fn();
+    let req = miraserve_core::LANDLOCK_MIN_REQUIRED_ABI_VERSION;
+    let warn = landlock_availability_warning(&probe, req, loaded);
+    (Some(probe), warn)
+}
+
+/// Resolves `--writable-set` Landlock enforcement, reusing `cached_probe` whenever `--fs` already
+/// queried Landlock in this invocation so at most one version query is issued per `check`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn resolve_landlock_enforcement<F>(
+    policy_landlock: bool,
+    cached_probe: Option<&miraserve_core::LandlockProbe>,
+    probe_fn: F,
+) -> miraserve_core::LandlockEnforcement
+where
+    F: FnOnce() -> miraserve_core::LandlockProbe,
+{
+    if !policy_landlock {
+        return miraserve_core::LandlockEnforcement::Disabled;
+    }
+    let host_abi = match cached_probe {
+        Some(probe) => probe.available_abi(),
+        None => probe_fn().available_abi(),
+    };
+    miraserve_core::classify_landlock_enforcement(policy_landlock, host_abi)
+}
+
+/// Emits `W035` for one condition only: the Landlock version query made by this checking process
+/// could not confirm Landlock at or above `req` ABI (not available, disabled, refused, or ABI too
+/// low). This is not a prediction that `miraserve run` will start; absence of `W035` does not
+/// guarantee startup (for example, a filter denying `landlock_restrict_self`, or a service
+/// environment that differs from the checking process).
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
 fn landlock_availability_warning(
     probe: &miraserve_core::LandlockProbe,
@@ -2800,15 +2861,21 @@ fn landlock_availability_warning(
 ) -> Option<ConfigIssue> {
     use miraserve_core::LandlockProbe as P;
     const L: &str = "Linux Landlock";
-    const R: &str = "`miraserve run` will refuse to start on this kernel";
+    const R: &str = "`miraserve run` refuses to start when Landlock is unavailable";
     const K: &str = "server.sandbox.landlock";
-    const H: &str = "run on a Landlock-enabled Linux kernel, or disable via `sandbox { landlock #false }` or `--no-sandbox`";
+    const H: &str = "ensure Landlock is available to the service, or disable via `sandbox { landlock #false }` or `--no-sandbox`";
     let message = match probe {
         P::Available(a) if *a >= req && *a >= 1 => return None,
-        P::Available(a) => format!("{L} ABI {a} found, ABI {req} required; {R}"),
-        P::Disabled => format!("{L} LSM not available (disabled in LSM list); {R}"),
-        P::NotImplemented => format!("{L} LSM not available on this kernel; {R}"),
-        P::ProbeError(e) => format!("{L} probe failed ({e}); {R} if unavailable"),
+        P::Available(a) => format!("{L} ABI {a} found for this process, ABI {req} required; {R}"),
+        P::Disabled => format!(
+            "{L} could not be confirmed for this process (disabled or query refused with EOPNOTSUPP); {R}"
+        ),
+        P::NotImplemented => format!(
+            "{L} could not be confirmed for this process (not available, disabled, or query refused); {R}"
+        ),
+        P::ProbeError(e) => {
+            format!("{L} could not be confirmed for this process (query error: {e}); {R}")
+        }
     };
     Some(ConfigIssue {
         code: "W035".into(),
@@ -3127,9 +3194,11 @@ mod writable_set_unit_tests {
     #[allow(clippy::too_many_lines)]
     fn landlock_availability_warning_covers_every_probe_branch_and_location()
     -> Result<(), Box<dyn std::error::Error>> {
-        use miraserve_core::LandlockProbe;
-        const EXPECTED_HELP: &str = "run on a Landlock-enabled Linux kernel, or disable via \
+        use miraserve_core::{LANDLOCK_MIN_REQUIRED_ABI_VERSION, LandlockProbe};
+        const EXPECTED_HELP: &str = "ensure Landlock is available to the service, or disable via \
             `sandbox { landlock #false }` or `--no-sandbox`";
+
+        assert_eq!(LANDLOCK_MIN_REQUIRED_ABI_VERSION, 1);
 
         let explicit = parse_kdl_detailed(
             "explicit.kdl",
@@ -3137,7 +3206,10 @@ mod writable_set_unit_tests {
 server {
     listen ":443"
     tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
-    sandbox { landlock #true; seccomp "strict" }
+    sandbox {
+        landlock #true
+        seccomp "strict"
+    }
 }
 site "a.example" { root "/var/www/a" }
 "#,
@@ -3164,21 +3236,25 @@ site "a.example" { root "/var/www/a" }
 "#,
         )?;
 
-        // 1. Available at or above required ABI -> None (no warning).
-        assert_eq!(
-            landlock_availability_warning(&LandlockProbe::Available(1), 1, &explicit),
-            None
-        );
-        assert_eq!(
-            landlock_availability_warning(&LandlockProbe::Available(5), 1, &explicit),
-            None
-        );
+        // 1. Available at or above the production minimum ABI (1..=5) -> None (no warning).
+        for abi in 1..=5 {
+            assert_eq!(
+                landlock_availability_warning(
+                    &LandlockProbe::Available(abi),
+                    LANDLOCK_MIN_REQUIRED_ABI_VERSION,
+                    &explicit,
+                ),
+                None,
+                "production minimum must accept ABI {abi}"
+            );
+        }
         assert_eq!(
             landlock_availability_warning(&LandlockProbe::Available(5), 5, &explicit),
             None
         );
 
-        // 2. Available below required ABI (and zero ABI) -> W035 naming ABI found vs required.
+        // 2. Available below required ABI (and zero ABI) -> W035 naming ABI found vs required,
+        //    pinned to the explicit `landlock` line (not the enclosing `sandbox` or `server` line).
         let low = landlock_availability_warning(&LandlockProbe::Available(2), 5, &explicit)
             .ok_or("expected W035 for ABI 2 < 5")?;
         assert_eq!(low.code, "W035");
@@ -3186,56 +3262,85 @@ site "a.example" { root "/var/www/a" }
         assert_eq!(low.path.as_deref(), Some("server.sandbox.landlock"));
         assert_eq!(
             low.message,
-            "Linux Landlock ABI 2 found, ABI 5 required; `miraserve run` will refuse to start on this kernel"
+            "Linux Landlock ABI 2 found for this process, ABI 5 required; \
+             `miraserve run` refuses to start when Landlock is unavailable"
         );
         assert_eq!(low.help.as_deref(), Some(EXPECTED_HELP));
-        assert_eq!(
-            low.location,
-            explicit.location_for("server.sandbox.landlock")
-        );
-        assert!(low.location.is_some());
+        let low_loc = low.location.ok_or("expected explicit landlock location")?;
+        let sandbox_loc = explicit
+            .location_for("server.sandbox")
+            .ok_or("expected sandbox location")?;
+        let server_loc = explicit
+            .location_for("server")
+            .ok_or("expected server location")?;
+        assert_eq!(low_loc.line, 6);
+        assert_eq!(sandbox_loc.line, 5);
+        assert_eq!(server_loc.line, 2);
+        assert_ne!(low_loc, sandbox_loc);
 
-        let zero = landlock_availability_warning(&LandlockProbe::Available(0), 1, &explicit)
-            .ok_or("expected W035 for ABI 0 < 1")?;
+        let zero = landlock_availability_warning(
+            &LandlockProbe::Available(0),
+            LANDLOCK_MIN_REQUIRED_ABI_VERSION,
+            &explicit,
+        )
+        .ok_or("expected W035 for ABI 0 < 1")?;
         assert_eq!(zero.code, "W035");
         assert_eq!(zero.path.as_deref(), Some("server.sandbox.landlock"));
         assert_eq!(
             zero.message,
-            "Linux Landlock ABI 0 found, ABI 1 required; `miraserve run` will refuse to start on this kernel"
+            "Linux Landlock ABI 0 found for this process, ABI 1 required; \
+             `miraserve run` refuses to start when Landlock is unavailable"
         );
 
-        // 3. Disabled in kernel LSM list (EOPNOTSUPP) -> W035.
-        let disabled = landlock_availability_warning(&LandlockProbe::Disabled, 1, &block_only)
-            .ok_or("expected W035 for Disabled")?;
+        // 3. Disabled / EOPNOTSUPP -> W035 falling back to the `sandbox` line (not `server`).
+        let disabled = landlock_availability_warning(
+            &LandlockProbe::Disabled,
+            LANDLOCK_MIN_REQUIRED_ABI_VERSION,
+            &block_only,
+        )
+        .ok_or("expected W035 for Disabled")?;
         assert_eq!(disabled.code, "W035");
         assert_eq!(disabled.severity, Severity::Warning);
         assert_eq!(disabled.path.as_deref(), Some("server.sandbox.landlock"));
         assert_eq!(
             disabled.message,
-            "Linux Landlock LSM not available (disabled in LSM list); `miraserve run` will refuse to start on this kernel"
+            "Linux Landlock could not be confirmed for this process \
+             (disabled or query refused with EOPNOTSUPP); \
+             `miraserve run` refuses to start when Landlock is unavailable"
         );
         assert_eq!(disabled.help.as_deref(), Some(EXPECTED_HELP));
-        assert_eq!(disabled.location, block_only.location_for("server.sandbox"));
-        assert!(disabled.location.is_some());
+        let dis_loc = disabled.location.ok_or("expected sandbox fallback")?;
+        let block_server_loc = block_only
+            .location_for("server")
+            .ok_or("expected server location")?;
+        assert_eq!(dis_loc.line, 5);
+        assert_eq!(block_server_loc.line, 2);
+        assert_ne!(dis_loc, block_server_loc);
 
-        // 4. Not implemented in kernel (ENOSYS / filtered) -> W035.
-        let not_impl = landlock_availability_warning(&LandlockProbe::NotImplemented, 1, &omitted)
-            .ok_or("expected W035 for NotImplemented")?;
+        // 4. Not implemented / refused -> W035 falling back to `server`.
+        let not_impl = landlock_availability_warning(
+            &LandlockProbe::NotImplemented,
+            LANDLOCK_MIN_REQUIRED_ABI_VERSION,
+            &omitted,
+        )
+        .ok_or("expected W035 for NotImplemented")?;
         assert_eq!(not_impl.code, "W035");
         assert_eq!(not_impl.severity, Severity::Warning);
         assert_eq!(not_impl.path.as_deref(), Some("server.sandbox.landlock"));
         assert_eq!(
             not_impl.message,
-            "Linux Landlock LSM not available on this kernel; `miraserve run` will refuse to start on this kernel"
+            "Linux Landlock could not be confirmed for this process \
+             (not available, disabled, or query refused); \
+             `miraserve run` refuses to start when Landlock is unavailable"
         );
         assert_eq!(not_impl.help.as_deref(), Some(EXPECTED_HELP));
-        assert_eq!(not_impl.location, omitted.location_for("server"));
-        assert!(not_impl.location.is_some());
+        let omitted_loc = not_impl.location.ok_or("expected server fallback")?;
+        assert_eq!(omitted_loc.line, 2);
 
-        // 5. Probe error -> W035 stating probe failure, never silent, never Error severity.
+        // 5. Probe error -> W035 stating query error, never silent, never Error severity.
         let err_issue = landlock_availability_warning(
             &LandlockProbe::ProbeError("unexpected Landlock ABI 0".to_owned()),
-            1,
+            LANDLOCK_MIN_REQUIRED_ABI_VERSION,
             &explicit,
         )
         .ok_or("expected W035 for ProbeError")?;
@@ -3244,9 +3349,116 @@ site "a.example" { root "/var/www/a" }
         assert_eq!(err_issue.path.as_deref(), Some("server.sandbox.landlock"));
         assert_eq!(
             err_issue.message,
-            "Linux Landlock probe failed (unexpected Landlock ABI 0); `miraserve run` will refuse to start on this kernel if unavailable"
+            "Linux Landlock could not be confirmed for this process \
+             (query error: unexpected Landlock ABI 0); \
+             `miraserve run` refuses to start when Landlock is unavailable"
         );
         assert_eq!(err_issue.help.as_deref(), Some(EXPECTED_HELP));
+        Ok(())
+    }
+
+    #[test]
+    fn fs_and_writable_set_reuses_single_landlock_probe_decision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use miraserve_core::{LandlockEnforcement, LandlockProbe};
+
+        let loaded = parse_kdl_detailed(
+            "reuse.kdl",
+            r#"
+server {
+    listen ":443"
+    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
+    sandbox { landlock #true; seccomp "strict" }
+}
+site "a.example" { root "/var/www/a" }
+"#,
+        )?;
+
+        // Combined `--fs --writable-set`: `probe_fs_landlock_once` caches the query and
+        // `resolve_landlock_enforcement` reuses it so the probe closure runs exactly once.
+        for (probe_val, expect_w035, expect_enforcement) in [
+            (
+                LandlockProbe::Available(5),
+                false,
+                LandlockEnforcement::Enforced { abi: 5 },
+            ),
+            (
+                LandlockProbe::Available(3),
+                false,
+                LandlockEnforcement::Partial { abi: 3 },
+            ),
+            (
+                LandlockProbe::Available(1),
+                false,
+                LandlockEnforcement::Partial { abi: 1 },
+            ),
+            (
+                LandlockProbe::Disabled,
+                true,
+                LandlockEnforcement::Unavailable,
+            ),
+            (
+                LandlockProbe::NotImplemented,
+                true,
+                LandlockEnforcement::Unavailable,
+            ),
+            (
+                LandlockProbe::ProbeError("unexpected Landlock ABI 0".to_owned()),
+                true,
+                LandlockEnforcement::Unavailable,
+            ),
+        ] {
+            let mut calls = 0_usize;
+            let (cached, warn) = probe_fs_landlock_once(true, true, false, &loaded, || {
+                calls += 1;
+                probe_val.clone()
+            });
+            let enforcement = resolve_landlock_enforcement(true, cached.as_ref(), || {
+                calls += 1;
+                probe_val.clone()
+            });
+            assert_eq!(calls, 1, "expected exactly 1 probe for {probe_val:?}");
+            assert_eq!(warn.is_some(), expect_w035);
+            if let Some(w) = warn {
+                assert_eq!(w.code, "W035");
+            }
+            assert_eq!(enforcement, expect_enforcement);
+        }
+
+        // `--writable-set` without `--fs`: probes once in `resolve_landlock_enforcement`.
+        {
+            let mut calls = 0_usize;
+            let (cached, warn) = probe_fs_landlock_once(false, true, false, &loaded, || {
+                calls += 1;
+                LandlockProbe::Available(5)
+            });
+            assert!(cached.is_none());
+            assert!(warn.is_none());
+            let enforcement = resolve_landlock_enforcement(true, cached.as_ref(), || {
+                calls += 1;
+                LandlockProbe::Available(5)
+            });
+            assert_eq!(calls, 1);
+            assert_eq!(enforcement, LandlockEnforcement::Enforced { abi: 5 });
+        }
+
+        // Landlock disabled (`landlock #false` or `--no-sandbox`): zero probes.
+        for (landlock_enabled, no_sandbox) in [(false, false), (true, true)] {
+            let mut calls = 0_usize;
+            let (cached, warn) =
+                probe_fs_landlock_once(true, landlock_enabled, no_sandbox, &loaded, || {
+                    calls += 1;
+                    LandlockProbe::NotImplemented
+                });
+            let enforcement = resolve_landlock_enforcement(false, cached.as_ref(), || {
+                calls += 1;
+                LandlockProbe::NotImplemented
+            });
+            assert_eq!(calls, 0);
+            assert!(cached.is_none());
+            assert!(warn.is_none());
+            assert_eq!(enforcement, LandlockEnforcement::Disabled);
+        }
         Ok(())
     }
 }
