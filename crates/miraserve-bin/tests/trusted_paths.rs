@@ -112,6 +112,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "--fs",
         "W034",
         "Linux-only",
+        "its only warning code is `W034`; it also prints notes",
         "Walks the directories on the way to five kinds of configured paths and stops at the first component it reports or does not find:",
         "socket-tree",
         "fastcgi-pass",
@@ -160,6 +161,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "owned by another account, group/other-writable",
         "when the configuration names a service account different",
         "may be able to replace that path while the server starts",
+        "reports `w034` only",
     ] {
         assert!(
             !lower.contains(forbidden),
@@ -789,7 +791,9 @@ mod linux_tests {
             Some(
                 format!(
                     "ACME directory '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component 'absent_acme' under a parent where another account could create it",
+                     (uid {euid}, mode 1777): missing component 'absent_acme' under a parent where \
+                     another account could create it, and if it is created later the permissions it \
+                     would inherit are not verified",
                     missing_direct.display(),
                     sticky.display()
                 )
@@ -805,7 +809,9 @@ mod linux_tests {
             Some(
                 format!(
                     "rotating --log-file parent directory '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component 'absent_mid' under a parent where another account could create it",
+                     (uid {euid}, mode 1777): missing component 'absent_mid' under a parent where \
+                     another account could create it, and if it is created later the permissions it \
+                     would inherit are not verified",
                     missing_deep_dir.display(),
                     sticky.display()
                 )
@@ -1135,7 +1141,7 @@ mod linux_tests {
                 "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
                  site \"p2.example\" {{\n\
                      root \"{}\"\n\
-                     route \"*.php\" {{ fastcgi-pass \"unix:{}/future/pool.sock\" }}\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:{}/pool.sock\" }}\n\
                  }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
@@ -1144,7 +1150,7 @@ mod linux_tests {
             ),
         )?;
 
-        // 1. P2-1: absent suffix under trusted parent emits verified-prefix note naming where walk stopped.
+        // 1. P2-1: absent exact socket under existing trusted parent emits verified-prefix note.
         let (ok_code, ok_val) = run_json(&["--fs", "--strict", "--trusted-paths"], &cfg)?;
         assert_eq!(ok_code, Some(0), "absent under trusted must pass: {ok_val}");
         assert!(w034s(&ok_val).is_empty(), "ok_val: {ok_val}");
@@ -1152,8 +1158,8 @@ mod linux_tests {
             note_at(&ok_val, 2),
             Some(
                 format!(
-                    "trusted-paths: site 'p2.example' FastCGI Unix socket '{}/future/pool.sock': \
-                     inspected existing prefix '{}' (stopped at 'future', not found by this lookup)",
+                    "trusted-paths: site 'p2.example' FastCGI Unix socket '{}/pool.sock': \
+                     inspected existing prefix '{}' (stopped at 'pool.sock', not found by this lookup)",
                     trusted_parent.display(),
                     trusted_parent.display()
                 )
@@ -2858,7 +2864,8 @@ mod linux_tests {
                 format!(
                     "site 'rt.example' FastCGI Unix socket '{} ': first untrusted component '{}' \
                      (uid {euid}, mode 1777): missing component 'pool.sock ' under a parent where \
-                     another account could create it",
+                     another account could create it, and if it is created later the permissions it \
+                     would inherit are not verified",
                     sock.display(),
                     sticky.display()
                 )
@@ -2890,10 +2897,9 @@ mod linux_tests {
             set_mode(d, 0o750)?;
         }
 
-        // 1. Missing directory components that startup creates (rotating log parent with missing
-        //    intermediate dir and leaf dir, and ACME dir with missing intermediate and leaf dir)
-        //    MUST give W034 with the exact reason; absent leaves for socket-tree / fastcgi-pass /
-        //    keyd-socket under the same trusted prefix keep verified-prefix notes (0 W034).
+        // 1. Missing directory components across all directory roles (socket-tree, rotating log
+        //    parent, ACME dir) MUST give W034 with the exact reason; absent final exact sockets
+        //    (fastcgi-pass, keyd-socket) under existing trusted parents keep verified-prefix notes.
         let miss_tree = trusted.join("future_tree");
         let miss_fcgi = trusted.join("future_fcgi.sock");
         let miss_keyd = trusted.join("future_keyd.sock");
@@ -2924,8 +2930,8 @@ mod linux_tests {
             ),
         )?;
 
-        let reason = "not found; the server would create it at start \
-            and the permissions it would inherit are not verified";
+        let reason =
+            "not found; if it is created later the permissions it would inherit are not verified";
         let (_code, val) = run_json(
             &[
                 "--fs",
@@ -2942,13 +2948,33 @@ mod linux_tests {
             &cfg,
         )?;
         let ws = w034s(&val);
-        assert_eq!(ws.len(), 3, "expected 3 W034s (acme, log, access): {ws:#?}");
+        assert_eq!(
+            ws.len(),
+            4,
+            "expected 4 W034s (socket-tree, acme, log, access): {ws:#?}"
+        );
         assert_eq!(
             ws.first().and_then(|w| jstr(w, "path")),
-            Some("server.tls.acme")
+            Some("server.sandbox.socket-tree")
         );
         assert_eq!(
             ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    miss_tree.display(),
+                    miss_tree.display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "path")),
+            Some("server.tls.acme")
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "ACME directory '{}': first untrusted component '{}' \
@@ -2960,11 +2986,11 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "path")),
+            ws.get(2).and_then(|w| jstr(w, "path")),
             Some("server.log-file")
         );
         assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "message")),
+            ws.get(2).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "rotating --log-file parent directory '{}': first untrusted component '{}' \
@@ -2976,11 +3002,11 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws.get(2).and_then(|w| jstr(w, "path")),
+            ws.get(3).and_then(|w| jstr(w, "path")),
             Some("server.access-log")
         );
         assert_eq!(
-            ws.get(2).and_then(|w| jstr(w, "message")),
+            ws.get(3).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "rotating --access-log parent directory '{}': first untrusted component '{}' \
@@ -2991,21 +3017,9 @@ mod linux_tests {
                 .as_str()
             )
         );
-        // The three non-created classes keep verified-prefix notes (0 W034 for them).
+        // Only absent exact sockets under an existing trusted parent keep verified-prefix notes.
         assert_eq!(
             note_at(&val, 2),
-            Some(
-                format!(
-                    "trusted-paths: server.sandbox socket-tree root '{}': inspected existing \
-                     prefix '{}' (stopped at 'future_tree', not found by this lookup)",
-                    miss_tree.display(),
-                    trusted.display()
-                )
-                .as_str()
-            )
-        );
-        assert_eq!(
-            note_at(&val, 3),
             Some(
                 format!(
                     "trusted-paths: site 'm.example' FastCGI Unix socket '{}': inspected existing \
@@ -3017,7 +3031,7 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            note_at(&val, 4),
+            note_at(&val, 3),
             Some(
                 format!(
                     "trusted-paths: server.tls.keyd-socket '{}': inspected existing prefix '{}' \
@@ -3042,11 +3056,11 @@ mod linux_tests {
         let ws_leaf = w034s(&val_leaf);
         assert_eq!(
             ws_leaf.len(),
-            1,
-            "expected 1 W034 for absent ACME leaf: {ws_leaf:#?}"
+            2,
+            "expected 2 W034s (absent socket-tree and absent ACME leaf): {ws_leaf:#?}"
         );
         assert_eq!(
-            ws_leaf.first().and_then(|w| jstr(w, "message")),
+            ws_leaf.get(1).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "ACME directory '{}': first untrusted component '{}' \
@@ -3127,6 +3141,177 @@ mod linux_tests {
                 )
             );
         }
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_small3_missing_dirs_all_classes_and_sticky_reason() -> TestResult {
+        if !require_local_root_fs("linux_small3_missing_dirs_all_classes_and_sticky_reason")? {
+            return Ok(());
+        }
+        let base = make_temp_base("small3")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
+        let trusted = base.join("trusted");
+        let sticky = base.join("sticky");
+        for d in [&docroot, &trusted, &sticky] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&sticky, 0o1777)?;
+
+        // 1. Fails on b6a2196: socket-tree with two missing components under a trusted prefix
+        //    (including alongside a non-rotating --log-file) MUST give W034 at the FIRST missing
+        //    component; missing intermediate dirs of fastcgi-pass and keyd-socket (and trailing /
+        //    on an absent socket) MUST also give W034; ONLY an absent exact socket directly under
+        //    an existing trusted parent gives no W034 (keeps verified-prefix note).
+        let tree_two_miss = trusted.join("a/b");
+        let nonrot_log = tree_two_miss.join("app.log");
+        let fcgi_miss_mid = trusted.join("miss_fcgi/pool.sock");
+        let fcgi_trailing_slash = format!("{}/trailing.sock/", trusted.display());
+        let fcgi_unbound_ok = trusted.join("unbound.sock");
+        let keyd_miss_mid = trusted.join("miss_keyd/keyd.sock");
+        let sticky_miss_tree = sticky.join("miss_tree/sub");
+
+        let cfg = base.join("small3.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ key-isolation \"split-daemon\"; keyd-socket \"{}\"; cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ socket-tree \"{}\" \"{}\" }}\n\
+                 }}\n\
+                 site \"s3.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"/mid/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/slash/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/ok/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&keyd_miss_mid),
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&tree_two_miss),
+                kdl_escape_path(&sticky_miss_tree),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&fcgi_miss_mid),
+                kdl_escape_path(Path::new(&fcgi_trailing_slash)),
+                kdl_escape_path(&fcgi_unbound_ok),
+            ),
+        )?;
+
+        let reason =
+            "not found; if it is created later the permissions it would inherit are not verified";
+        let (_code, val) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--log-file",
+                &nonrot_log.to_string_lossy(),
+            ],
+            &cfg,
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 5, "expected 5 W034s: {ws:#?}");
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("server.sandbox.socket-tree")
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    tree_two_miss.display(),
+                    trusted.join("a").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "path")),
+            Some("server.sandbox.socket-tree")
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 1777): missing component 'miss_tree' under a parent where \
+                     another account could create it, and if it is created later the permissions it \
+                     would inherit are not verified",
+                    sticky_miss_tree.display(),
+                    sticky.display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[0].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 's3.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    fcgi_miss_mid.display(),
+                    trusted.join("miss_fcgi").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(3).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[1].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(3).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 's3.example' FastCGI Unix socket '{fcgi_trailing_slash}': first untrusted \
+                     component '{}' (uid unknown, mode unknown): {reason}",
+                    trusted.join("trailing.sock").display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(4).and_then(|w| jstr(w, "path")),
+            Some("server.tls.keyd-socket")
+        );
+        assert_eq!(
+            ws.get(4).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "server.tls.keyd-socket '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): {reason}",
+                    keyd_miss_mid.display(),
+                    trusted.join("miss_keyd").display(),
+                )
+                .as_str()
+            )
+        );
+        // The absent exact socket under existing trusted parent keeps its note and gets no W034.
+        assert_eq!(
+            note_at(&val, 2),
+            Some(
+                format!(
+                    "trusted-paths: site 's3.example' FastCGI Unix socket '{}': inspected existing \
+                     prefix '{}' (stopped at 'unbound.sock', not found by this lookup)",
+                    fcgi_unbound_ok.display(),
+                    trusted.display(),
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(note_at(&val, 3), None, "unexpected extra note: {val}");
 
         let _ = fs::remove_dir_all(&base);
         Ok(())

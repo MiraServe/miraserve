@@ -25,8 +25,7 @@ const SYM_BAD: &str = "symbolic link whose own parent or target chain is untrust
 const TREE_WR: &str = "group or other writable \
     (other accounts with search permission may be able to create or replace sockets)";
 const STKY_OWN: &str = "owner not trusted in sticky directory";
-const MISS_CRE: &str = "not found; the server would create it at start \
-    and the permissions it would inherit are not verified";
+const MISS_INH: &str = "if it is created later the permissions it would inherit are not verified";
 type WalkRes = Result<Option<(PathBuf, OsString)>, Fail>;
 struct Ctx(Option<u32>, bool, Option<u32>, bool);
 struct Fail(PathBuf, Option<(u32, u32)>, String, u8);
@@ -289,11 +288,13 @@ fn walk_at(c: &Ctx, root: &Path, raw: &Path, role: u8) -> WalkRes {
             Ok(fd) => fd,
             Err(Errno::NOENT) if cur.3 => {
                 let m = "under a parent where another account could create it";
-                let r = format!("missing component '{}' {m}", fmt_os(&seg));
+                let r = format!("missing component '{}' {m}, and {MISS_INH}", fmt_os(&seg));
                 return Err(wrap(&via, fst(&cur.1, &cur.2, r, 0)));
             }
-            Err(Errno::NOENT) if role >= 2 => return Err(Fail(cp, None, MISS_CRE.into(), 1)),
-            Err(Errno::NOENT) => return Ok(Some((cur.1.clone(), seg))),
+            Err(Errno::NOENT) if role == 1 && pending.is_empty() => {
+                return Ok(Some((cur.1.clone(), seg)));
+            }
+            Err(Errno::NOENT) => return Err(Fail(cp, None, format!("not found; {MISS_INH}"), 1)),
             Err(e) => return Err(fin(&cp, e)),
         };
         let (st, nosym) = inspect_fd(c, &fd, &cp)?;

@@ -315,9 +315,24 @@ fn walk_at_enforces_fs_guard_leaves_acme_sticky_symlink_and_p2_rules() -> TestRe
         );
     }
 
-    // 7. P2-1 absent suffix reports verified prefix + missing name.
-    let abs_ok = walk_at(&ctx, &root, Path::new("/good/future/pool.sock"), 1).map_err(|f| f.2)?;
-    assert_eq!(abs_ok, Some((good.clone(), OsString::from("future"))));
+    // 7. Absent final exact socket under existing trusted parent returns verified prefix;
+    //    missing intermediate directory or trailing slash on exact socket fails with W034 reason.
+    let miss_dir_reason =
+        "not found; if it is created later the permissions it would inherit are not verified";
+    let abs_ok = walk_at(&ctx, &root, Path::new("/good/absent.sock"), 1).map_err(|f| f.2)?;
+    assert_eq!(abs_ok, Some((good.clone(), OsString::from("absent.sock"))));
+    let abs_mid = walk_at(&ctx, &root, Path::new("/good/future/pool.sock"), 1)
+        .err()
+        .ok_or("missing intermediate dir for exact socket must fail")?;
+    assert_eq!(abs_mid.0, good.join("future"));
+    assert_eq!(abs_mid.1, None);
+    assert_eq!(abs_mid.2, miss_dir_reason);
+    let abs_slash = walk_at(&ctx, &root, Path::new("/good/absent.sock/"), 1)
+        .err()
+        .ok_or("trailing slash on absent exact socket must fail")?;
+    assert_eq!(abs_slash.0, good.join("absent.sock"));
+    assert_eq!(abs_slash.1, None);
+    assert_eq!(abs_slash.2, miss_dir_reason);
 
     // 8. P2-2 socket-tree producer reason unmasked by group-write.
     let gw_fd = op(CWD, &gw_tree, OFlags::NOFOLLOW)?;
@@ -364,30 +379,26 @@ fn walk_at_enforces_fs_guard_leaves_acme_sticky_symlink_and_p2_rules() -> TestRe
         .ok_or("missing under sticky must fail")?;
     assert_eq!(
         stky_miss.2,
-        "missing component 'missing_mid' under a parent where another account could create it"
+        "missing component 'missing_mid' under a parent where another account could create it, \
+         and if it is created later the permissions it would inherit are not verified"
     );
 
-    // 10. Small pass 2: missing created dirs (role 2 ACME & role 3 rotating log) fail with W034
-    //     reason; role 0/1 absent leaves still return verified prefix; fmt_os is injective.
-    for role in [2_u8, 3] {
+    // 10. Small pass 3: every missing directory component across all directory roles (0 socket-tree,
+    //     2 ACME, 3 rotating log) fails with W034 reason; fmt_os is injective.
+    for role in [0_u8, 2, 3] {
         let m_mid = walk_at(&ctx, &root, Path::new("/good/new/sub"), role)
             .err()
-            .ok_or("missing created intermediate dir must fail")?;
+            .ok_or("missing intermediate dir must fail")?;
         assert_eq!(m_mid.0, good.join("new"));
         assert_eq!(m_mid.1, None);
-        assert_eq!(m_mid.2, MISS_CRE);
+        assert_eq!(m_mid.2, miss_dir_reason);
         let m_leaf = walk_at(&ctx, &root, Path::new("/good/absent_leaf"), role)
             .err()
-            .ok_or("missing created leaf dir must fail")?;
+            .ok_or("missing leaf dir must fail")?;
         assert_eq!(m_leaf.0, good.join("absent_leaf"));
         assert_eq!(m_leaf.1, None);
-        assert_eq!(m_leaf.2, MISS_CRE);
+        assert_eq!(m_leaf.2, miss_dir_reason);
     }
-    let tree_abs = walk_at(&ctx, &root, Path::new("/good/absent_tree"), 0).map_err(|f| f.2)?;
-    assert_eq!(
-        tree_abs,
-        Some((good.clone(), OsString::from("absent_tree")))
-    );
 
     assert_eq!(
         fmt_os(OsStr::from_bytes(b"/tmp/bad_\xff")),

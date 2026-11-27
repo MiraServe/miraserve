@@ -77,26 +77,26 @@ pub(crate) struct CheckArgs {
     #[arg(long)]
     pub(crate) fs: bool,
 
-    /// Opt-in Linux-only check (requires `--fs`); reports `W034` only and does not change what the
-    /// server does (without it, the processing of a configuration is the same as in 0.1.6; with
-    /// it, existing `--fs` probes still run). Walks the directories on the way to five kinds of
-    /// configured paths and stops at the first component it reports or does not find: `socket-tree`
-    /// roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the endpoint the server
-    /// connects to), ACME dir (`--acme-dir` or `.miraserve-acme`), and rotating log parents
-    /// (`--log-file`/`--access-log` when `--log-max-bytes > 0`); other configured paths, including
-    /// `ai-publish` storage, are not looked at yet. For each path it considers untrusted or cannot
-    /// verify, it reports `W034` giving the component (when reported), its owner and mode (when
-    /// known), and the reason. A warning means the check found something to fix on that path, or
-    /// could not verify it; the reason in the warning says which, and the usual fixes are to
-    /// correct the ownership, mode or type of the named component, or to move the path. No
-    /// warning is not a guarantee. Sees checker's view; assumes same root/mount view (unit isolates
-    /// `/tmp`, restricts `/home`), ordinary local filesystems (no idmap, stacking, name-hiding
-    /// encryption, or other writable view), stable mounts, no shared service account. Run as the
-    /// service account or as root with `server.sandbox.user` set; when no service account is
-    /// configured, the check trusts the account that runs it (only root when run as root), so run
-    /// it as the service account. Can wait on unresponsive filesystems; writes nothing to
-    /// configured paths, reads no contents (symlink read can update atime; reads uid/symlink system
-    /// files and account db).
+    /// Opt-in Linux-only check (requires `--fs`); its only warning code is `W034`; it also prints
+    /// notes. It does not change what the server does (without it, the processing of a
+    /// configuration is the same as in 0.1.6; with it, existing `--fs` probes still run). Walks the
+    /// directories on the way to five kinds of configured paths and stops at the first component it
+    /// reports or does not find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets,
+    /// `keyd-socket` (path of the endpoint the server connects to), ACME dir (`--acme-dir` or
+    /// `.miraserve-acme`), and rotating log parents (`--log-file`/`--access-log` when
+    /// `--log-max-bytes > 0`); other configured paths, including `ai-publish` storage, are not
+    /// looked at yet. For each path it considers untrusted or cannot verify, it reports `W034`
+    /// giving the component (when reported), its owner and mode (when known), and the reason. A
+    /// warning means the check found something to fix on that path, or could not verify it; the
+    /// reason in the warning says which, and the usual fixes are to correct the ownership, mode or
+    /// type of the named component, or to move the path. No warning is not a guarantee. Sees
+    /// checker's view; assumes same root/mount view (unit isolates `/tmp`, restricts `/home`),
+    /// ordinary local filesystems (no idmap, stacking, name-hiding encryption, or other writable
+    /// view), stable mounts, no shared service account. Run as the service account or as root with
+    /// `server.sandbox.user` set; when no service account is configured, the check trusts the
+    /// account that runs it (only root when run as root), so run it as the service account. Can
+    /// wait on unresponsive filesystems; writes nothing to configured paths, reads no contents
+    /// (symlink read can update atime; reads uid/symlink system files and account db).
     #[arg(long)]
     pub(crate) trusted_paths: bool,
 
