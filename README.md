@@ -50,7 +50,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 - [Threat Model & Trust Boundaries](docs/THREAT_MODEL.md)
 - [Production Deployment Guide](docs/DEPLOYMENT.md) (`systemd`, `.deb`/`.rpm`, distroless OCI, Homebrew/`launchd`, Windows Service)
 - [Migration Guide](docs/MIGRATION.md) (Nginx, Caddy, Apache, OpenLiteSpeed → KDL)
-- [Benchmarks & Baseline Methodology](docs/BENCHMARKS.md)
+- [Measuring MiraServe yourself](docs/BENCHMARKS.md)
 - [Security Review Record & Audit Map](docs/SECURITY_AUDIT_PREP.md)
 - [Example Configuration](examples/miraserve.kdl)
 - [Setup guide for AI assistants](skills/miraserve-setup/SKILL.md) (also at <https://miraserve.org/ai-setup.txt>; see [AGENTS.md](AGENTS.md))
