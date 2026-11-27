@@ -5,10 +5,26 @@ description: Install, configure and operate the MiraServe web server (static sit
 
 # Setting up MiraServe
 
-This guide is written for AI assistants that install or operate MiraServe for a user. Every command,
-configuration and message in it was run against MiraServe 0.1.5 on Ubuntu 24.04 with the `.deb` package.
+This guide is written for AI assistants that install or operate MiraServe for a user. The walkthrough was
+run against MiraServe 0.1.5 on Ubuntu 24.04 with the `.deb` package; the 0.1.6 additions were checked
+against the 0.1.6 code and binary.
 For anything not covered here, read the documentation at <https://miraserve.org/docs/introduction/>
 (index for machines: <https://miraserve.org/llms.txt>) instead of guessing.
+
+## Safety rules
+
+1. **Tell the user and back up first.** Before any step that replaces, moves or deletes a file, or
+   restarts or removes the service, tell the user what will change and copy the file elsewhere first.
+   Never purge or delete data without the user saying so for that data.
+2. **Stop on the first failure.** Stop at the first failed command or check. Never continue an install
+   after a failed checksum, and never put a configuration in place that the strict check rejected.
+3. **Never print secret contents.** Never print the contents of keys, private parts of certificates,
+   `.env` files, dumps or unit files that may hold secrets; test readability and show metadata instead.
+4. **Keep the working server until the new one answers.** Do not stop or replace a working web server
+   until the new one has answered correctly for each site.
+5. **Stop and ask when the host differs.** This guide cannot cover every server: when the server differs
+   from what a step assumes (another web server, a control panel, custom units, shared PHP pools, a key
+   daemon), stop and ask the user.
 
 ## Rules
 
@@ -45,10 +61,10 @@ Downloads and checksums: <https://miraserve.org/download/> (same files on the Gi
 Always verify the download against `SHA256SUMS` from the same folder before installing:
 
 ```sh
-V=0.1.5
+V=0.1.6
 curl -fLO https://miraserve.org/dl/v$V/miraserve_${V}_amd64.deb
 curl -fLO https://miraserve.org/dl/v$V/SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS      # must print: miraserve_0.1.5_amd64.deb: OK
+sha256sum --ignore-missing -c SHA256SUMS      # must print: miraserve_0.1.6_amd64.deb: OK
 sudo dpkg -i miraserve_${V}_amd64.deb
 ```
 
@@ -79,10 +95,14 @@ journalctl -u miraserve -n 30 --no-pager
 Ports 80 and 443 (TCP) and 443 (UDP, for HTTP/3) must be free; stop or move another web server first,
 with the user's agreement.
 
-Three `WARN` lines at start-up are expected with the packaged unit and are not errors: `openat2 is
-refused in this process` (the default unit's `RestrictSUIDSGID=yes` causes it), `running unprivileged
-(UID ..., GID ...); OS user/group isolation verified`, and, on kernels older than Linux 6.10, `Landlock
-partially enforced`.
+These `WARN` lines may appear at start-up with the packaged unit and are not errors: `running
+unprivileged (UID ..., GID ...); OS user/group isolation verified`, and, on kernels older than Linux
+6.10, `Landlock partially enforced`. The notice `openat2 is refused in this process` (usually caused
+by the default unit's `RestrictSUIDSGID=yes`; an outer seccomp filter or a kernel older than Linux
+5.6 gives the same notice) may also appear: it is logged at `WARN` only when a site `file-cache` is
+enabled (not `"off"`) with a non-zero `server.limits.file-cache-bytes` budget, or when `workers` is
+not `"shared"`; otherwise it is logged at `INFO`, and it may not appear at all when nothing
+configured depends on `openat2`.
 
 ## 2. The configuration file
 
@@ -132,13 +152,23 @@ site "www.example.com" {
 }
 ```
 
-For a single-page app, add a fallback route. Note that it also answers missing asset paths with
-`index.html` (status 200):
+For a single-page app, add a fallback route. By default `try-files "{path}" "/index.html"` also answers
+missing asset paths with `index.html` (status 200); add `fallback-unless-extension=#true` when missing
+assets should answer 404 instead of the HTML shell. Existing assets are still matched by the earlier
+`"{path}"` candidate (served on `GET`/`HEAD`, or `405` on other methods); only when evaluation reaches
+the last candidate and the normalized request path (ignoring the query string, with at most one
+trailing line feed removed) ends in `.` plus 1 to 8 ASCII letters or digits does the route refuse the
+fallback and answer its own 404:
 
 ```kdl
+site "spa.example.com" {
+    security-headers "strict"
+    root "/var/www/spa"
+
     route "/*" {
-        try-files "{path}" "/index.html"
+        try-files "{path}" "/index.html" fallback-unless-extension=#true
     }
+}
 ```
 
 ### Application behind the reverse proxy (Node, Python, Go, anything that speaks HTTP)
@@ -155,8 +185,8 @@ site "app.example.com" {
 ```
 
 - Several `upstream` lines in one `reverse-proxy` block are load-balanced.
-- WebSocket upgrades are off by default; switch them on for the route that needs them with
-  `allow-upgrades #true` inside `reverse-proxy`.
+- WebSocket upgrades are ON by default on every `reverse-proxy` route. For a backend that must never
+  receive an upgraded connection, add `allow-upgrades #false` inside its `reverse-proxy` block.
 - Static files and proxied paths can live in one site: give the site a `root` and add routes such as
   `route "/api/*" { reverse-proxy { ... } }`.
 
@@ -179,15 +209,33 @@ site "blog.example.com" {
 }
 ```
 
-- Use the socket path of the PHP-FPM pool that is really installed (`ls -l /run/php/`).
-- **The `miraserve` account must be allowed to open that socket.** A default Ubuntu pool creates it as
-  `www-data:www-data` with mode `0660`, and the site then answers `502` with
-  `FastCGI transport I/O error: Permission denied` in the journal, although `miraserve check` passes.
-  Fix it in the pool file (for example `/etc/php/8.3/fpm/pool.d/www.conf`) by setting
-  `listen.group = miraserve` and restarting PHP-FPM (`sudo systemctl restart php8.3-fpm`); or, if the
-  pool file must not change, add the server to the socket's group
-  (`sudo usermod -aG www-data miraserve`, then `sudo systemctl restart miraserve`), which also lets the
-  server read other files of that group.
+- Use the socket path of the PHP-FPM pool that is really installed (`ls -l /run/php/`). On Linux only,
+  if an exact `fastcgi-pass "unix:..."` path exists at start-up and is not a Unix socket: a plain
+  wrong-type path gets no socket rule and logs a `WARN` naming the path; a directory that is also
+  another configured grant keeps its previous rule and logs a `WARN`; an individually granted file
+  keeps read access only and logs a `WARN`; and a directory configured as `socket-tree` keeps its rule
+  with no warning. Fix a wrong socket path and restart (a reload cannot add a skipped rule).
+- **The `miraserve` account must be allowed to reach and open that socket.** A default Ubuntu pool
+  creates it as `www-data:www-data` with mode `0660`. Running `miraserve check --fs` as the `miraserve`
+  account catches access problems with warning `W033` (which fails `--strict`). If left unfixed, PHP
+  requests can then fail with `502` and `FastCGI transport I/O error: Permission denied` in the
+  journal. `W033` has two different diagnostics with two different fixes:
+  - **Message naming the socket's owner and mode** (`(owner ..., mode ...) requires read and write
+    permission on the socket`): the account can reach the path, but lacks read/write permission on the
+    socket itself. Fix it in the pool file (for example `/etc/php/8.3/fpm/pool.d/www.conf`) by setting
+    `listen.group = miraserve` and restarting PHP-FPM (`sudo systemctl restart php8.3-fpm`); or, if the
+    pool file must not change, add the server to the socket's group
+    (`sudo usermod -aG www-data miraserve`, then `sudo systemctl restart miraserve`), which also lets
+    the server read other files of that group.
+  - **Message saying `could not be reached (type and owner unknown)`**: a parent directory cannot be
+    searched by the checking account. Test search permission on each parent directory with
+    `sudo -u miraserve test -x <parent> && echo ok`, use `namei -l <socket path>` to see owners and
+    modes along the path, and fix the directory permission; do **not** change `listen.group` or add
+    `miraserve` to a socket group for this diagnostic.
+  There is no `W033` when the path does not exist or is found to be something other than a socket; a
+  parent directory the account cannot search gives `W033` whatever is behind it (even under `root`).
+  The informational note saying socket access was not tested under `root` appears only after the
+  socket itself has been identified (with matching real and effective UID and GID).
 - For WordPress there is a `preset "wordpress-hardened"` directive; read
   <https://miraserve.org/docs/php-wordpress/> before using it.
 - Files must be readable by the `miraserve` account (static files) and by the PHP-FPM pool's user (PHP).
@@ -363,8 +411,9 @@ the old configuration, add the `user`, `read-tree` and `socket-tree` lines from 
 `sandbox` block, and run `miraserve check` on it. The draft keeps the old server's certificate paths;
 `check --fs` fails with `E301 ... is missing or unreadable` until the certificates are where the
 `miraserve` account can read them (copy them to `/etc/miraserve/certs/` and edit the paths, or switch
-to ACME). Proxied routes are written with `allow-upgrades #false`; change it only for routes that need
-WebSocket.
+to ACME). Check every proxied route in the draft for `allow-upgrades`: the importer writes
+`allow-upgrades #false` on some routes and leaves the line out on others (a route without the line
+allows WebSocket upgrades). Set it to what the original server did for that route.
 
 The importer refuses to guess. When it meets a rule that controls access or changes what is served and
 that it cannot translate exactly, it stops with exit status 1 and writes no file:
@@ -385,10 +434,20 @@ user's explicit decision. Rules in `.htaccess` files are never imported.
   `--dev-tls` to both (`miraserve run site.kdl --dev-tls`); it creates a self-signed certificate.
   To run as a service, generate a unit: `miraserve service generate --target systemd --config <file>`
   (also `launchd` on macOS). Create the service account and folders the unit names.
-- **Container:** `docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve/miraserve:0.1.5`
+- **Container:** Throw-away demo (state is lost when the container stops; for real use mount volumes as in
+  `docs/DEPLOYMENT.md`): `docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve/miraserve:0.1.6`
   serves a starter page on <https://localhost:8443/>. Its configuration is `/etc/miraserve/miraserve.kdl`
-  and its site folder `/var/www/html`; mount your own over them, read-only (the author of this guide
-  ran the image as shipped but did not test such mounts). Port 8080 redirects to HTTPS. The image has
+  and its site folder `/var/www/html`; mount your own over them, read-only
+  (`-v ./site.kdl:/etc/miraserve/miraserve.kdl:ro -v ./public:/var/www/html:ro`; tested with 0.1.5:
+  the site is served, the sandbox is enforced, and a file changed on the host is served on the next
+  request). The server runs as user 65532, so that user must be able to read the mounted files. The
+  image starts with `--dev-tls`: with no certificate in your configuration it serves a self-signed
+  one. Port 8080 redirects to HTTPS on port 8443, whatever host port you published. With a single
+  mounted configuration file the log carries a sandbox note about exact-file access; serving is not
+  affected. In Docker Compose, another service is reached by its service name:
+  `reverse-proxy { upstream "http://app:8000" }` (tested with 0.1.5, also after the other container
+  was recreated); the log then shows warning W005 for plain HTTP to a host that is not loopback,
+  which is expected inside a private Compose network. The image has
   no shell or other tools inside. The sandbox needs a Linux kernel with Landlock (5.13 or newer); on a
   kernel without it the server stops at start and says so.
 
@@ -397,19 +456,22 @@ user's explicit decision. Rules in `.htaccess` files are never imported.
 | Symptom | Cause and what to do |
 |---|---|
 | `421 Misdirected Request` | No `site` block for that host name. Add the name, check, reload. |
-| `404` for a file that exists | The `miraserve` account cannot read it, a symbolic link points outside the site root, or it is a hidden or blocked file type (dotfiles such as `.env`, `*.bak`, `*.sql`, keys and similar are never served). Check permissions with `sudo -u miraserve cat <file>`. |
+| `404` for a file that exists | Can mean: (a) `miraserve` cannot read the file or search a parent directory; (b) symlink outside `root`; (c) a dotfile (dotfiles such as `.env`, except non-dotfile paths under `/.well-known/`, are refused by default and can be allowed only by `static { dotfiles "allow" }`); or (d) an unconditionally blocked static type (`*.bak`, `*.sql`, `*.key`, `*.pem`, `*~`, PHP scripts, etc.). Check access **without printing file contents**: `sudo -u miraserve test -r <file> && echo readable`, `ls -l <file>`, and `namei -l <file>`. |
 | `systemctl reload` fails, site still works | The new configuration was refused and the old one is still active. Read `journalctl -u miraserve -n 20`; fix and reload. |
 | Reload says "restart required: path(s) outside the startup Landlock policy" | See section 5. |
 | Service does not start after adding a site under `/home` | See section 6. |
 | `502` on a proxied route | The application is not listening on the `upstream` address. Test it directly with `curl`. |
-| `502` on PHP | PHP-FPM is not running, the socket path is wrong, or the `miraserve` account may not open the socket (journal: `FastCGI transport I/O error: Permission denied`; see the PHP part of section 2). Check `systemctl status php8.3-fpm` and `ls -l /run/php/`. |
+| `502` on PHP | PHP-FPM is not running, the socket path is wrong, or the `miraserve` account may not reach or open the socket (journal: `FastCGI transport I/O error: Permission denied`; `check --fs` as `miraserve` reports `W033`; see the PHP part of section 2). Check `systemctl status php8.3-fpm` and `ls -l /run/php/`. |
+| `warning[W033]` naming a PHP socket's owner and mode (`requires read and write permission on the socket`) | The checking account reached the socket but lacks read/write permission on it (fails `--strict`; no `W033` when the path does not exist or is found to be something other than a socket, and the `root` note appears only after the socket itself is identified with matching real and effective UID and GID). Set `listen.group = miraserve` in the PHP-FPM pool and restart PHP-FPM, or add `miraserve` to the socket's group and restart MiraServe (section 2). |
+| `warning[W033]` saying a PHP socket `could not be reached (type and owner unknown)` | A parent directory cannot be searched by the checking account (gives `W033` whatever is behind it, even under `root`, before the target's type or owner is known). Test search permission on each parent directory with `sudo -u miraserve test -x <parent> && echo ok`, use `namei -l <socket path>` to see owners and modes, and fix the directory permission; do **not** change `listen.group` or add `miraserve` to a socket group for this diagnostic (section 2). |
+| `WARN` naming a Unix socket path as not a socket at start | Linux only: an exact `fastcgi-pass "unix:..."` or `keyd-socket` path exists at start-up and is not a Unix socket. A plain wrong-type path gets no socket rule (`WARN`); a directory that is also another configured grant keeps its previous rule (`WARN`); an individually granted file keeps read access only (`WARN`); a directory configured as `socket-tree` keeps its rule with no warning. Fix the socket path and restart. |
 | `systemctl restart` succeeded but nothing answers | The server refused to start and is retrying. `systemctl is-active miraserve` prints `activating`; read the journal (section 5). |
-| `404` on `.php` files | The site has no `route "*.php"` with `fastcgi-pass`. MiraServe never sends PHP source; add the route. |
+| `404` on `.php` files | Can mean: (a) the script is missing or unreadable inside `root` (check with `sudo -u miraserve test -r <script>` and `ls -l`, never `cat`); (b) `preset "wordpress-hardened"` deliberately returns `404` for sensitive files like `wp-config.php`; or (c) no FastCGI route matches that script (MiraServe never serves `.php` source statically). Inspect existing routes, preset, and script path first; do **not** blindly add a site-wide `route "*.php"` handler, and preserve narrow allow-lists and upload execution blocks. |
 | Browser warns about the certificate | The self-signed starter certificate is still in use, or ACME has not issued yet. See section 3 and the journal. |
-| `WARN openat2 is refused in this process` at start | Expected with the default unit. Not an error. |
+| `openat2 is refused in this process` at start (`INFO`, or `WARN` with enabled `file-cache` / non-`"shared"` `workers`) | Usually caused by the default unit's `RestrictSUIDSGID=yes`; an outer seccomp filter or a kernel older than Linux 5.6 gives the same notice (may not appear at all when nothing configured depends on `openat2`). Logged at `WARN` only when a site `file-cache` is enabled with a non-zero `file-cache-bytes` budget or `workers` is not `"shared"`, and at `INFO` otherwise; not an error unless you rely on those features. |
 | `miraserve check` passes from a root shell but the service fails | Check as the service account (section 4); the unit also hides `/home` and makes most of the system read-only. |
 
-Logs: `journalctl -u miraserve`. Version and build features: `miraserve version`.
+Logs: `journalctl -u miraserve`. Version and build features: `miraserve version` (0.1.6 prints `features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless`).
 
 ## 10. Before you say it is done
 
@@ -423,11 +485,26 @@ Logs: `journalctl -u miraserve`. Version and build features: `miraserve version`
 
 ## Removing MiraServe
 
-`sudo systemctl disable --now miraserve` and `sudo dpkg --purge miraserve` remove the program and the
-service. They leave behind, on purpose or not: the folders `/etc/miraserve` (with `conf`, `certs`,
-`auth`, `keys`), `/var/lib/miraserve` (certificates and ACME account), `/var/log/miraserve`, the
-accounts and groups `miraserve` and `miraserve-keyd`, and any unit or drop-in you added under
-`/etc/systemd/system/`. Remove those only if the user wants the certificates and configuration gone.
+**Ask the user whether they want to remove the package and keep its files, or purge.**
+
+`sudo dpkg --remove miraserve` removes the program and stops and disables the services
+(`miraserve.service` and `miraserve-keyd.service`); it keeps `/etc/miraserve/conf/miraserve.kdl`, the
+starter certificate and key, and `/var/www/miraserve/index.html`.
+
+`sudo dpkg --purge miraserve` additionally deletes those four files whatever they contain by then, and
+backup copies next to the home page (names such as `index.html.bak`, `index.html~`,
+`index.html.dpkg-old`), following a symbolic link if `index.html` is one; before a purge, copy what may
+be needed to a directory outside `/etc/miraserve` and `/var/www/miraserve`.
+
+Both remove the files the package itself installed (its units under `/usr/lib/systemd/system`, its
+sysusers and tmpfiles files under `/usr/lib`, and files under `/usr/share/miraserve` and
+`/usr/share/doc/miraserve`), so local edits made inside those files are lost; regular local units and
+drop-ins under `/etc/systemd/system` stay.
+
+Left behind in both cases: other files under `/etc/miraserve`, `/var/lib/miraserve` (certificates, ACME
+account, published releases), `/var/log/miraserve`, and the accounts and groups `miraserve` and
+`miraserve-keyd`. List what is there and ask the user about each kind of data before deleting any of
+it.
 
 Security problems in MiraServe itself are reported privately to <support@miraserve.org>
 (see `SECURITY.md`), not in public issues.
