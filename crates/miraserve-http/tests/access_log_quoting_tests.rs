@@ -1,6 +1,5 @@
 //! Access-log field quoting tests: verifies client-supplied fields (`host`, `method`, `target`,
-//! `user_agent`, `referer`) arrive as string values and that embedded quotes are escaped when
-//! formatted.
+//! `user_agent`, `referer`) arrive as string values.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;

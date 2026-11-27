@@ -1358,9 +1358,7 @@ impl HttpEngine {
             .max_pending_accept_reset_streams(Some(
                 usize::try_from(settings.limits.max_h2_rst_stream_per_sec).unwrap_or(50),
             ));
-        // No HTTP/2 keep-alive PINGs: idle connections are closed by `h2_watch` at
-        // `idle-keepalive`, stalled streams by `h2_streams.expire_stalled`, and write-blocked
-        // TCP peers by `WriteGuardedIo`.
+        // No HTTP/2 keep-alive PINGs.
 
         let limits_snap = settings.limits.clone();
         let timeouts_snap = settings.timeouts.clone();
@@ -1768,8 +1766,6 @@ async fn h2_watch(
             streams.changed().await;
             continue;
         }
-        // While buffered DATA is still being written, the connection is neither idle nor a
-        // candidate for per-IP eviction; control frames do not count as delivery.
         // `idle_since_ms` is 0 while DATA is still on its way and otherwise counts from the
         // later of the last request and the last DATA written (see `attach_transport`).
         let idle_since = idle_state.idle_since_ms();
@@ -3467,9 +3463,7 @@ const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 /// allowance there.
 ///
 /// With it the kernel accepts a write only while roughly this much data is queued but not yet
-/// sent (it can overshoot by one buffer), whatever size it has grown the send buffer to,
-/// instead of basing the kernel allowance on kernel buffer autotuning. It limits only unsent
-/// data, not data in flight, so it does not cap throughput.
+/// sent.
 ///
 /// It says nothing about the **client's** side: a receiver reopens its window in steps (one
 /// segment, or a sixteenth of its receive buffer on Linux), so accepted writes arrive in lumps
@@ -3478,12 +3472,11 @@ const MAX_SEND_BUFFER_SLACK_BYTES: u64 = 1024 * 1024;
 const NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 
 /// Largest lead over the minimum rate a client can bank in one backpressure episode, and so the
-/// longest extra silence it can buy on a blocked TCP write:
+/// longest extra silence it can buy:
 /// `MAX_READER_LEAD_BYTES / min-response-rate`.
 ///
-/// Caps the TCP write-idle allowance credited for bytes already accepted ahead of the minimum rate
-/// (`WriteGuardedIo::reader_lead`, `WriteGuardedIo::idle_limit`), bounding how long a client that
-/// downloads fast and then stops reading can hold a backpressured TCP connection.
+/// Caps the write-idle allowance credited for bytes already accepted ahead of the minimum rate
+/// (`WriteGuardedIo::reader_lead`, `WriteGuardedIo::idle_limit`).
 const MAX_READER_LEAD_BYTES: u64 = 1024 * 1024;
 
 /// Outbound `AsyncWrite` wrapper defending connections against slow-reader DoS (`R7-DOS-1`,
@@ -3677,10 +3670,7 @@ impl<I> WriteGuardedIo<I> {
     /// Longest tolerated gap with no accepted write.
     ///
     /// `response-write-idle`, plus the time the minimum rate needs for the kernel allowance and
-    /// for the client's lead (capped at `MAX_READER_LEAD_BYTES`). A client that took data faster
-    /// than the minimum rate may hold it in its own buffers and along the path, and a steady
-    /// reader works through it before the window reopens: that silence is the lead being spent,
-    /// not a stall.
+    /// for the client's lead (capped at `MAX_READER_LEAD_BYTES`).
     fn idle_limit(&self, slack: u64) -> Duration {
         self.write_idle_timeout
             .saturating_add(self.time_to_send(slack.saturating_add(self.reader_lead())))

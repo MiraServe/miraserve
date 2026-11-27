@@ -115,7 +115,7 @@ async fn memory_bomb_plugin_is_blocked_by_store_limits() -> TestResult {
         "memory.grow exceeding max_memory must trap with MemoryLimitExceeded (trap_on_grow_failure=true), got: {grow_res:?}"
     );
 
-    // 2. Static initial memory declaration (100 pages = 6.25 MiB) exceeding 256 KiB fails instantiation.
+    // 2. Static initial memory declaration (100 pages = 6.25 MiB) exceeding 256 KiB fails.
     let static_bomb_wat = r#"
 (module
   (memory (export "memory") 100)
@@ -170,7 +170,7 @@ async fn ambient_filesystem_import_is_denied_in_sandbox() -> TestResult {
 #[tokio::test]
 async fn wasm_audit_regressions_epoch_timeout_header_hygiene_and_offset0_preservation() -> TestResult
 {
-    // 1. Timeout returns `WasmError::Timeout` before fuel exhaustion.
+    // 1. Timeout returns `WasmError::Timeout`.
     let spin_wat = r#"
 (module
   (memory (export "memory") 1)
@@ -183,8 +183,6 @@ async fn wasm_audit_regressions_epoch_timeout_header_hygiene_and_offset0_preserv
     let timeout_cfg = WasmPluginConfig {
         module_path: "<timeout-test.wat>".to_owned(),
         max_memory: ByteSize::from_bytes(1024 * 1024),
-        // Large `max_fuel` budget so the 60 ms timeout returns `WasmError::Timeout` before fuel
-        // exhaustion.
         max_fuel: 5_000_000_000,
         timeout: Duration::from_millis(60),
         allow_outbound_hosts: Vec::new(),

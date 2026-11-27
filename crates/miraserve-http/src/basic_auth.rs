@@ -6,7 +6,7 @@
 //! document root does not stop the server or a reload: that one area answers every request
 //! with 503 (fail closed) and the problem is logged; `miraserve check --fs` reports it first.
 //!
-//! bcrypt is deliberately CPU-intensive. Checks run on the blocking
+//! Checks run on the blocking
 //! pool holding two permits that travel with the work (one for the whole process, one for the
 //! area), so a cancelled request cannot free a slot while its bcrypt run continues and one
 //! site cannot take every slot. Each visitor address gets [`MAX_FAILURES_PER_MINUTE`] failed

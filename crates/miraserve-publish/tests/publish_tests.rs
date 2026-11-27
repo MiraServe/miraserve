@@ -2463,8 +2463,8 @@ fn publish_round5_wave2_site_id_rebind_x509_dn_v2_allowlist_replay_and_preflight
 }
 
 /// Round 5 Wave 3 scanner regressions (`R5-PUB-8, 9, 10, 13, 14`):
-/// - `R5-PUB-8`: nested `<div>` hits the depth cap within 5 s (best of 3), 50k
-///   foster-parented `<table><i></i>` completes within 10 s, and `max-size` short-circuits
+/// - `R5-PUB-8`: nested `<div>` hits the depth cap within 5 s (best of 3)
+///   and `max-size` short-circuits
 ///   markup scanning.
 /// - `R5-PUB-9`: Ordinary valid pages pass without false positives (XHTML 1.0 DOCTYPE, `a < b`,
 ///   `&nbsp`, `<div/>`, duplicate `class`, stray `</p>`, nested `<a>`, empty `.html`,
@@ -2495,8 +2495,7 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
         site_id: None,
     };
     // Keep the functional assertion on every run, and check the wall-clock bound using the best
-    // of three runs so a single scheduler stall on a loaded or emulated host cannot cause a
-    // spurious timeout failure.
+    // of three runs.
     let mut div_elapsed = std::time::Duration::MAX;
     for _ in 0..3 {
         let t0 = std::time::Instant::now();
@@ -2509,13 +2508,12 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
             "expected depth limit violation, got: {div_v:?}"
         );
     }
-    // Best-of-3 wall-clock bound (5 s) to tolerate unoptimised builds on loaded hosts.
     assert!(
         div_elapsed < std::time::Duration::from_secs(5),
         "1 MB nested <div> took {div_elapsed:?} at best of 3 (expected well under 5 s, R5-PUB-8)"
     );
 
-    // 1b. R5-PUB-8: Foster-parenting `<table>` + `<i></i>` x 50k completes within the 10 s bound.
+    // 1b. R5-PUB-8: `<table>` + `<i></i>` x 50k completes within the 10 s bound.
     let foster = format!("<table>{}</table>", "<i></i>".repeat(50_000));
     let foster_bundle = SiteBundle {
         files: BTreeMap::from([("foster.html".to_owned(), foster.into_bytes())]),
@@ -2833,14 +2831,14 @@ fn r6_pub_3_importmap_and_speculationrules_enforce_same_origin_targets() {
 /// R6-PUB-6: Exercises all four scanner DoS protections:
 /// 1. 180k-sibling SVG (< 2 MiB) — ratio check against a 45k-sibling SVG
 /// 2. Deeply nested XML/SVG (>512 depth) — explicit depth cap
-/// 3. HTML adoption-agency formatting-element attribute amplification (95 `<b>` × 20 × 900 B + 2,500 `<p>`)
+/// 3. HTML (95 `<b>` × 20 × 900 B)
 /// 4. Excessive attributes on a single HTML or SVG element (>1024 attrs)
 #[test]
 #[allow(clippy::too_many_lines)]
 fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() {
     let checks = vec![PreflightCheck::NoInlineScripts, PreflightCheck::CspValid];
 
-    // 1. 180k sibling `<g a="1"/>` SVG (< 2 MiB) must scan cleanly without quadratic hang. The
+    // 1. 180k sibling `<g a="1"/>` SVG (< 2 MiB) must scan cleanly. The
     //    bound is a ratio against a quarter-size document scanned right before, so a loaded
     //    machine slows both alike: linear work gives about 4x, quadratic about 16x.
     let svg_with = |siblings: usize| {
@@ -2921,7 +2919,7 @@ fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() 
     // 3. HTML5 adoption-agency attribute amplification bomb (`<p>` followed by 95 `<b>` × 20 × 900 B
     //    attributes, then 2,500 `<p>t`).
     //    Must abort cleanly on the
-    //    4 MiB expanded attribute memory budget.
+    //    attribute memory budget.
     let mut bomb = String::with_capacity(1_900_000);
     bomb.push_str("<!doctype html><html><body><p>");
     let big_val = "x".repeat(900);
@@ -3815,7 +3813,7 @@ fn r7_scan_3_prescan_rcdata_rawtext_and_svg_script_cannot_be_desynchronized() {
         );
     }
 
-    // SVG `<title>` HTML-integration-point comment containing `<g ...>` with 2,000 attributes
+    // SVG `<title>` comment containing `<g ...>` with 2,000 attributes
     // completes within the 250 ms bound.
     let svg_title_comment = format!(
         "<!doctype html><html><body><svg><title><!--</title><g{}>--></title></svg></body></html>",

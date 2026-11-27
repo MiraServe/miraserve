@@ -2504,8 +2504,6 @@ site "a.example" { root "/var/www/a.example" }
     Ok(())
 }
 
-/// `check --fs` reports `W023` (not `E301`) and exits 0 when a custom error page is missing or is
-/// a symlink leaving the site root.
 #[cfg(unix)]
 #[test]
 fn check_fs_reports_unloadable_error_pages_as_warnings_not_errors() -> TestResult {
@@ -3112,7 +3110,7 @@ site "localhost" {{
     Ok(())
 }
 
-/// Exercises the CLI binary with a non-rotating access log in an ungranted parent directory,
+/// Exercises the CLI binary with a non-rotating access log,
 /// sends distinct HTTPS requests before and after a live CLI `reload`, and asserts the HTTPS
 /// responses and that the access log contains BOTH distinct request paths.
 #[cfg(unix)]

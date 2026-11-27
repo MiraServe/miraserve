@@ -56,8 +56,7 @@ fn reserve_free_port() -> Result<u16, std::io::Error> {
     Ok(sock.local_addr()?.port())
 }
 
-/// Starts `MiraServeServer` on a freshly picked loopback port, retrying on `AddrInUse` in case
-/// another concurrent test claimed the ephemeral port between `reserve_free_port` and bind.
+/// Starts `MiraServeServer` on a freshly picked loopback port, retrying on `AddrInUse`.
 async fn start_server_with_free_port<F>(
     source_name: &str,
     make_kdl: F,
@@ -70,8 +69,7 @@ where
 }
 
 /// Like [`start_server_with_free_port`], bounding each `MiraServeServer::start` attempt by
-/// `attempt_timeout` so port selection, KDL parsing, and `AddrInUse` retries are excluded from
-/// the per-start timeout.
+/// `attempt_timeout`.
 #[cfg(unix)]
 async fn start_server_with_free_port_within<F>(
     source_name: &str,
@@ -550,7 +548,6 @@ async fn g3_tenant_fifos_in_error_pages_and_wasm_never_stall_startup_or_sibling_
     fs::write(&cert_path, &dev_pem.cert_pem)?;
     fs::write(&key_path, &dev_pem.key_pem)?;
 
-    // Startup MUST complete promptly (within 5s) instead of hanging forever on open(FIFO)!
     let (server, _, kdl) = start_server_with_free_port_within(
         "g3-fifo.kdl",
         |tls_port| {
@@ -1379,7 +1376,7 @@ site "sibling.example" {{
 /// unrelated directory the symlink pointed at.
 ///
 /// On Linux this needs an enforcing Landlock kernel, so it is ignored by default there and FAILS
-/// (never passes silently) when Landlock is unavailable; run it on a Landlock-capable Linux host with
+/// when Landlock is unavailable; run it on a Landlock-capable Linux host with
 /// `--ignored`. On macOS the sandbox reports an unsupported platform and the functional checks run.
 #[cfg(unix)]
 #[tokio::test]

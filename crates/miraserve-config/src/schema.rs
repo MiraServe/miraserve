@@ -987,8 +987,7 @@ pub fn parse_htpasswd(text: &str) -> Result<Vec<(String, String)>, String> {
     Ok(users)
 }
 
-/// Lowest and highest bcrypt cost accepted in a users file. Each cost increment doubles the
-/// bcrypt work factor.
+/// Lowest and highest bcrypt cost accepted in a users file.
 pub const BCRYPT_COST_RANGE: std::ops::RangeInclusive<u32> = 4..=12;
 
 /// Checks a complete bcrypt record: `$2y$` (or `$2b$`, `$2a$`), a two-digit cost in

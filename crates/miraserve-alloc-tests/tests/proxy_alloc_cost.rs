@@ -1077,7 +1077,6 @@ fn verify_allocator_attribution_is_exact() {
     );
 
     // Non-excluded thread allocations must register exact count and bytes.
-    // Signal with atomic flags so synchronization does not allocate inside the counting window.
     let ready = Arc::new(AtomicBool::new(false));
     let go = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
@@ -1129,7 +1128,6 @@ fn verify_allocator_attribution_is_exact() {
 
     // Profiler reentrancy guard: profiling a single allocation must count and profile ONLY the
     // target allocation, never the backtrace/HashMap allocations made inside `profile_hit`.
-    // Uses atomic flags so synchronization does not allocate inside the counting window.
     let prof_ready = Arc::new(AtomicBool::new(false));
     let prof_go = Arc::new(AtomicBool::new(false));
     let prof_done = Arc::new(AtomicBool::new(false));
@@ -1195,9 +1193,6 @@ fn verify_allocator_attribution_is_exact() {
 
 /// Returns `(max_ops_per_req, max_bytes_per_req)` regression ceilings for `label` on Linux and
 /// macOS, or `None` if `label` is absent from the platform table.
-///
-/// This function and its caller's ceiling assertions are compiled only on Linux and macOS; on
-/// other platforms the harness prints the measured table without asserting ceilings.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn regression_ceiling(label: &str) -> Option<(f64, f64)> {
     #[cfg(target_os = "linux")]

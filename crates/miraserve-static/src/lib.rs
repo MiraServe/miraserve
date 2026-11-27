@@ -2607,10 +2607,8 @@ impl StaticServer {
 
     /// Whether a lookup may run on the calling thread.
     ///
-    /// On Linux an eligible hot lookup can use a confined `openat2` call (see [`fast_open`]) and
-    /// avoid a pool handoff; nonblocking callers also require `openat2` and `RESOLVE_CACHED`
-    /// support (see [`Self::inline_mode`]). When inline lookups are repeatedly slow, inline
-    /// serving is paused for [`INLINE_PAUSE`] and requests go through the blocking pool; see
+    /// When inline lookups are repeatedly slow, inline
+    /// serving is paused for [`INLINE_PAUSE`]; see
     /// [`Self::note_inline_lookup`].
     fn inline_allowed(&self) -> bool {
         FAST_LOOKUP_AVAILABLE
@@ -6911,7 +6909,7 @@ fn has_extension_token(leaf: &str, dot_ext: &str) -> bool {
         return false;
     }
     // For extensions starting with '.', an occurrence can only start at a '.' in the name: test
-    // those positions directly instead of building a substring searcher for each extension.
+    // those positions directly.
     if dot_ext.starts_with('.') {
         let bytes = leaf.as_bytes();
         let ext = dot_ext.as_bytes();

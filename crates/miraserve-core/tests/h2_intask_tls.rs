@@ -1019,7 +1019,7 @@ site "fair.h2it.test" {{
 /// - 1 HTTP/2 TLS connection carrying 8 concurrent requests, and
 /// - 4 HTTP/2 TLS connections carrying 2 concurrent requests each.
 ///
-/// Asserts 200 OK and expected body on all requests.
+/// Asserts 200 OK and expected body.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn h2_tls_single_conn_vs_multi_conn_wasm_cpu_bound() -> TestResult {
@@ -1028,7 +1028,7 @@ fn h2_tls_single_conn_vs_multi_conn_wasm_cpu_bound() -> TestResult {
         let _mode = enter_in_task_h2_test_mode();
         let tmp = TempDir::new("wasm-cpu")?;
         let wat_path = tmp.path.join("burn.wat");
-        // Pure CPU loop (400,000 iterations, within the 10,000,000 `max-fuel` cap) returning 200 OK.
+        // CPU loop (400,000 iterations) returning 200 OK.
         fs::write(
             &wat_path,
             r#"
@@ -1684,9 +1684,9 @@ site "compress.h2it.test" {{
     })
 }
 
-/// On one TCP + TLS 1.3 HTTP/2 connection, runs `CONCURRENT` WASM plugin requests concurrently
+/// On one TCP + TLS HTTP/2 connection, runs `CONCURRENT` WASM plugin requests concurrently
 /// against a calibrated per-request timeout, checks executor spawn counters, and verifies
-/// cancellation on stream reset and trap reporting.
+/// cancellation and trap reporting.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn h2_tls_wasm_concurrent_requests_meet_deadlines_cancel_and_trap() -> TestResult {
@@ -1699,9 +1699,7 @@ fn h2_tls_wasm_concurrent_requests_meet_deadlines_cancel_and_trap() -> TestResul
         let trap_wat = tmp.path.join("trap.wat");
         let slow_wat = tmp.path.join("slow.wat");
 
-        // 2,500,000-iteration CPU loop (within the 50,000,000 `max-fuel` cap). The test runs
-        // `CONCURRENT` requests concurrently against a calibrated per-request timeout and checks
-        // that all concurrent responses succeed and the executor counters record spawned streams.
+        // 2,500,000-iteration CPU loop.
         fs::write(
             &burn_wat,
             r#"

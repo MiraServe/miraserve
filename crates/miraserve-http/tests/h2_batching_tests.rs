@@ -1401,12 +1401,11 @@ async fn run_burst_scenario(vectored: bool, max_write_chunk: usize) -> TestResul
 
     // Phase B (unsplit transport, flush gate open): assert what the patch actually changes.
     // Queue N = 12 ready responses (1,024 B DATA payload each) behind WriteMode::Blocked while
-    // FlushMode::Open stays open, then release the write gate once all 12 handlers have queued
-    // their responses into h2.
+    // FlushMode::Open stays open, then release the write gate.
     //
     // Bound rationale:
-    // - Patched h2 (`COPY_LIMIT = 4096`, initial buffer `16,384 B`, `min_buffer_capacity = 4,105 B`)
-    //   copies 1 KiB DATA frames into the shared write buffer before draining; this test asserts
+    // - Patched h2:
+    //   this test asserts
     //   at most `MAX_PATCHED_DATA_WRITES` (4) DATA-carrying transport writes for N = 12 responses.
     // - Unpatched upstream h2 (CHAIN_THRESHOLD = 256 vectored, 1024 scalar) chains EVERY 1,024 B
     //   DATA frame into Next::Data, occupying `next` and forcing a transport write per stream:

@@ -304,7 +304,7 @@ pub async fn serve_h3_connection_with_control(
 }
 
 /// How many streams of one connection may be reset by the server while Quinn holds a stop
-/// notification for them (kept until the connection closes) before the server
+/// notification for them before the server
 /// stops accepting further requests on that connection.
 const MAX_STALE_STOP_NOTIFICATIONS: u32 = 512;
 
