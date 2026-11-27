@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 
 const NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, \
     site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, \
-    basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, mcp-gateway, wasm-plugin, \
-    or non-rotating log paths";
+    basic-auth, bot-auth, ai-publish storage and keys, error-pages, upstream-tls, mcp-gateway, \
+    wasm-plugin, or non-rotating log paths";
 const HELP_GEN: &str = "keep every ancestor (and exclusive state directory) owned by root or the \
     service account, not group/other-writable, on an ordinary local POSIX filesystem; use absolute paths";
 const HELP_PROD: &str = "set the socket-tree directory owner to root or the service account, or \
@@ -142,11 +142,6 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
                 let lb = format!("site '{h}' FastCGI Unix socket");
                 chk(&k, &lb, Path::new(path), true, Ok(1));
             }
-        }
-        if let Some(st) = &s.ai_publish {
-            let k = format!("site[{i}].ai-publish.storage");
-            let lb = format!("site '{h}' ai-publish storage");
-            chk(&k, &lb, Path::new(st.storage.trim()), true, Ok(3));
         }
     }
     if let Some(s) = &cfg.server.tls.keyd_socket {

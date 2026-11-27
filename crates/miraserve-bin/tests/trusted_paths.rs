@@ -104,7 +104,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         .find("--trusted-paths")
         .ok_or("missing --trusted-paths in help")?;
     let rest = help.get(start..).unwrap_or("");
-    let end = rest.find("--acme-dir").unwrap_or(rest.len());
+    let end = rest.find("  --acme-dir").unwrap_or(rest.len());
     let flag_help = rest.get(..end).unwrap_or(rest);
     let norm = flag_help.split_whitespace().collect::<Vec<_>>().join(" ");
     for req in [
@@ -112,17 +112,15 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "--fs",
         "W034",
         "Linux-only",
-        "Walks the directories on the way to each of six kinds of configured paths and stops at the first one it reports or does not find:",
+        "Walks the directories on the way to five kinds of configured paths and stops at the first component it reports or does not find:",
         "socket-tree",
         "fastcgi-pass",
         "keyd-socket",
         "path of the endpoint the server connects to",
         "ACME",
-        "ai-publish",
-        "resolve against the config dir first",
         "rotating log",
-        "other paths are not looked at yet",
-        "An existing socket at an exact endpoint is accepted whatever its owner and mode (only its directory entry is examined), and in a sticky directory owned by root or the service account an existing entry owned by root or the service account is accepted.",
+        "other configured paths, including `ai-publish` storage, are not looked at yet",
+        "For each path it considers untrusted or cannot verify, it reports `W034`",
         "No warning is not a guarantee.",
         "/tmp",
         "/home",
@@ -130,7 +128,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "stacking",
         "encryption",
         "writable view",
-        "when the configuration names a service account different from the account running the check, each path is reported as not verified; when no service account is configured, the check trusts the account that runs it (only root when run as root), so run it as the service account.",
+        "Run as the service account or as root with `server.sandbox.user` set; when no service account is configured, the check trusts the account that runs it (only root when run as root), so run it as the service account.",
         "0.1.6",
         "unresponsive",
         "atime",
@@ -154,6 +152,12 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "looks at each directory on the way",
         "else not verified",
         "otherwise results are reported as not verified",
+        "six kinds",
+        "resolve against the config dir first",
+        "an existing socket at an exact endpoint is accepted",
+        "in a sticky directory owned by root",
+        "owned by another account, group/other-writable",
+        "when the configuration names a service account different",
     ] {
         assert!(
             !lower.contains(forbidden),
@@ -279,8 +283,8 @@ mod linux_tests {
 
     const NARROWED_NOTE_LITERAL: &str = "trusted-paths (narrowed): does not yet inspect config file, \
         read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, \
-        acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, \
-        mcp-gateway, wasm-plugin, or non-rotating log paths";
+        acme-webroot, basic-auth, bot-auth, ai-publish storage and keys, error-pages, \
+        upstream-tls, mcp-gateway, wasm-plugin, or non-rotating log paths";
 
     const TREE_WR_LITERAL: &str = "group or other writable (other accounts with search permission may be able to create or replace sockets)";
 
@@ -330,13 +334,6 @@ mod linux_tests {
             }
         }
         Ok(true)
-    }
-
-    fn make_pub_key(dir: &Path) -> Result<PathBuf, std::io::Error> {
-        let p = dir.join("publish.pub");
-        fs::write(&p, b"0123456789abcdef0123456789abcdef\n")?;
-        set_mode(&p, 0o640)?;
-        Ok(p)
     }
 
     fn expected_default_observer_note() -> String {
@@ -413,23 +410,21 @@ mod linux_tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn linux_trusted_chain_all_six_classes_and_narrowed_exclusions() -> TestResult {
-        if !require_local_root_fs("linux_trusted_chain_all_six_classes_and_narrowed_exclusions")? {
+    fn linux_trusted_chain_all_five_classes_and_narrowed_exclusions() -> TestResult {
+        if !require_local_root_fs("linux_trusted_chain_all_five_classes_and_narrowed_exclusions")? {
             return Ok(());
         }
         let base = make_temp_base("clean")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
         let sock_dir = base.join("php");
         let acme_dir = base.join("acme");
-        let store_dir = base.join("store");
         let log_dir = base.join("logs");
         let uncov_bad = base.join("uncovered_bad");
         let docroot = uncov_bad.join("www");
         let read_tree = uncov_bad.join("rtree");
         for d in [
-            &sock_dir, &acme_dir, &store_dir, &log_dir, &uncov_bad, &docroot, &read_tree,
+            &sock_dir, &acme_dir, &log_dir, &uncov_bad, &docroot, &read_tree,
         ] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
@@ -470,10 +465,6 @@ mod linux_tests {
                  }}\n\
                  site \"tp.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{\n\
-                         storage \"{}\"\n\
-                         require-signature \"ed25519:{}\"\n\
-                     }}\n\
                      route \"*.php\" {{ fastcgi-pass \"unix:{}\" }}\n\
                  }}\n",
                 kdl_escape_path(&cert),
@@ -481,8 +472,6 @@ mod linux_tests {
                 kdl_escape_path(&read_tree),
                 kdl_escape_path(&sock_dir),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&store_dir),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&sock),
             ),
         )?;
@@ -562,26 +551,29 @@ mod linux_tests {
         }
         let base = make_temp_base("writable")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
         let gw = base.join("gw");
         let ow = gw.join("ow");
-        let store = ow.join("store");
-        fs::create_dir_all(&store)?;
+        let sock_dir = ow.join("socks");
+        fs::create_dir_all(&docroot)?;
+        fs::create_dir_all(&sock_dir)?;
+        set_mode(&docroot, 0o750)?;
         set_mode(&gw, 0o775)?;
         set_mode(&ow, 0o777)?;
-        set_mode(&store, 0o750)?;
+        set_mode(&sock_dir, 0o750)?;
+        let sock = sock_dir.join("pool.sock");
 
         let cfg = base.join("gw.kdl");
         fs::write(
             &cfg,
             format!(
                 "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"tp.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                 site \"tp.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
-                kdl_escape_path(&store),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&sock),
             ),
         )?;
 
@@ -592,14 +584,14 @@ mod linux_tests {
         let ws = w034s(&val);
         assert_eq!(ws.len(), 1, "expected 1 W034: {val}");
         let w = ws.first().copied().ok_or("missing W034")?;
-        assert_eq!(jstr(w, "path"), Some("site[0].ai-publish.storage"));
+        assert_eq!(jstr(w, "path"), Some("site[0].route[0].fastcgi-pass"));
         assert_eq!(
             jstr(w, "message"),
             Some(
                 format!(
-                    "site 'tp.example' ai-publish storage '{}': first untrusted component '{}' \
+                    "site 'tp.example' FastCGI Unix socket '{}': first untrusted component '{}' \
                      (uid {euid}, mode 0775): group or other writable",
-                    store.display(),
+                    sock.display(),
                     gw.display()
                 )
                 .as_str()
@@ -634,9 +626,9 @@ mod linux_tests {
         assert_eq!(String::from_utf8(txt.stdout)?, "");
         let stderr = String::from_utf8(txt.stderr)?;
         let expected_warn = format!(
-            "warning[W034]: site 'tp.example' ai-publish storage '{}': first untrusted component '{}' \
+            "warning[W034]: site 'tp.example' FastCGI Unix socket '{}': first untrusted component '{}' \
              (uid {euid}, mode 0775): group or other writable\n",
-            store.display(),
+            sock.display(),
             gw.display()
         );
         assert!(stderr.contains(&expected_warn), "stderr:\n{stderr}");
@@ -697,28 +689,41 @@ mod linux_tests {
         }
         let base = make_temp_base("sticky")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
+        let docroot = base.join("www");
         let sticky = base.join("sticky");
-        let existing_child = sticky.join("ok_store");
+        let existing_child = sticky.join("ok_logs");
+        fs::create_dir_all(&docroot)?;
         fs::create_dir_all(&existing_child)?;
+        set_mode(&docroot, 0o750)?;
         set_mode(&sticky, 0o1777)?;
         set_mode(&existing_child, 0o750)?;
 
         // 1. Existing trusted child inside sticky dir -> ACCEPTED (0 W034).
+        let ok_log = existing_child.join("server.log");
         let ok_cfg = base.join("sticky_ok.kdl");
         fs::write(
             &ok_cfg,
             format!(
                 "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"tp.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                 site \"tp.example\" {{ root \"{}\" }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
-                kdl_escape_path(&existing_child),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&docroot),
             ),
         )?;
-        let (code, val) = run_json(&["--fs", "--strict", "--trusted-paths"], &ok_cfg)?;
+        let (code, val) = run_json(
+            &[
+                "--fs",
+                "--strict",
+                "--trusted-paths",
+                "--log-file",
+                &ok_log.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &ok_cfg,
+        )?;
         assert_eq!(
             code,
             Some(0),
@@ -728,18 +733,18 @@ mod linux_tests {
 
         // 2. Absent direct child, deeper absent child, AND sticky dir itself as leaf -> REPORTED!
         let missing_direct = sticky.join("absent_acme");
-        let missing_deep = sticky.join("absent_mid/leaf_store");
+        let missing_deep_dir = sticky.join("absent_mid/leaf_logs");
+        let missing_deep_log = missing_deep_dir.join("server.log");
         let miss_cfg = base.join("sticky_miss.kdl");
         fs::write(
             &miss_cfg,
             format!(
                 "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }}; sandbox {{ socket-tree \"{}\" }} }}\n\
-                 site \"tp.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                 site \"tp.example\" {{ root \"{}\" }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&sticky),
-                kdl_escape_path(&missing_deep),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&docroot),
             ),
         )?;
         let (_code, mval) = run_json(
@@ -748,6 +753,10 @@ mod linux_tests {
                 "--trusted-paths",
                 "--acme-dir",
                 &missing_direct.to_string_lossy(),
+                "--log-file",
+                &missing_deep_log.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
             ],
             &miss_cfg,
         )?;
@@ -771,15 +780,15 @@ mod linux_tests {
         );
         assert_eq!(
             ws.get(1).and_then(|w| jstr(w, "path")),
-            Some("site[0].ai-publish.storage")
+            Some("server.tls.acme")
         );
         assert_eq!(
             ws.get(1).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'tp.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component 'absent_mid' under a parent where another account could create it",
-                    missing_deep.display(),
+                    "ACME directory '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 1777): missing component 'absent_acme' under a parent where another account could create it",
+                    missing_direct.display(),
                     sticky.display()
                 )
                 .as_str()
@@ -787,15 +796,15 @@ mod linux_tests {
         );
         assert_eq!(
             ws.get(2).and_then(|w| jstr(w, "path")),
-            Some("server.tls.acme")
+            Some("server.log-file")
         );
         assert_eq!(
             ws.get(2).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "ACME directory '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component 'absent_acme' under a parent where another account could create it",
-                    missing_direct.display(),
+                    "rotating --log-file parent directory '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 1777): missing component 'absent_mid' under a parent where another account could create it",
+                    missing_deep_dir.display(),
                     sticky.display()
                 )
                 .as_str()
@@ -817,7 +826,6 @@ mod linux_tests {
 
         let base = make_temp_base("symlinks")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
 
         let good_dir = base.join("good_dir");
@@ -865,15 +873,17 @@ mod linux_tests {
         fs::write(
             &ok_cfg,
             format!(
-                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"a.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n\
-                 site \"b.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ socket-tree \"{}\" \"{}\" }}\n\
+                 }}\n\
+                 site \"a.example\" {{ root \"{}\" }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&abs_ok_link),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&rel_ok_link),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&docroot),
             ),
         )?;
         let (ok_code, ok_val) = run_json(
@@ -1209,7 +1219,6 @@ mod linux_tests {
 
         let base = make_temp_base("matrix")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
 
         let good = base.join("good");
@@ -1218,11 +1227,7 @@ mod linux_tests {
         let not_a_dir = base.join("regular_file");
         let no_search = base.join("no_search");
         let webroot = bad.join("webroot");
-        let store0 = bad.join("store0");
-        let store1 = bad.join("store1");
-        for d in [
-            &good, &docroot, &bad, &no_search, &webroot, &store0, &store1,
-        ] {
+        for d in [&good, &docroot, &bad, &no_search, &webroot] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
@@ -1249,14 +1254,12 @@ mod linux_tests {
                  }}\n\
                  site \"s0.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"/a/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/ok/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/proc/*\" {{ fastcgi-pass \"unix:{}/p.sock\" }}\n\
                  }}\n\
                  site \"s1.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"/b/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/nd/*\" {{ fastcgi-pass \"unix:{}/child.sock\" }}\n\
                  }}\n",
@@ -1266,14 +1269,10 @@ mod linux_tests {
                 kdl_escape_path(&key),
                 kdl_escape_path(&bad),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&store0),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&shared_sock),
                 kdl_escape_path(&absent_good),
                 kdl_escape_path(&proc_link),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&store1),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&shared_sock),
                 kdl_escape_path(&not_a_dir),
             ),
@@ -1319,7 +1318,7 @@ mod linux_tests {
         );
         assert_eq!(w029_with, w029_without, "W029 must remain frozen");
 
-        // Verify all 11 expected W034 paths in exact deterministic order (absent_good must NOT warn!)
+        // Verify all 9 expected W034 paths in exact deterministic order (absent_good must NOT warn!)
         let ws = w034s(&val_with);
         let paths: Vec<Option<&str>> = ws.iter().map(|w| jstr(w, "path")).collect();
         assert_eq!(
@@ -1328,10 +1327,8 @@ mod linux_tests {
                 Some("server.sandbox.socket-tree"),
                 Some("site[0].route[0].fastcgi-pass"),
                 Some("site[0].route[2].fastcgi-pass"),
-                Some("site[0].ai-publish.storage"),
                 Some("site[1].route[0].fastcgi-pass"),
                 Some("site[1].route[1].fastcgi-pass"),
-                Some("site[1].ai-publish.storage"),
                 Some("server.tls.keyd-socket"),
                 Some("server.tls.acme"),
                 Some("server.log-file"),
@@ -1352,7 +1349,7 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws.get(5).and_then(|w| jstr(w, "message")),
+            ws.get(4).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "site 's1.example' FastCGI Unix socket '{}/child.sock': first untrusted component \
@@ -1430,11 +1427,9 @@ mod linux_tests {
         }
         let base = make_temp_base("openat2-cli")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let sock_dir = base.join("socks");
-        let store_dir = base.join("store");
         let docroot = base.join("www");
-        for d in [&sock_dir, &store_dir, &docroot] {
+        for d in [&sock_dir, &docroot] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
@@ -1450,15 +1445,12 @@ mod linux_tests {
                  }}\n\
                  site \"o2.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"*.php\" {{ fastcgi-pass \"unix:{}/pool.sock\" }}\n\
                  }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&sock_dir),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&store_dir),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&sock_dir),
             ),
         )?;
@@ -1526,17 +1518,16 @@ mod linux_tests {
 
         let base = make_temp_base("root-multiuid")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
 
         let docroot = base.join("www");
         let php_dir = base.join("php_producer");
         let root_sock_dir = base.join("root_socks");
         let keyd_dir = base.join("keyd_dir");
         let sticky_dir = base.join("sticky_root");
-        let sticky_u1000 = sticky_dir.join("u1000_store");
+        let sticky_u1000 = sticky_dir.join("u1000_logs");
         let sticky_sym_u1000 = sticky_dir.join("u1000_link");
-        let u1000_store = base.join("u1000_store");
-        let u1001_store = base.join("u1001_store");
+        let u1000_dir = base.join("u1000_logs");
+        let u1001_dir = base.join("u1001_logs");
         for d in [
             &docroot,
             &php_dir,
@@ -1544,16 +1535,16 @@ mod linux_tests {
             &keyd_dir,
             &sticky_dir,
             &sticky_u1000,
-            &u1000_store,
-            &u1001_store,
+            &u1000_dir,
+            &u1001_dir,
         ] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o755)?;
         }
         set_mode(&keyd_dir, 0o2750)?;
         set_mode(&sticky_dir, 0o1777)?;
-        set_mode(&u1000_store, 0o750)?;
-        set_mode(&u1001_store, 0o750)?;
+        set_mode(&u1000_dir, 0o750)?;
+        set_mode(&u1001_dir, 0o750)?;
 
         let php_sock = php_dir.join("pool.sock");
         let _l1 = UnixListener::bind(&php_sock)?;
@@ -1582,10 +1573,12 @@ mod linux_tests {
             g1000,
             AtFlags::SYMLINK_NOFOLLOW,
         )?;
-        chown(&u1000_store, u1000, g1000)?;
-        chown(&u1001_store, u1001, g1001)?;
+        chown(&u1000_dir, u1000, g1000)?;
+        chown(&u1001_dir, u1001, g1001)?;
 
         // 1. Running as root with `server.sandbox.user` UNSET: only uid 0 is trusted!
+        let u1000_log = u1000_dir.join("app.log");
+        let sticky_u1000_acc = sticky_u1000.join("acc.log");
         let cfg1 = base.join("root_unset.kdl");
         fs::write(
             &cfg1,
@@ -1597,13 +1590,11 @@ mod linux_tests {
                  }}\n\
                  site \"r0.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"/bad/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/ok/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                  }}\n\
                  site \"r1.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"/sym/*\" {{ fastcgi-pass \"unix:{}/pool.sock\" }}\n\
                  }}\n",
                 kdl_escape_path(&keyd_sock),
@@ -1612,17 +1603,25 @@ mod linux_tests {
                 kdl_escape_path(&php_dir),
                 kdl_escape_path(&root_sock_dir),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&u1000_store),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&php_sock),
                 kdl_escape_path(&root_parent_sock),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&sticky_u1000),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&sticky_sym_u1000),
             ),
         )?;
-        let (_c1, val1) = run_json(&["--fs", "--trusted-paths"], &cfg1)?;
+        let (_c1, val1) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--log-file",
+                &u1000_log.to_string_lossy(),
+                "--access-log",
+                &sticky_u1000_acc.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg1,
+        )?;
         assert_eq!(
             note_at(&val1, 0),
             Some(
@@ -1674,26 +1673,10 @@ mod linux_tests {
         );
         assert_eq!(
             ws1.get(2).and_then(|w| jstr(w, "path")),
-            Some("site[0].ai-publish.storage")
-        );
-        assert_eq!(
-            ws1.get(2).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "site 'r0.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid 1000, mode 0750): owner not trusted",
-                    u1000_store.display(),
-                    u1000_store.display()
-                )
-                .as_str()
-            )
-        );
-        assert_eq!(
-            ws1.get(3).and_then(|w| jstr(w, "path")),
             Some("site[1].route[0].fastcgi-pass")
         );
         assert_eq!(
-            ws1.get(3).and_then(|w| jstr(w, "message")),
+            ws1.get(2).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "site 'r1.example' FastCGI Unix socket '{}/pool.sock': first untrusted component '{}' \
@@ -1706,33 +1689,49 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws1.get(4).and_then(|w| jstr(w, "path")),
-            Some("site[1].ai-publish.storage")
-        );
-        assert_eq!(
-            ws1.get(4).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "site 'r1.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid 1000, mode 0755): owner not trusted",
-                    sticky_u1000.display(),
-                    sticky_u1000.display()
-                )
-                .as_str()
-            )
-        );
-        assert_eq!(
-            ws1.get(5).and_then(|w| jstr(w, "path")),
+            ws1.get(3).and_then(|w| jstr(w, "path")),
             Some("server.tls.keyd-socket")
         );
         assert_eq!(
-            ws1.get(5).and_then(|w| jstr(w, "message")),
+            ws1.get(3).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "server.tls.keyd-socket '{}': first untrusted component '{}' \
                      (uid 1000, mode 2750): owner not trusted",
                     keyd_sock.display(),
                     keyd_dir.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws1.get(4).and_then(|w| jstr(w, "path")),
+            Some("server.log-file")
+        );
+        assert_eq!(
+            ws1.get(4).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "rotating --log-file parent directory '{}': first untrusted component '{}' \
+                     (uid 1000, mode 0750): owner not trusted",
+                    u1000_dir.display(),
+                    u1000_dir.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws1.get(5).and_then(|w| jstr(w, "path")),
+            Some("server.access-log")
+        );
+        assert_eq!(
+            ws1.get(5).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "rotating --access-log parent directory '{}': first untrusted component '{}' \
+                     (uid 1000, mode 0755): owner not trusted",
+                    sticky_u1000.display(),
+                    sticky_u1000.display()
                 )
                 .as_str()
             )
@@ -1750,6 +1749,7 @@ mod linux_tests {
         chown(&php_gw, u1001, g1001)?;
         chown(&sticky_php, u1001, g1001)?;
 
+        let u1001_acc = u1001_dir.join("acc.log");
         let cfg2 = base.join("root_user1000.kdl");
         fs::write(
             &cfg2,
@@ -1759,20 +1759,28 @@ mod linux_tests {
                      tls {{ cert \"{}\"; key \"{}\" }}\n\
                      sandbox {{ user \" 1000 \"; socket-tree \"{}\" \"{}\" \"{}\" }}\n\
                  }}\n\
-                 site \"ok.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n\
-                 site \"bad.example\" {{ ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                 site \"ok.example\" {{ root \"{}\" }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&php_dir),
                 kdl_escape_path(&php_gw),
                 kdl_escape_path(&sticky_php),
-                kdl_escape_path(&u1000_store),
-                kdl_escape_path(&pub_key),
-                kdl_escape_path(&u1001_store),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&docroot),
             ),
         )?;
-        let (_c2, val2) = run_json(&["--fs", "--trusted-paths"], &cfg2)?;
+        let (_c2, val2) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--log-file",
+                &u1000_log.to_string_lossy(),
+                "--access-log",
+                &u1001_acc.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg2,
+        )?;
         assert_eq!(
             note_at(&val2, 0),
             Some(
@@ -1783,7 +1791,7 @@ mod linux_tests {
         assert_eq!(
             ws2.len(),
             3,
-            "expected 3 W034s (php_gw, sticky_php, u1001_store): {ws2:#?}"
+            "expected 3 W034s (php_gw, sticky_php, u1001_dir): {ws2:#?}"
         );
         assert_eq!(
             ws2.first().and_then(|w| jstr(w, "message")),
@@ -1813,16 +1821,16 @@ mod linux_tests {
         );
         assert_eq!(
             ws2.get(2).and_then(|w| jstr(w, "path")),
-            Some("site[1].ai-publish.storage")
+            Some("server.access-log")
         );
         assert_eq!(
             ws2.get(2).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'bad.example' ai-publish storage '{}': first untrusted component '{}' \
+                    "rotating --access-log parent directory '{}': first untrusted component '{}' \
                      (uid 1001, mode 0750): owner not trusted",
-                    u1001_store.display(),
-                    u1001_store.display()
+                    u1001_dir.display(),
+                    u1001_dir.display()
                 )
                 .as_str()
             )
@@ -1914,23 +1922,22 @@ mod linux_tests {
         let base = make_temp_base("p1-overlay")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let docroot = base.join("www");
-        let store = base.join("store");
-        let pub_key = make_pub_key(&base)?;
-        for d in [&docroot, &store] {
+        let socks = base.join("socks");
+        for d in [&docroot, &socks] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
+        let sock = socks.join("pool.sock");
         let cfg = base.join("ovl.kdl");
         fs::write(
             &cfg,
             format!(
                 "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"ovl.example\" {{ root \"{}\"; ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }} }}\n",
+                 site \"ovl.example\" {{ root \"{}\"; route \"*.php\" {{ fastcgi-pass \"unix:{}\" }} }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&store),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&sock),
             ),
         )?;
         let (_code, val) = run_json(&["--fs", "--trusted-paths"], &cfg)?;
@@ -1940,9 +1947,9 @@ mod linux_tests {
             ws.first().and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'ovl.example' ai-publish storage '{}': first untrusted component '/' \
+                    "site 'ovl.example' FastCGI Unix socket '{}': first untrusted component '/' \
                      (uid 0, mode 0755): could not be verified on this filesystem (filesystem 0x794c7630)",
-                    store.display()
+                    sock.display()
                 )
                 .as_str()
             )
@@ -2032,7 +2039,6 @@ mod linux_tests {
         }
         let base = make_temp_base("p1-leaves")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
         let docroot = base.join("www");
         let good_dir = base.join("good_dir");
@@ -2041,19 +2047,11 @@ mod linux_tests {
             set_mode(d, 0o750)?;
         }
         let reg_tree = base.join("reg_tree");
-        let reg_store = base.join("reg_store");
         let reg_log_parent = base.join("reg_log_parent");
         let reg_acme = base.join("reg_acme");
         let reg_fcgi = base.join("reg_fcgi");
         let reg_keyd = base.join("reg_keyd");
-        for f in [
-            &reg_tree,
-            &reg_store,
-            &reg_log_parent,
-            &reg_acme,
-            &reg_fcgi,
-            &reg_keyd,
-        ] {
+        for f in [&reg_tree, &reg_log_parent, &reg_acme, &reg_fcgi, &reg_keyd] {
             fs::write(f, b"not-a-dir-or-sock")?;
             set_mode(f, 0o644)?;
         }
@@ -2072,7 +2070,6 @@ mod linux_tests {
                  }}\n\
                  site \"lf.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
                      route \"/ok/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/reg/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
                      route \"/dir/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
@@ -2082,8 +2079,6 @@ mod linux_tests {
                 kdl_escape_path(&key),
                 kdl_escape_path(&reg_tree),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&reg_store),
-                kdl_escape_path(&pub_key),
                 kdl_escape_path(&real_sock),
                 kdl_escape_path(&reg_fcgi),
                 kdl_escape_path(&good_dir),
@@ -2107,8 +2102,8 @@ mod linux_tests {
         let ws = w034s(&val);
         assert_eq!(
             ws.len(),
-            7,
-            "all 7 wrong leaves must fail, 0660 sock must pass: {val}"
+            6,
+            "all 6 wrong leaves must fail, 0660 sock must pass: {val}"
         );
         assert_eq!(
             ws.first().and_then(|w| jstr(w, "message")),
@@ -2150,18 +2145,6 @@ mod linux_tests {
             ws.get(3).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'lf.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 0644): exists but is not a directory",
-                    reg_store.display(),
-                    reg_store.display()
-                )
-                .as_str()
-            )
-        );
-        assert_eq!(
-            ws.get(4).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
                     "server.tls.keyd-socket '{}': first untrusted component '{}' \
                      (uid {euid}, mode 0644): exists but is not a socket",
                     reg_keyd.display(),
@@ -2171,7 +2154,7 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws.get(5).and_then(|w| jstr(w, "message")),
+            ws.get(4).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "ACME directory '{}': first untrusted component '{}' \
@@ -2183,7 +2166,7 @@ mod linux_tests {
             )
         );
         assert_eq!(
-            ws.get(6).and_then(|w| jstr(w, "message")),
+            ws.get(5).and_then(|w| jstr(w, "message")),
             Some(
                 format!(
                     "rotating --log-file parent directory '{}': first untrusted component '{}' \
@@ -2641,15 +2624,14 @@ mod linux_tests {
         }
         let base = make_temp_base("c2-cli-loc")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let docroot = base.join("www");
         let bad = base.join("bad");
-        let bad_store = bad.join("store");
-        for d in [&docroot, &bad, &bad_store] {
+        for d in [&docroot, &bad] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
         set_mode(&bad, 0o775)?;
+        let bad_sock = bad.join("pool.sock");
 
         // Explicit `server` and `server.tls` blocks exist in KDL; CLI-sourced warnings MUST NOT
         // inherit their source spans via `location_for` fallback.
@@ -2663,13 +2645,12 @@ mod linux_tests {
                  }}\n\
                  site \"c2.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:{}\" }}\n\
                  }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&bad_store),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&bad_sock),
             ),
         )?;
 
@@ -2694,10 +2675,10 @@ mod linux_tests {
         let ws = w034s(&val);
         assert_eq!(ws.len(), 4, "expected 4 W034s: {ws:#?}");
 
-        // KDL-sourced ai-publish.storage retains its KDL location.
+        // KDL-sourced fastcgi-pass retains its KDL location.
         assert_eq!(
             ws.first().and_then(|w| jstr(w, "path")),
-            Some("site[0].ai-publish.storage")
+            Some("site[0].route[0].fastcgi-pass")
         );
         assert!(
             ws.first().and_then(|w| w.get("location")).is_some(),
@@ -2770,88 +2751,108 @@ mod linux_tests {
     }
 
     #[test]
-    fn linux_ai_publish_storage_whitespace_trimmed_matches_validator_and_loader() -> TestResult {
+    fn linux_point2_fastcgi_untrimmed_and_socket_tree_trailing_slash_match_runtime() -> TestResult {
         if !require_local_root_fs(
-            "linux_ai_publish_storage_whitespace_trimmed_matches_validator_and_loader",
+            "linux_point2_fastcgi_untrimmed_and_socket_tree_trailing_slash_match_runtime",
         )? {
             return Ok(());
         }
-        let base = make_temp_base("pub-space")?;
+        let base = make_temp_base("p2-runtime-match")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let pub_key = make_pub_key(&base)?;
         let euid = rustix::process::geteuid().as_raw();
         let docroot = base.join("www");
-        let good_store = base.join("good_store");
-        let bad_store = base.join("bad_store");
-        for d in [&docroot, &good_store, &bad_store] {
+        let sticky = base.join("sticky");
+        let tree_ok = base.join("tree_ok");
+        let tree_bad = base.join("tree_bad");
+        for d in [&docroot, &sticky, &tree_ok, &tree_bad] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
-        set_mode(&bad_store, 0o775)?;
+        set_mode(&sticky, 0o1777)?;
+        set_mode(&tree_bad, 0o775)?;
 
-        // Leading space pointing at an absolute trusted directory: loader and validator trim
-        // `ai-publish.storage`, so the walker must inspect the trimmed absolute path and emit
-        // zero W034 (must not report it as relative).
-        let good_cfg = base.join("good_space.kdl");
+        // Existing trusted socket at `pool.sock`; distinct entry `pool.sock ` (trailing space)
+        // is absent in the sticky directory. FastCGI connects to the raw untrimmed string, so
+        // `unix:<sticky>/pool.sock ` must inspect `pool.sock ` (and report missing component in
+        // sticky dir) rather than trimming to `pool.sock`, and `unix: <sock>` (leading space)
+        // must be reported as relative rather than trimmed!
+        let sock = sticky.join("pool.sock");
+        let _listener = UnixListener::bind(&sock)?;
+        set_mode(&sock, 0o660)?;
+
+        let cfg = base.join("rt.kdl");
         fs::write(
-            &good_cfg,
+            &cfg,
             format!(
-                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"good.example\" {{\n\
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ socket-tree \"{}/\" \"{}/\" }}\n\
+                 }}\n\
+                 site \"rt.example\" {{\n\
                      root \"{}\"\n\
-                     ai-publish {{ storage \" {}\"; require-signature \"ed25519:{}\" }}\n\
+                     route \"/lead/*\" {{ fastcgi-pass \"unix: {}\" }}\n\
+                     route \"/trail/*\" {{ fastcgi-pass \"unix:{} \" }}\n\
                  }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
+                kdl_escape_path(&tree_ok),
+                kdl_escape_path(&tree_bad),
                 kdl_escape_path(&docroot),
-                kdl_escape_path(&good_store),
-                kdl_escape_path(&pub_key),
+                kdl_escape_path(&sock),
+                kdl_escape_path(&sock),
             ),
         )?;
-        let (_code, good_val) = run_json(&["--fs", "--trusted-paths"], &good_cfg)?;
-        let good_ws = w034s(&good_val);
-        assert!(
-            good_ws.is_empty(),
-            "leading-space absolute trusted ai-publish.storage must emit zero W034: {good_val}"
-        );
 
-        // Leading and trailing spaces pointing at an absolute untrusted (0775) directory: must
-        // report the untrusted component rather than treating the value as relative.
-        let bad_cfg = base.join("bad_space.kdl");
-        fs::write(
-            &bad_cfg,
-            format!(
-                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                 site \"bad.example\" {{\n\
-                     root \"{}\"\n\
-                     ai-publish {{ storage \" {} \"; require-signature \"ed25519:{}\" }}\n\
-                 }}\n",
-                kdl_escape_path(&cert),
-                kdl_escape_path(&key),
-                kdl_escape_path(&docroot),
-                kdl_escape_path(&bad_store),
-                kdl_escape_path(&pub_key),
-            ),
-        )?;
-        let (_bcode, bad_val) = run_json(&["--fs", "--trusted-paths"], &bad_cfg)?;
-        let bad_ws = w034s(&bad_val);
+        let (_code, val) = run_json(&["--fs", "--trusted-paths"], &cfg)?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 3, "expected 3 W034s: {ws:#?}");
         assert_eq!(
-            bad_ws.len(),
-            1,
-            "trimmed untrusted ai-publish.storage must emit 1 W034: {bad_val}"
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("server.sandbox.socket-tree")
         );
         assert_eq!(
-            bad_ws.first().and_then(|w| jstr(w, "path")),
-            Some("site[0].ai-publish.storage")
-        );
-        assert_eq!(
-            bad_ws.first().and_then(|w| jstr(w, "message")),
+            ws.first().and_then(|w| jstr(w, "message")),
             Some(
                 format!(
-                    "site 'bad.example' ai-publish storage '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 0775): group or other writable",
-                    bad_store.display(),
-                    bad_store.display()
+                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0775): {TREE_WR_LITERAL}",
+                    tree_bad.display(),
+                    tree_bad.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[0].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'rt.example' FastCGI Unix socket ' {}': first untrusted component ' {}' \
+                     (uid unknown, mode unknown): not verified: relative path depends on the \
+                     working directory of the server",
+                    sock.display(),
+                    sock.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[1].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'rt.example' FastCGI Unix socket '{} ': first untrusted component '{}' \
+                     (uid {euid}, mode 1777): missing component 'pool.sock ' under a parent where \
+                     another account could create it",
+                    sock.display(),
+                    sticky.display()
                 )
                 .as_str()
             )

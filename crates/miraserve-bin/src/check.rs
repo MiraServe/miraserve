@@ -77,27 +77,25 @@ pub(crate) struct CheckArgs {
     #[arg(long)]
     pub(crate) fs: bool,
 
-    /// Opt-in Linux-only check (requires `--fs`); reports `W034` only, does not change the server
-    /// (without it, config matches 0.1.6; `--fs` probes still run). Walks the directories on the way
-    /// to each of six kinds of configured paths and stops at the first one it reports or does not
-    /// find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the
-    /// endpoint the server connects to), ACME dir, `ai-publish` storage (relative config-file values
-    /// resolve against the config dir first), rotating log parents; other paths are not looked at
-    /// yet. Reports `W034` for the first component owned by another account, group/other-writable,
-    /// via an unvouched symlink, missing where another account could create it, wrong kind,
-    /// relative, unaccepted filesystem type, or not inspectable (another account may replace it at
-    /// start; fix owner/mode or move it). An existing socket at an exact endpoint is accepted
-    /// whatever its owner and mode (only its directory entry is examined), and in a sticky directory
-    /// owned by root or the service account an existing entry owned by root or the service account
-    /// is accepted. No warning is not a guarantee. Sees checker's view; assumes same root/mount view
-    /// (unit isolates `/tmp`, restricts `/home`), ordinary local filesystems (no idmap, stacking,
-    /// name-hiding encryption, or other writable view), stable mounts, no shared service account.
-    /// Run as the service account or as root with `server.sandbox.user` set; otherwise, when the
-    /// configuration names a service account different from the account running the check, each path
-    /// is reported as not verified; when no service account is configured, the check trusts the
-    /// account that runs it (only root when run as root), so run it as the service account. Can wait
-    /// on unresponsive filesystems; writes nothing to configured paths, reads no contents (symlink
-    /// read can update atime; reads uid/symlink system files and account db).
+    /// Opt-in Linux-only check (requires `--fs`); reports `W034` only and does not change what the
+    /// server does (without it, the processing of a configuration is the same as in 0.1.6; with
+    /// it, existing `--fs` probes still run). Walks the directories on the way to five kinds of
+    /// configured paths and stops at the first component it reports or does not find: `socket-tree`
+    /// roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the endpoint the server
+    /// connects to), ACME dir (`--acme-dir` or `.miraserve-acme`), and rotating log parents
+    /// (`--log-file`/`--access-log` when `--log-max-bytes > 0`); other configured paths, including
+    /// `ai-publish` storage, are not looked at yet. For each path it considers untrusted or cannot
+    /// verify, it reports `W034` giving the component (when reported), its owner and mode (when
+    /// known), and the reason (another account than root and the service account may be able to
+    /// replace that path while the server starts; fix ownership or mode, or move the path). No
+    /// warning is not a guarantee. Sees checker's view; assumes same root/mount view (unit isolates
+    /// `/tmp`, restricts `/home`), ordinary local filesystems (no idmap, stacking, name-hiding
+    /// encryption, or other writable view), stable mounts, no shared service account. Run as the
+    /// service account or as root with `server.sandbox.user` set; when no service account is
+    /// configured, the check trusts the account that runs it (only root when run as root), so run
+    /// it as the service account. Can wait on unresponsive filesystems; writes nothing to
+    /// configured paths, reads no contents (symlink read can update atime; reads uid/symlink system
+    /// files and account db).
     #[arg(long)]
     pub(crate) trusted_paths: bool,
 
