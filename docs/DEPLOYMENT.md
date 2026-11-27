@@ -444,13 +444,13 @@ For production, the redirect from HTTP to HTTPS points at the port the server li
 server {
     listen ":443" protocols="h3,h2,h1"
     listen ":80" redirect-https=#true
-    // tls, sandbox and your sites as in the documentation
+    // tls and sandbox as in the documentation
 }
+// site blocks are top-level (outside server { ... })
 ```
 
 ```bash
-# Production container with read-only rootfs, dropped capabilities, and persistent ACME and
-# release volumes (override CMD without `--dev-tls` so missing certs/ACME fail closed)
+# Production container with read-only rootfs, dropped capabilities, and persistent state volumes
 docker run -d --name miraserve \
   --read-only \
   --cap-drop=ALL \
@@ -463,7 +463,7 @@ docker run -d --name miraserve \
   run /etc/miraserve/miraserve.kdl --acme-dir /var/lib/miraserve/acme
 ```
 
-Started this way, without `--dev-tls`, the server refuses to start unless your configuration has a certificate or an ACME block. Certificates obtained by ACME and published releases live in the two volumes (`miraserve-acme` and `miraserve-releases`); without them they are lost when the container stops. The Docker Hub image and release downloads do not carry signatures.
+With this example configuration and without `--dev-tls`, the server refuses to start unless a certificate, an ACME block, or split-daemon `miraserve-keyd` is configured. Mount any host certificate, key, or site files referenced by your configuration read-only and readable by UID `65532`. Binding `:80` and `:443` as UID `65532` with `--cap-drop=ALL` requires the container network namespace to permit unprivileged binding to port 80 and above (for example, `net.ipv4.ip_unprivileged_port_start=80` or `0`). The `miraserve-acme` volume holds ACME state at `/var/lib/miraserve/acme`, and `miraserve-releases` persists `ai-publish` release stores configured under `/var/lib/miraserve/releases`. The Docker Hub image and release downloads do not carry signatures.
 
 ---
 
