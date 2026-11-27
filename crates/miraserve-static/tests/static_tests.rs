@@ -1205,7 +1205,7 @@ async fn r8_sta_1_script_extension_token_rule_blocks_every_separator_and_keeps_r
     Ok(())
 }
 
-/// Field report from the hosting-panel staging VM: `try-files "{path}" "{path}/" "=404"` answered
+/// Regression test: `try-files "{path}" "{path}/" "=404"` previously answered
 /// 404 for `/` when the document root holds `index.php`, while `/sub/` worked. The site root
 /// must resolve its script index exactly like any subdirectory.
 #[tokio::test]

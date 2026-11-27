@@ -1359,12 +1359,11 @@ impl HttpEngine {
                 usize::try_from(settings.limits.max_h2_rst_stream_per_sec).unwrap_or(50),
             ));
         // No HTTP/2 keep-alive PINGs. A PING queues behind the response data already sent, so
-        // a client reading slowly answers it only after draining that data: with 20 s to answer,
-        // a 3 KB/s download over HTTP/2 was closed after exactly 50 s although it was above the
-        // minimum rate (AmiraPanel staging). The cases PINGs were meant for are covered without
-        // them: an idle connection closes at `idle-keepalive` (`h2_watch`), a peer that stops
-        // reading blocks the socket and is cut by the TCP write guard, and a stream whose window
-        // stays closed is released by the stall watchdog.
+        // a client reading slowly answers it only after draining that data and can be closed
+        // despite staying above the configured minimum response rate. The cases PINGs were meant
+        // for are covered without them: an idle connection closes at `idle-keepalive` (`h2_watch`),
+        // a peer that stops reading blocks the socket and is cut by the TCP write guard, and a
+        // stream whose window stays closed is released by the stall watchdog.
 
         let limits_snap = settings.limits.clone();
         let timeouts_snap = settings.timeouts.clone();
@@ -1774,10 +1773,10 @@ async fn h2_watch(
         }
         // A body counts as produced once its last piece is handed to hyper, but hyper and the
         // HTTP/2 layer can still hold a good part of it, waiting for the client's flow-control
-        // window (AmiraPanel staging: 134 to 231 KB unsent when a 3 KB/s download was closed as
-        // idle). While DATA is still on its way the connection is neither idle nor a candidate
-        // for per-IP eviction; idle time counts from when the last of it was written. Control
-        // frames (keep-alive PING replies) do not count as delivery.
+        // window, so a slow download would otherwise be closed as idle before buffered DATA
+        // finishes draining. While DATA is still on its way the connection is neither idle nor a
+        // candidate for per-IP eviction; idle time counts from when the last of it was written.
+        // Control frames (keep-alive PING replies) do not count as delivery.
         // `idle_since_ms` is 0 while DATA is still on its way and otherwise counts from the
         // later of the last request and the last DATA written (see `attach_transport`).
         let idle_since = idle_state.idle_since_ms();
@@ -2017,10 +2016,8 @@ thread_local! {
 }
 
 /// Sends access-log lines straight to `sink`, formatted by MiraServe itself, instead of through
-/// the general `tracing` formatter: the same text, byte for byte, at a fraction of the cost (the
-/// generic formatter was about a tenth of the CPU time of a small static request). Lines are
-/// still written only when INFO is enabled for `miraserve::access`. Returns `false` if a sink
-/// was already set.
+/// the general `tracing` formatter, producing the same text byte for byte. Lines are still written
+/// only when INFO is enabled for `miraserve::access`. Returns `false` if a sink was already set.
 pub fn set_access_log_sink(sink: AccessLogSink) -> bool {
     ACCESS_LOG_SINK.set(sink).is_ok()
 }
@@ -2638,11 +2635,10 @@ impl AccessLogRecord {
 /// Upper bound on the size of the future hyper gets for one request.
 ///
 /// On HTTP/2, hyper moves that future by value through `H2Stream::new` into `InTaskExec::execute`
-/// before boxing it into `Driven`'s `FuturesUnordered` (and formerly into a spawned Tokio task).
-/// With the request pipeline's state machine inline it was about 10 KiB, so every HTTP/2 request
-/// copied tens of kilobytes on entry (measured with a probe on `memmove`: 23% of the server's CPU
-/// time at 64 connections x 10 streams). The pipeline's future is therefore boxed inside the
-/// service future: one allocation and one copy per request, and the moves copy only what is left.
+/// before boxing it into `Driven`'s `FuturesUnordered` (or a spawned Tokio task). Keeping the
+/// request pipeline's state machine inline would move the entire state machine by value on every
+/// HTTP/2 request entry, so the pipeline's future is boxed inside the service future and only the
+/// small wrapper is moved by value.
 const SERVICE_FUTURE_MAX_BYTES: usize = 2048;
 
 const TRANSPORT_OUTCOME_PENDING: u8 = 0;
@@ -3502,10 +3498,10 @@ const NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 /// longest extra silence it can buy: `MAX_READER_LEAD_BYTES / min-response-rate` (about 8.5
 /// minutes at 2048 bytes per second, 17 at the default 1024).
 ///
-/// Staging over a `WireGuard` path with 60-70 ms round trips: curl reading at 3 KB/s over HTTP/2
-/// had taken about 540 KB more than it had read when its window stayed shut for over 46 s, and
-/// was cut while still reading. A lead of this size covers such paths; it also bounds how long a
-/// client that downloads fast and then stops reading can hold a connection.
+/// A slow HTTP/2 reader over a high-BDP or tunneled path can accept substantial data ahead of what
+/// it has drained and then leave its receive window closed longer than `response-write-idle` while
+/// still reading. A lead of this size covers such paths; it also bounds how long a client that
+/// downloads fast and then stops reading can hold a connection.
 const MAX_READER_LEAD_BYTES: u64 = 1024 * 1024;
 
 /// Outbound `AsyncWrite` wrapper defending connections against slow-reader DoS (`R7-DOS-1`,

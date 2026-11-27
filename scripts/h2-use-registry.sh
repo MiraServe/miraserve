@@ -17,7 +17,7 @@
 # originals before proceeding.
 #
 # Switching to the registry crate disables MiraServe's COPY_LIMIT=4096 encoder
-# patch (see vendor/README.md for the measured cost in upstream 0.4.20).
+# patch (see vendor/README.md for what the patch changes).
 
 set -eu
 

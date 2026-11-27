@@ -1316,7 +1316,7 @@ site "sibling.example" {{
 /// unrelated directory the symlink pointed at.
 ///
 /// On Linux this needs an enforcing Landlock kernel, so it is ignored by default there and FAILS
-/// (never passes silently) when Landlock is unavailable; run it on the staging VM with
+/// (never passes silently) when Landlock is unavailable; run it on a Landlock-capable Linux host with
 /// `--ignored`. On macOS the sandbox reports an unsupported platform and the functional checks run.
 #[cfg(unix)]
 #[tokio::test]
@@ -1839,7 +1839,7 @@ site "{domain}" {{
     Ok(())
 }
 
-/// Codex Round-6 P1 #4 & Round-7 staging fix, enforced Linux only: after the external error-page
+/// Enforced Linux regression test: after the external error-page
 /// DIRECTORY is replaced at the same name, a reload must be refused with `RestartRequired` (the
 /// installed Landlock rule refers to the old directory) and the old generation keeps serving its
 /// page. Filesystem edits are performed by a separate unconfined fixture-owner thread spawned

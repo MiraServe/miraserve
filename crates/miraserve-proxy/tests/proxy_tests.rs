@@ -1945,7 +1945,7 @@ async fn review4_health_probe_uses_configured_host_on_preserve_host_route() -> T
     Ok(())
 }
 
-/// Hosting-panel VM bug #1: Two upstreams with one down (and no active health-check) must NOT
+/// Regression test: Two upstreams with one down (and no active health-check) must NOT
 /// return 502 on every second request; connect errors fail over transparently (including
 /// non-empty POST bodies before any bytes are polled), passively cool down the dead backend,
 /// recover after cooldown, and NEVER duplicate a POST whose body was already read by a backend.

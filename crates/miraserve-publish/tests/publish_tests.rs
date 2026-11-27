@@ -2463,8 +2463,8 @@ fn publish_round5_wave2_site_id_rebind_x509_dn_v2_allowlist_replay_and_preflight
 }
 
 /// Round 5 Wave 3 scanner regressions (`R5-PUB-8, 9, 10, 13, 14`):
-/// - `R5-PUB-8`: Eliminates quadratic DoS — 1 MB of nested `<div>` terminates in `< 100 ms`
-///   (down from ~150 s), foster-parented `<table><i></i>` runs in linear time via O(1) linked
+/// - `R5-PUB-8`: Eliminates quadratic DoS — 1 MB of nested `<div>` fails on the depth cap without
+///   quadratic backtracking, foster-parented `<table><i></i>` runs in linear time via O(1) linked
 ///   sibling pointers, `max-size` short-circuits markup scanning, and >2 MiB single markup files fail fast.
 /// - `R5-PUB-9`: Ordinary valid pages pass without false positives (XHTML 1.0 DOCTYPE, `a < b`,
 ///   `&nbsp`, `<div/>`, duplicate `class`, stray `</p>`, nested `<a>`, empty `.html`,
@@ -2485,7 +2485,7 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
         PreflightCheck::CspValid,
     ];
 
-    // 1. R5-PUB-8: 1 MB of deeply nested `<div>` MUST fail quickly (previously ~150 s)!
+    // 1. R5-PUB-8: 1 MB of deeply nested `<div>` must hit the depth cap within the test bound.
     let nested_divs = "<div>".repeat(210_000);
     assert!(nested_divs.len() > 1_000_000);
     let div_bundle = SiteBundle {
@@ -2494,9 +2494,9 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
         created_at_unix: 1,
         site_id: None,
     };
-    // Codex Round-11: keep the functional assertion on every run, and measure the timing
-    // requirement as the best of three runs so a single scheduler stall on a loaded (or
-    // emulated) host cannot masquerade as a regression to the old ~150 s behavior.
+    // Keep the functional assertion on every run, and check the wall-clock bound using the best
+    // of three runs so a single scheduler stall on a loaded or emulated host cannot cause a
+    // spurious timeout failure.
     let mut div_elapsed = std::time::Duration::MAX;
     for _ in 0..3 {
         let t0 = std::time::Instant::now();
@@ -2509,15 +2509,14 @@ fn publish_round5_wave3_scanner_perf_false_positives_script_policy_and_refresh()
             "expected depth limit violation, got: {div_v:?}"
         );
     }
-    // The defect this guards against took about 150 s. The bound is 5 s, not the ~10 ms a
-    // quiet machine needs: an unoptimised build on a machine that is compiling something
-    // else exceeded 100 ms in four of four runs, which only hid other failures.
+    // Use a generous 5 s wall-clock bound so unoptimised builds on loaded hosts do not flake,
+    // while still catching a regression to quadratic backtracking.
     assert!(
         div_elapsed < std::time::Duration::from_secs(5),
         "1 MB nested <div> took {div_elapsed:?} at best of 3 (expected well under 5 s, R5-PUB-8)"
     );
 
-    // 1b. R5-PUB-8: Foster-parenting `<table>` + `<i></i>` x 50k runs in linear O(N) time (< 500 ms in debug)!
+    // 1b. R5-PUB-8: Foster-parenting `<table>` + `<i></i>` x 50k runs in linear O(N) time within the bound.
     let foster = format!("<table>{}</table>", "<i></i>".repeat(50_000));
     let foster_bundle = SiteBundle {
         files: BTreeMap::from([("foster.html".to_owned(), foster.into_bytes())]),
@@ -2832,7 +2831,7 @@ fn r6_pub_3_importmap_and_speculationrules_enforce_same_origin_targets() {
     assert!(miraserve_publish::run_preflight_checks(&ok, &checks).is_empty());
 }
 
-/// R6-PUB-6: Bounds all four scanner DoS paths in sub-second time and bounded RAM:
+/// R6-PUB-6: Bounds all four scanner DoS paths to linear/capped work and bounded RAM:
 /// 1. 190k-sibling SVG (1.9 MB) — no O(N^2) `text_pos_at` rescan
 /// 2. Deeply nested XML/SVG (>512 depth) — explicit depth cap
 /// 3. HTML adoption-agency formatting-element attribute amplification (95 `<b>` × 20 × 1 KB + 2500 `<p>`)
@@ -2923,7 +2922,7 @@ fn r6_pub_6_eliminates_xml_quadratic_depth_attr_count_and_adoption_agency_dos() 
     // 3. HTML5 adoption-agency attribute amplification bomb (`<p>` followed by 95 `<b>` × 20 × 900 B
     //    attributes, then 2,500 `<p>t`): each `<p>` closes the previous `<p>` and reconstructs all
     //    95 active formatting `<b>` elements with cloned attributes (~4.3 GB RAM uncapped). Must
-    //    abort cleanly on the 4 MiB expanded attribute memory budget in milliseconds!
+    //    abort cleanly on the 4 MiB expanded attribute memory budget.
     let mut bomb = String::with_capacity(1_900_000);
     bomb.push_str("<!doctype html><html><body><p>");
     let big_val = "x".repeat(900);
@@ -3768,8 +3767,8 @@ fn r7_scan_2_importmap_enforces_url_like_relative_specifier_rule() {
 
 /// R7-SCAN-3: Prescan tracks HTML5 RCDATA/RAWTEXT (`<title>`, `<textarea>`, etc.) and `<svg>`/`<math>`
 /// foreign-content depth so `<title><!--</title><g a0 ...>`, `<textarea><!--</textarea><g a0 ...>`,
-/// and `<svg><script><g a0 ...></script></svg>` with 250k attributes reject in milliseconds
-/// instead of triggering `html5ever`'s 10s–150s quadratic attribute loop.
+/// and `<svg><script><g a0 ...></script></svg>` with 250k attributes reject at the attribute cap
+/// instead of entering `html5ever`'s quadratic attribute loop.
 #[test]
 fn r7_scan_3_prescan_rcdata_rawtext_and_svg_script_cannot_be_desynchronized() {
     use std::fmt::Write as _;
@@ -3819,7 +3818,7 @@ fn r7_scan_3_prescan_rcdata_rawtext_and_svg_script_cannot_be_desynchronized() {
     }
 
     // Valid SVG `<title>` HTML-integration-point comment containing `<g ...>` is treated as a
-    // comment by BOTH prescan and html5ever and finishes instantaneously.
+    // comment by BOTH prescan and html5ever and completes within the test bound.
     let svg_title_comment = format!(
         "<!doctype html><html><body><svg><title><!--</title><g{}>--></title></svg></body></html>",
         " a=1".repeat(2_000)

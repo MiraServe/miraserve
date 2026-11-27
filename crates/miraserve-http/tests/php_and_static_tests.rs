@@ -1,4 +1,4 @@
-//! Regression tests for hosting-panel staging VM bugs #2 and #3:
+//! Regression tests for shared-hosting FastCGI and static-file handling:
 //! - FastCGI `PATH_INFO` routing (`/script.php/extra`) + `PATH_INFO`, `SERVER_ADDR`, `REMOTE_PORT`
 //! - Configurable site `index` order (`index "index.php" "index.html"` vs `index "index.html" "index.php"`)
 //! - Static directory `/dir` -> `/dir/` `301` redirect preserving query string

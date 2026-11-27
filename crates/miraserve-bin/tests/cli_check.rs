@@ -2504,7 +2504,7 @@ site "a.example" { root "/var/www/a.example" }
     Ok(())
 }
 
-/// Staging findings M1 and M4: `check --fs` must agree with the server about custom error
+/// Regression test: `check --fs` must agree with the server about custom error
 /// pages. A missing page, or one that is a symlink leaving the site root, makes the server use
 /// its built-in page, so `check --fs` reports a warning (`W023`) and still exits 0.
 #[cfg(unix)]
@@ -3113,7 +3113,7 @@ site "localhost" {{
     Ok(())
 }
 
-/// Codex Round-7 staging fix: exercises the real CLI binary with a non-rotating access log in an
+/// Enforced Linux regression test: exercises the real CLI binary with a non-rotating access log in an
 /// ungranted parent directory under Landlock, sends distinct HTTPS requests before and after a
 /// live CLI `reload`, and asserts the access log contains BOTH distinct request paths.
 #[cfg(unix)]

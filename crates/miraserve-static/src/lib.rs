@@ -2608,11 +2608,10 @@ impl StaticServer {
     /// Whether a lookup may run on the calling thread.
     ///
     /// On Linux a file below the document root is found with one confined `openat2` call (see
-    /// [`fast_open`]); with the file in the page cache that takes microseconds, less than
-    /// handing the work to the blocking pool and back. On storage where a lookup turns out to be
-    /// repeatedly slow (a cold disk, a network mount), inline serving is paused for
-    /// [`INLINE_PAUSE`] and every request goes through the blocking pool; see
-    /// [`Self::note_inline_lookup`].
+    /// [`fast_open`]) without hopping to the blocking pool when the file is already cached. On
+    /// storage where a lookup turns out to be repeatedly slow (a cold disk, a network mount),
+    /// inline serving is paused for [`INLINE_PAUSE`] and every request goes through the blocking
+    /// pool; see [`Self::note_inline_lookup`].
     fn inline_allowed(&self) -> bool {
         FAST_LOOKUP_AVAILABLE
             && self.breaker_monotonic_ms() >= self.inline_paused_until_ms.load(Ordering::Acquire)

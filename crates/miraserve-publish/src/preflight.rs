@@ -1410,8 +1410,8 @@ impl TokenSink for BoundedTokenSink {
 }
 
 /// Parses HTML5 in bounded 4 KiB chunks (`R5-PUB-8`, `R7-SCAN-3`) and aborts immediately on the
-/// first fatal parse error, DOM depth/node/attribute cap, or wall-clock CPU deadline so adversarial
-/// inputs terminate in milliseconds instead of quadratic minutes.
+/// first fatal parse error, DOM depth/node/attribute cap, or CPU-time deadline so adversarial
+/// inputs cannot trigger unbounded quadratic parsing.
 fn parse_html_dom(markup: &str, scripting_enabled: bool, deadline: Duration) -> ArenaState {
     let abort_flag = Rc::new(Cell::new(false));
     let shared_state = Rc::new(RefCell::new(ArenaState::new(Rc::clone(&abort_flag))));
@@ -1474,7 +1474,7 @@ fn parse_html_dom(markup: &str, scripting_enabled: bool, deadline: Duration) -> 
         }
         if abort_flag.get() {
             // Drop tokenizer directly without flushing EOF so aborted deeply-nested or timed-out
-            // parses return instantaneously with zero `html5ever` unwind cost!
+            // parses do not trigger `html5ever` EOF tree-closing work.
             drop(tokenizer);
             let fallback_flag = Rc::new(Cell::new(true));
             return std::mem::replace(

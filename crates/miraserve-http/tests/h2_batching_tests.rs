@@ -1406,10 +1406,9 @@ async fn run_burst_scenario(vectored: bool, max_write_chunk: usize) -> TestResul
     //
     // Bound rationale:
     // - Patched h2 (COPY_LIMIT = 4096, initial buffer = 16,384 B, min_buffer_capacity = 4,105 B)
-    //   packs ~11-12 responses (~12,280 B) into one write buffer before draining, so N = 12 ready
-    //   1 KiB responses require at most 4 DATA-carrying transport writes (typically 1 or 2; even if
-    //   one early response occupied the first write before the remaining 11 queued, the other 11
-    //   pack into 1-2 writes).
+    //   copies 1 KiB DATA frames into the shared write buffer before draining, so N = 12 ready
+    //   1 KiB responses stay within the 4 DATA-carrying transport write regression ceiling even
+    //   when an early response occupies the first write before the remaining streams queue.
     // - Unpatched upstream h2 (CHAIN_THRESHOLD = 256 vectored, 1024 scalar) chains EVERY 1,024 B
     //   DATA frame into Next::Data, occupying `next` and forcing a transport write per stream:
     //   mathematically >= 12 DATA-carrying writes on both scalar and vectored transports.

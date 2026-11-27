@@ -1702,9 +1702,9 @@ fn h2_tls_wasm_concurrent_requests_meet_deadlines_cancel_and_trap() -> TestResul
         let trap_wat = tmp.path.join("trap.wat");
         let slow_wat = tmp.path.join("slow.wat");
 
-        // ~2.5M iterations (~37.5M fuel, well within the 50M max-fuel cap): takes tens of
-        // milliseconds so 8 serialized on 1 core would miss the calibrated deadline while 8 fanned
-        // across 4 worker threads finish well inside it.
+        // 2.5M iterations (within the 50M max-fuel cap): enough CPU work that 8 serialized on
+        // 1 core miss the calibrated deadline while 8 fanned across 4 worker threads finish inside
+        // it.
         fs::write(
             &burn_wat,
             r#"

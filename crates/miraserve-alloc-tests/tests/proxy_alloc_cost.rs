@@ -1197,55 +1197,37 @@ fn verify_allocator_attribution_is_exact() {
 }
 
 /// Returns `(max_ops_per_req, max_bytes_per_req)` regression ceilings for `label` on platforms
-/// with directly measured baselines (Linux and macOS). Returns `None` on other platforms so the
-/// harness still prints the table without asserting unmeasured ceilings.
+/// with configured ceilings (Linux and macOS). Returns `None` on other platforms so the harness
+/// still prints the table without asserting platform-specific ceilings.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn regression_ceiling(label: &str) -> Option<(f64, f64)> {
     #[cfg(target_os = "linux")]
     let table: &[(&str, f64, f64)] = &[
-        // Measured on Linux (1.95.0 & 1.100.0): 20-21 ops / 29256-29569 B (416f01f: 21-22 / 29107-29420 B)
+        // Regression ceilings guarding against per-request allocation ops/bytes regressions on Linux.
         ("proxy_get_h1_shared", 22.5, 31_500.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 17.60-18.75 ops / 22197-22551 B (416f01f: 25.73-26.71 / 23660-24016 B)
         ("proxy_get_h2_shared", 21.0, 24_900.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 25-26 ops / 44256-44571 B (416f01f: 26-27 / 44109-44424 B)
         ("proxy_post_4k_h1_shared", 27.5, 47_100.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 12.00 ops / 19008-19314 B (416f01f: 17.00 / 20190-20496 B)
         ("static_1k_h1_shared", 13.0, 21_200.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 5.47-5.77 ops / 10836-11128 B (416f01f: 11.53-11.79 / 12416-12735 B)
         ("static_1k_h2_shared", 7.5, 13_300.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 20-21 ops / 29256-29569 B (416f01f: 21-22 / 29107-29420 B)
         ("proxy_get_h1_workers2", 22.5, 31_500.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 17.58-18.66 ops / 22213-22553 B (416f01f: 25.59-26.68 / 23707-24033 B)
         ("proxy_get_h2_workers2", 21.0, 24_900.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 20.00 ops / 17599-17905 B (416f01f: 25.00 / 18927-18929 B)
         ("static_1k_h1_browser_shared", 21.5, 20_200.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 10.00 ops / 15597-15905 B (416f01f: 13.00 / 15467-15471 B)
         ("static_304_h1_shared", 11.5, 18_000.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 14.00 ops / 15226-15530 B (416f01f: 15.00 / 15072 B)
         ("redirect_h1_shared", 15.5, 17_500.0),
-        // Measured on Linux (1.95.0 & 1.100.0): 24-25 ops / 29533-29846 B (416f01f: 25-26 / 29530-29539 B)
         ("proxy_get_h1_browser_shared", 26.5, 32_000.0),
     ];
 
     #[cfg(target_os = "macos")]
     let table: &[(&str, f64, f64)] = &[
-        // Measured on macOS (1.95.0 & 1.100.0): 21-22 ops / 29216-29505 B (416f01f: 22-23 / 29067-29356 B)
+        // Regression ceilings guarding against per-request allocation ops/bytes regressions on macOS.
         ("proxy_get_h1_shared", 24.0, 31_500.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 18.77-19.82 ops / 22179-22469 B (416f01f: 27.82-28.77 / 23729-24019 B)
         ("proxy_get_h2_shared", 22.5, 24_800.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 36-37 ops / 44944-45235 B (416f01f: 37-38 / 44797-45088 B)
         ("proxy_post_4k_h1_shared", 39.0, 48_100.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 35.00 ops / 20389-20669 B (416f01f: 39.00 / 21558-21842 B)
         ("static_1k_h1_shared", 37.0, 23_200.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 26.55-26.79 ops / 11969-12251 B (416f01f: 32.67-32.75 / 13628-13914 B)
         ("static_1k_h2_shared", 29.5, 14_700.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 48.00 ops / 20244-20524 B (416f01f: 52.00 / 21563-21843 B)
         ("static_1k_h1_browser_shared", 50.0, 23_200.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 33.00 ops / 17020-17300 B (416f01f: 35.00 / 16881-17161 B)
         ("static_304_h1_shared", 35.0, 20_000.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 14.00 ops / 15114-15394 B (416f01f: 15.00 / 14960-15240 B)
         ("redirect_h1_shared", 16.0, 18_000.0),
-        // Measured on macOS (1.95.0 & 1.100.0): 25-26 ops / 29493-29782 B (416f01f: 26-27 / 29490-29779 B)
         ("proxy_get_h1_browser_shared", 28.0, 32_500.0),
     ];
 

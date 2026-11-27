@@ -1,7 +1,7 @@
-//! HTTP/1.1 keep-alive timing. Staging finding: an idle keep-alive connection was closed after
-//! `header-read` (10 s) instead of `idle-keepalive` (60 s), with a warning each time. An idle
-//! connection must wait the idle limit, while a client that starts a request head and stalls
-//! must still be cut after `header-read`.
+//! HTTP/1.1 keep-alive timing regression tests. Guards against closing an idle keep-alive
+//! connection after the `header-read` timeout (default 10 s) instead of `idle-keepalive`
+//! (default 60 s), with a warning each time. An idle connection must wait the idle limit, while a
+//! client that starts a request head and stalls must still be cut after `header-read`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

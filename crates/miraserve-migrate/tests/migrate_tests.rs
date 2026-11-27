@@ -3832,7 +3832,7 @@ server {
 }
 
 /// R7-MIG-8, R7-MIG-13, R7-MIG-14, R7-MIG-16, R7-MIG-17 & R7-CFG-2:
-/// - Caddy snippet expansion bomb fails cleanly in milliseconds (never OOMs or silently truncates).
+/// - Caddy snippet expansion bomb fails cleanly at the expansion limit (never OOMs or silently truncates).
 /// - `MigrateOptions { source_root }` remaps `/etc/nginx/conf.d/*.conf` inside a copied tree.
 /// - Attacker-controlled text actually reaches the `// INSECURE:` comment sanitizer (`R7-MIG-14`,
 ///   revert-checkable!).
@@ -3841,7 +3841,7 @@ server {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn r7_mig_8_13_14_16_17_snippet_bomb_source_root_sanitizer_bidi_and_nginx_dot_root() -> TestResult {
-    // 1. R7-MIG-8 & R7-MIG-17: Exponential Caddy snippet bomb terminates instantaneously with error.
+    // 1. R7-MIG-8 & R7-MIG-17: Exponential Caddy snippet bomb fails at the expansion cap within the test bound.
     let mut bomb = String::from("(s0) {\n}\n");
     for n in 1..=7 {
         use std::fmt::Write as _;

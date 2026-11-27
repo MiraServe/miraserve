@@ -987,9 +987,8 @@ pub fn parse_htpasswd(text: &str) -> Result<Vec<(String, String)>, String> {
     Ok(users)
 }
 
-/// Lowest and highest bcrypt cost accepted in a users file. Higher costs make every check of
-/// that account occupy a worker for a long time (cost 12 is about a quarter second; each step
-/// doubles it).
+/// Lowest and highest bcrypt cost accepted in a users file. Each cost increment doubles the
+/// work per check, so unbounded costs would let every check occupy a worker for a long time.
 pub const BCRYPT_COST_RANGE: std::ops::RangeInclusive<u32> = 4..=12;
 
 /// Checks a complete bcrypt record: `$2y$` (or `$2b$`, `$2a$`), a two-digit cost in

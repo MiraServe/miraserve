@@ -1161,7 +1161,7 @@ site "a.example" {{
     Ok(())
 }
 
-/// Staging finding M2: a reloaded site `root` that is a symlink inside a granted `read-tree`
+/// Regression test: a reloaded site `root` that is a symlink inside a granted `read-tree`
 /// but points outside it was treated as covered, so the reload succeeded and the site answered
 /// 404. Coverage is decided on the real location, as the kernel does.
 #[cfg(unix)]
@@ -1872,7 +1872,7 @@ site "b.example.test" {{
 /// tenant's intermediate symlink pointed at.
 ///
 /// Requires an enforcing Landlock kernel, so it is ignored by default and FAILS (never passes
-/// silently) when Landlock is unavailable. Run on the staging VM with
+/// silently) when Landlock is unavailable. Run on a Landlock-capable Linux host with
 /// `cargo test -p miraserve-sandbox --test sandbox_tests -- --ignored`.
 #[cfg(target_os = "linux")]
 #[test]

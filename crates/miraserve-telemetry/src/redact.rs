@@ -792,9 +792,8 @@ mod tests {
             large.len()
         );
 
-        // Prove the inner-scan counter genuinely catches the 600c0d9 quadratic suffix scan:
-        // on the exact same 3,001-byte fixture, the old algorithm exceeds 1.5M byte reads and
-        // scales ~100x from 100 to 1,000 repeats.
+        // Verify the inner-scan counter catches quadratic suffix scanning: the reference quadratic
+        // model must trip both the superlinear byte-read bound and the quadratic scaling bound.
         let mut old_small = CountingScanner::default();
         assert!(!old_quadratic_scan_with_counter(&small, &mut old_small));
         let mut old_large = CountingScanner::default();
@@ -849,8 +848,8 @@ mod tests {
 
     /// Direct black-box regression check against `looks_like_secret_token` itself (with no counter
     /// scaffolding) so even an uninstrumented inner suffix `.contains(&b'.')` fails cleanly:
-    /// on 20,000 repeated `eyJ` markers (60 KiB), the quadratic algorithm scans ~600 MB while
-    /// the linear scanner stays within a small constant factor of a same-length non-`eyJ` string.
+    /// on 20,000 repeated `eyJ` markers (60 KiB), a quadratic suffix scan scales quadratically
+    /// while the linear scanner stays within a constant factor of a same-length non-`eyJ` string.
     #[test]
     fn looks_like_secret_token_direct_scaling_rejects_quadratic_suffix_scan() {
         use std::time::{Duration, Instant};

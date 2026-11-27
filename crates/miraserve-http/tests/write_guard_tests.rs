@@ -359,11 +359,11 @@ dual_runtime_test!(
     -> Result<(), String>
 );
 
-/// Staging (`WireGuard` path, curl at 3 KB/s over HTTP/2): the client took about 540 KB more than
-/// it had read, then its window stayed shut longer than `response-write-idle` while it kept
-/// reading. Scaled: minimum 100 kB/s, a reader at 150 kB/s that first takes 400 kB in one go,
-/// then gets 300 kB every 2 s (silences of 2 s, ten times `WRITE_IDLE`). It is never behind the
-/// minimum rate and must not be cut.
+/// Regression test: an HTTP/2 reader that buffers a large lead ahead of what it has drained and
+/// then leaves its window closed longer than `response-write-idle` while still reading must not be
+/// cut. Scaled parameters: minimum 100 kB/s, a reader at 150 kB/s that first takes 400 kB in one
+/// go, then gets 300 kB every 2 s (silences of 2 s, ten times `WRITE_IDLE`). It is never behind
+/// the minimum rate and must not be cut.
 async fn review_round6_reader_spending_its_lead_through_long_silences_is_not_cut_impl() {
     let io = WriteGuardedIo::new(
         BurstyKernel::new(vec![
@@ -420,8 +420,8 @@ dual_runtime_test!(
     -> io::Result<()>
 );
 
-/// Staging finding: an HTTP/1.1 client that stopped reading a large download was still
-/// connected after 150 s, because the allowance followed the kernel's autotuned send buffer.
+/// Regression test: an HTTP/1.1 client that stopped reading a large download remained connected
+/// far past `write-idle` when the allowance followed the kernel's autotuned send buffer.
 /// On Linux `for_tcp_stream` bounds the unsent queue (`TCP_NOTSENT_LOWAT`, 32 KiB), so the cut
 /// comes at `write-idle + 32 KiB / min-rate` whatever the send buffer is: here 1 s + 0.5 s.
 #[cfg(target_os = "linux")]

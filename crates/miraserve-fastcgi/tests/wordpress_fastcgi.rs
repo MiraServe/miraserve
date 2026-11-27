@@ -273,7 +273,7 @@ fn cgi_response_parser_rejects_1xx_whitespace_colon_and_strips_framing_headers()
     Ok(())
 }
 
-/// Staging finding: a graceful PHP-FPM reload drops connections for a moment and in-flight
+/// Regression test: a graceful PHP-FPM reload drops connections for a moment and in-flight
 /// requests got 502. With `replay-safe-methods` a request without side effects is tried once
 /// more on a fresh connection; a POST is never sent twice. Without the setting (the default)
 /// nothing that reached the backend is sent again, because the backend may have run it.

@@ -1,5 +1,5 @@
 //! A server that hosts sites must not answer for hostnames it does not serve, and must not
-//! describe itself to them. Reported from hosting-panel staging: an unknown hostname over HTTPS
+//! describe itself to them. Regression: an unknown hostname over HTTPS
 //! got `200` and the built-in welcome page, which shows the TLS and sandbox state.
 
 use std::net::{IpAddr, Ipv4Addr};
@@ -93,7 +93,7 @@ server {
     Ok(())
 }
 
-/// Staging findings M1 and M4: a custom error page that is missing, or is a symlink leaving the
+/// Regression test: a custom error page that is missing, or is a symlink leaving the
 /// site root, stopped the whole server at the next start. The file belongs to the site owner,
 /// so the engine must still build and that status must fall back to the built-in page.
 #[cfg(unix)]
@@ -192,7 +192,7 @@ site "a.example.test" {{
     Ok(())
 }
 
-/// Staging finding: an ABSOLUTE `error-pages` path that is a symlink to another account's file
+/// Regression test: an ABSOLUTE `error-pages` path that is a symlink to another account's file
 /// was followed, and that file's content became the 404 body. A symlinked absolute page is
 /// refused, inside or outside the site root, and the built-in page is used.
 #[cfg(unix)]

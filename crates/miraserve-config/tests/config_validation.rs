@@ -2600,7 +2600,7 @@ site "{bad}" {{
     Ok(())
 }
 
-/// Staging finding: W021 ("non-standard backend port without trusted-proxies") fired for an
+/// Regression test: W021 ("non-standard backend port without trusted-proxies") previously fired for an
 /// extra listener port next to :443 on a directly exposed server, and for `site "[::1]"`.
 #[test]
 fn w021_ignores_an_extra_port_beside_443_and_bracketed_ipv6_site_names() {

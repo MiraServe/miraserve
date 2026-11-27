@@ -6,7 +6,7 @@
 //! document root does not stop the server or a reload: that one area answers every request
 //! with 503 (fail closed) and the problem is logged; `miraserve check --fs` reports it first.
 //!
-//! bcrypt is deliberately slow (milliseconds to a quarter second). Checks run on the blocking
+//! bcrypt is deliberately CPU-intensive. Checks run on the blocking
 //! pool holding two permits that travel with the work (one for the whole process, one for the
 //! area), so a cancelled request cannot free a slot while its bcrypt run continues and one
 //! site cannot take every slot. Each visitor address gets [`MAX_FAILURES_PER_MINUTE`] failed
@@ -2216,7 +2216,7 @@ mod tests {
         Ok(())
     }
 
-    /// The panel's real-box check of a3edeca: twenty correct logins in flight at once from one
+    /// Regression test: twenty correct logins in flight at once from one
     /// address, nothing remembered yet, all get in (one shared check), and nothing stays
     /// counted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

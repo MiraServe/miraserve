@@ -1,4 +1,4 @@
-//! Access-log field forgery. Staging finding: `user_agent` and `referer` were written unquoted,
+//! Access-log field forgery regression tests: `user_agent` and `referer` were previously written unquoted,
 //! so a visitor could send `User-Agent: x status=500 host=victim.test` and forge fields for any
 //! parser (statistics, fail2ban, bot detection). Client-supplied text must reach the logger as
 //! string values, which the formatter quotes and escapes.
