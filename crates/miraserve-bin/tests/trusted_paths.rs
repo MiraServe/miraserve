@@ -100,32 +100,67 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         .output()?;
     assert_eq!(out.status.code(), Some(0));
     let help = String::from_utf8(out.stdout)?;
-    assert!(help.contains("--trusted-paths"), "help:\n{help}");
-    assert!(help.contains("--fs"), "help:\n{help}");
-    assert!(help.contains("W034"), "help:\n{help}");
-    assert!(help.contains("Linux-only"), "help:\n{help}");
-    assert!(help.contains("socket-tree"), "help:\n{help}");
-    assert!(help.contains("fastcgi-pass"), "help:\n{help}");
-    assert!(help.contains("keyd-socket"), "help:\n{help}");
-    assert!(help.contains("ACME"), "help:\n{help}");
-    assert!(help.contains("ai-publish"), "help:\n{help}");
-    assert!(help.contains("rotating log"), "help:\n{help}");
-    let norm = help.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        norm.contains("assumes no identity-mapped mounts and no other writable view"),
-        "help:\n{norm}"
-    );
-    assert!(norm.contains("stacked filesystems"), "help:\n{norm}");
-    assert!(norm.contains("atime"), "help:\n{norm}");
-    assert!(
-        norm.contains("unresponsive network or userspace filesystem"),
-        "help:\n{norm}"
-    );
+    let start = help
+        .find("--trusted-paths")
+        .ok_or("missing --trusted-paths in help")?;
+    let rest = help.get(start..).unwrap_or("");
+    let end = rest.find("--acme-dir").unwrap_or(rest.len());
+    let flag_help = rest.get(..end).unwrap_or(rest);
+    let norm = flag_help.split_whitespace().collect::<Vec<_>>().join(" ");
+    for req in [
+        "--trusted-paths",
+        "--fs",
+        "W034",
+        "Linux-only",
+        "socket-tree",
+        "fastcgi-pass",
+        "keyd-socket",
+        "path of the endpoint the server connects to",
+        "ACME",
+        "ai-publish",
+        "resolve against the config dir first",
+        "rotating log",
+        "other paths are not looked at yet",
+        "No warning is not a guarantee.",
+        "/tmp",
+        "/home",
+        "idmap",
+        "stacking",
+        "encryption",
+        "writable view",
+        "sandbox.user",
+        "not verified",
+        "0.1.6",
+        "unresponsive",
+        "atime",
+    ] {
+        assert!(norm.contains(req), "missing '{req}' in help:\n{norm}");
+    }
     let lower = norm.to_ascii_lowercase();
-    assert!(!lower.contains("race-free"), "help:\n{help}");
-    assert!(!lower.contains("secure layout"), "help:\n{help}");
-    assert!(!lower.contains("changes nothing"), "help:\n{help}");
-    assert!(!lower.contains("never pass"), "help:\n{help}");
+    for forbidden in [
+        "never",
+        "always",
+        "every component",
+        "cannot pass",
+        "verified local filesystem",
+        "established",
+        "does not exist",
+        "opens no file for reading",
+        "absent prefixes",
+        "race-free",
+        "secure layout",
+        "changes nothing",
+    ] {
+        assert!(
+            !lower.contains(forbidden),
+            "forbidden '{forbidden}' in help:\n{norm}"
+        );
+    }
+    assert_eq!(
+        lower.matches("guarantee").count(),
+        1,
+        "only the not-a-guarantee sentence may mention guarantee:\n{norm}"
+    );
     Ok(())
 }
 
@@ -500,8 +535,8 @@ mod linux_tests {
             note_at(&kval, 2),
             Some(
                 format!(
-                    "trusted-paths: server.tls.keyd-socket '{}': verified existing prefix '{}' \
-                     (stopped at absent component 'keyd.sock')",
+                    "trusted-paths: server.tls.keyd-socket '{}': inspected existing prefix '{}' \
+                     (stopped at 'keyd.sock', not found by this lookup)",
                     keyd_sock.display(),
                     sock_dir.display()
                 )
@@ -1097,7 +1132,7 @@ mod linux_tests {
             Some(
                 format!(
                     "trusted-paths: site 'p2.example' FastCGI Unix socket '{}/future/pool.sock': \
-                     verified existing prefix '{}' (stopped at absent component 'future')",
+                     inspected existing prefix '{}' (stopped at 'future', not found by this lookup)",
                     trusted_parent.display(),
                     trusted_parent.display()
                 )
@@ -1320,8 +1355,8 @@ mod linux_tests {
             note_at(&val_with, 2),
             Some(
                 format!(
-                    "trusted-paths: site 's0.example' FastCGI Unix socket '{}': verified existing \
-                     prefix '{}' (stopped at absent component 'absent.sock')",
+                    "trusted-paths: site 's0.example' FastCGI Unix socket '{}': inspected existing \
+                     prefix '{}' (stopped at 'absent.sock', not found by this lookup)",
                     absent_good.display(),
                     good.display()
                 )
@@ -2448,6 +2483,276 @@ mod linux_tests {
                 )
                 .as_str()
             )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified() -> TestResult {
+        let euid = rustix::process::geteuid().as_raw();
+        if euid == 0 {
+            eprintln!(
+                "skipping linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified: requires non-root"
+            );
+            return Ok(());
+        }
+        if !require_local_root_fs(
+            "linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified",
+        )? {
+            return Ok(());
+        }
+
+        let other_uid = if euid == 1000 { 1001 } else { 1000 };
+        let base = make_temp_base("c1-mismatch")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let docroot = base.join("www");
+        let pool_dir = base.join("pool");
+        for d in [&docroot, &pool_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        let sock = pool_dir.join("app.sock");
+        let _listener = UnixListener::bind(&sock)?;
+        set_mode(&sock, 0o660)?;
+
+        let cfg = base.join("c1.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ cert \"{}\"; key \"{}\" }}\n\
+                     sandbox {{ user \"{other_uid}\" }}\n\
+                 }}\n\
+                 site \"c1.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"/owned/*\" {{ fastcgi-pass \"unix:{}\" }}\n\
+                     route \"/root/*\" {{ fastcgi-pass \"unix:/ms-tp-c1-nonexistent.sock\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&sock),
+            ),
+        )?;
+
+        let (code, val) = run_json(&["--fs", "--strict", "--trusted-paths"], &cfg)?;
+        let ws = w034s(&val);
+        assert_eq!(
+            ws.len(),
+            3,
+            "expected owner-not-trusted + two per-path not-verified W034s: {ws:#?}"
+        );
+        assert_eq!(
+            code,
+            Some(1),
+            "mismatched service uid must fail --strict: {val}"
+        );
+        assert_eq!(
+            note_at(&val, 0),
+            Some(
+                format!(
+                    "trusted-paths: checked as uid {euid}, but server.sandbox.user '{other_uid}' \
+                     resolves to uid {other_uid}; trusting uid 0 and service uid {other_uid}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(note_at(&val, 1), Some(NARROWED_NOTE_LITERAL));
+        assert_eq!(
+            note_at(&val, 2),
+            None,
+            "mismatched check must not emit an inspected-prefix pass note: {val}"
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("site[0].route[0].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'c1.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid {euid}, mode 0750): owner not trusted",
+                    sock.display(),
+                    base.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[0].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(1).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'c1.example' FastCGI Unix socket '{}': first untrusted component '{}' \
+                     (uid unknown, mode unknown): not verified: checked as uid {euid} but the \
+                     configured service account is uid {other_uid}",
+                    sock.display(),
+                    sock.display()
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "path")),
+            Some("site[0].route[1].fastcgi-pass")
+        );
+        assert_eq!(
+            ws.get(2).and_then(|w| jstr(w, "message")),
+            Some(
+                format!(
+                    "site 'c1.example' FastCGI Unix socket '/ms-tp-c1-nonexistent.sock': \
+                     first untrusted component '/ms-tp-c1-nonexistent.sock' \
+                     (uid unknown, mode unknown): not verified: checked as uid {euid} but the \
+                     configured service account is uid {other_uid}"
+                )
+                .as_str()
+            )
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_c2_cli_sourced_paths_have_no_kdl_location_and_documented_keys() -> TestResult {
+        if !require_local_root_fs(
+            "linux_c2_cli_sourced_paths_have_no_kdl_location_and_documented_keys",
+        )? {
+            return Ok(());
+        }
+        let base = make_temp_base("c2-cli-loc")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let pub_key = make_pub_key(&base)?;
+        let docroot = base.join("www");
+        let bad = base.join("bad");
+        let bad_store = bad.join("store");
+        for d in [&docroot, &bad, &bad_store] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&bad, 0o775)?;
+
+        // Explicit `server` and `server.tls` blocks exist in KDL; CLI-sourced warnings MUST NOT
+        // inherit their source spans via `location_for` fallback.
+        let cfg = base.join("c2.kdl");
+        fs::write(
+            &cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ cert \"{}\"; key \"{}\" }}\n\
+                 }}\n\
+                 site \"c2.example\" {{\n\
+                     root \"{}\"\n\
+                     ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+                kdl_escape_path(&bad_store),
+                kdl_escape_path(&pub_key),
+            ),
+        )?;
+
+        let acme_bad = bad.join("acme");
+        let log_bad = bad.join("server.log");
+        let acc_bad = bad.join("access.log");
+        let (_code, val) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &acme_bad.to_string_lossy(),
+                "--log-file",
+                &log_bad.to_string_lossy(),
+                "--access-log",
+                &acc_bad.to_string_lossy(),
+                "--log-max-bytes",
+                "1024",
+            ],
+            &cfg,
+        )?;
+        let ws = w034s(&val);
+        assert_eq!(ws.len(), 4, "expected 4 W034s: {ws:#?}");
+
+        // KDL-sourced ai-publish.storage retains its KDL location.
+        assert_eq!(
+            ws.first().and_then(|w| jstr(w, "path")),
+            Some("site[0].ai-publish.storage")
+        );
+        assert!(
+            ws.first().and_then(|w| w.get("location")).is_some(),
+            "KDL-sourced warning must retain location: {:?}",
+            ws.first()
+        );
+
+        // CLI-sourced --acme-dir, --log-file, and --access-log use documented keys and omit `location`.
+        for (idx, expected_key) in [
+            (1_usize, "server.tls.acme"),
+            (2, "server.log-file"),
+            (3, "server.access-log"),
+        ] {
+            let w = ws.get(idx).copied().ok_or("missing CLI W034")?;
+            assert_eq!(jstr(w, "path"), Some(expected_key), "w: {w}");
+            assert!(
+                w.get("location").is_none(),
+                "CLI-sourced W034 '{expected_key}' must have no KDL location: {w}"
+            );
+        }
+
+        // Even when KDL contains `server.tls.acme`, `--acme-dir` is CLI-sourced -> no location;
+        // without `--acme-dir`, default `.miraserve-acme` is triggered by KDL -> has location.
+        let acme_cfg = base.join("c2_acme.kdl");
+        fs::write(
+            &acme_cfg,
+            format!(
+                "server {{\n\
+                     listen \":443\"\n\
+                     tls {{ acme {{ email \"ops@example.com\"; challenge \"tls-alpn-01\" }} }}\n\
+                 }}\n\
+                 site \"c2a.example\" {{ root \"{}\" }}\n",
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+        let (_c_cli, val_cli) = run_json(
+            &[
+                "--fs",
+                "--trusted-paths",
+                "--acme-dir",
+                &acme_bad.to_string_lossy(),
+            ],
+            &acme_cfg,
+        )?;
+        let w_cli = w034s(&val_cli);
+        assert_eq!(w_cli.len(), 1, "val_cli: {val_cli}");
+        assert_eq!(
+            w_cli.first().and_then(|w| jstr(w, "path")),
+            Some("server.tls.acme")
+        );
+        assert!(
+            w_cli.first().and_then(|w| w.get("location")).is_none(),
+            "--acme-dir W034 must omit location even with KDL acme block: {val_cli}"
+        );
+
+        let (_c_kdl, val_kdl) = run_json(&["--fs", "--trusted-paths"], &acme_cfg)?;
+        let w_kdl = w034s(&val_kdl);
+        assert_eq!(w_kdl.len(), 1, "val_kdl: {val_kdl}");
+        assert_eq!(
+            w_kdl.first().and_then(|w| jstr(w, "path")),
+            Some("server.tls.acme")
+        );
+        assert!(
+            w_kdl.first().and_then(|w| w.get("location")).is_some(),
+            "KDL-triggered default ACME W034 must carry location: {val_kdl}"
         );
 
         let _ = fs::remove_dir_all(&base);

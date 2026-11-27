@@ -77,14 +77,20 @@ pub(crate) struct CheckArgs {
     #[arg(long)]
     pub(crate) fs: bool,
 
-    /// Opt-in Linux-only diagnostic (requires `--fs`) emitting `W034` (reports, never enforces) on
-    /// six classes: socket-tree roots, exact `fastcgi-pass` unix sockets, `keyd-socket`, ACME dir,
-    /// `ai-publish` storage, and rotating log parents. Pass verifies `/` ancestors (root/service
-    /// uid, not g/o-writable; sticky allows trusted existing child), leaf type/role, symlinks, and
-    /// absent prefixes on ordinary local mounts (assumes no identity-mapped mounts and no other
-    /// writable view of the same directories); relative paths and stacked filesystems report not
-    /// verified. Performs no writes and opens no file for reading (reading a symlink can update
-    /// atime); like `--fs`, can wait on an unresponsive network or userspace filesystem.
+    /// Opt-in Linux-only check (requires `--fs`); reports `W034` only, does not change the server
+    /// (without it, config matches 0.1.6; `--fs` probes still run). Inspects paths to six kinds:
+    /// `socket-tree` roots, exact `fastcgi-pass` Unix sockets, `keyd-socket` (path of the endpoint
+    /// the server connects to), ACME dir, `ai-publish` storage (relative config-file values resolve
+    /// against the config dir first), rotating log parents; other paths are not looked at yet.
+    /// Reports `W034` for the first component owned by another account, group/other-writable, via
+    /// an unvouched symlink, missing where another account could create it, wrong kind, relative,
+    /// unaccepted filesystem type, or not inspectable (another account may replace it at start; fix
+    /// owner/mode or move it). No warning is not a guarantee. Sees checker's view; assumes same
+    /// root/mount view (unit isolates `/tmp`, restricts `/home`), ordinary local filesystems (no
+    /// idmap, stacking, name-hiding encryption, or other writable view), stable mounts, no shared
+    /// service account. Run as service account or root with `sandbox.user`; else not verified. Can
+    /// wait on unresponsive filesystems; writes nothing to configured paths, reads no contents
+    /// (symlink read can update atime; reads uid/symlink system files and account db).
     #[arg(long)]
     pub(crate) trusted_paths: bool,
 

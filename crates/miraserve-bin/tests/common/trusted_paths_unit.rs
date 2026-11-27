@@ -165,8 +165,15 @@ fn observer_resolution_covers_root_and_nonroot_cases() {
     assert_eq!(
         obs(1000, Some("www-data"), resolve_fixture),
         (
+            Some(33),
+            "trusted-paths: checked as uid 1000, but server.sandbox.user 'www-data' resolves to uid 33; trusting uid 0 and service uid 33".to_owned(),
+        )
+    );
+    assert_eq!(
+        obs(1001, Some("1000"), resolve_fixture),
+        (
             Some(1000),
-            "trusted-paths: trusting uid 0 and service uid 1000 (effective uid of this check; server.sandbox.user 'www-data' resolves to uid 33, which differs)".to_owned(),
+            "trusted-paths: checked as uid 1001, but server.sandbox.user '1000' resolves to uid 1000; trusting uid 0 and service uid 1000".to_owned(),
         )
     );
     assert_eq!(
