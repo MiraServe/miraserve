@@ -60,8 +60,45 @@ fn reserve_free_port() -> Result<u16, std::io::Error> {
 /// another concurrent test claimed the ephemeral port between `reserve_free_port` and bind.
 async fn start_server_with_free_port<F>(
     source_name: &str,
+    make_kdl: F,
+    options: ServerOptions,
+) -> Result<(miraserve_core::RunningServer, u16, String), Box<dyn std::error::Error>>
+where
+    F: FnMut(u16) -> String,
+{
+    start_server_with_free_port_inner(source_name, make_kdl, options, None, "").await
+}
+
+/// Like [`start_server_with_free_port`], bounding each `MiraServeServer::start` attempt by
+/// `attempt_timeout` so port selection, KDL parsing, and `AddrInUse` retries are excluded from
+/// the per-start timeout.
+#[cfg(unix)]
+async fn start_server_with_free_port_within<F>(
+    source_name: &str,
+    make_kdl: F,
+    options: ServerOptions,
+    attempt_timeout: std::time::Duration,
+    timeout_msg: &'static str,
+) -> Result<(miraserve_core::RunningServer, u16, String), Box<dyn std::error::Error>>
+where
+    F: FnMut(u16) -> String,
+{
+    start_server_with_free_port_inner(
+        source_name,
+        make_kdl,
+        options,
+        Some(attempt_timeout),
+        timeout_msg,
+    )
+    .await
+}
+
+async fn start_server_with_free_port_inner<F>(
+    source_name: &str,
     mut make_kdl: F,
     options: ServerOptions,
+    attempt_timeout: Option<std::time::Duration>,
+    timeout_msg: &'static str,
 ) -> Result<(miraserve_core::RunningServer, u16, String), Box<dyn std::error::Error>>
 where
     F: FnMut(u16) -> String,
@@ -71,7 +108,14 @@ where
         let port = reserve_free_port()?;
         let kdl = make_kdl(port);
         let (cfg, _) = parse_kdl(source_name, &kdl)?;
-        match MiraServeServer::start(Arc::new(ConfigStore::new(cfg)), options.clone()).await {
+        let start_fut = MiraServeServer::start(Arc::new(ConfigStore::new(cfg)), options.clone());
+        let outcome = match attempt_timeout {
+            Some(limit) => tokio::time::timeout(limit, start_fut)
+                .await
+                .map_err(|_| timeout_msg)?,
+            None => start_fut.await,
+        };
+        match outcome {
             Ok(server) => return Ok((server, port, kdl)),
             Err(CoreError::Bind { source, addr })
                 if source.kind() == std::io::ErrorKind::AddrInUse =>
@@ -507,13 +551,11 @@ async fn g3_tenant_fifos_in_error_pages_and_wasm_never_stall_startup_or_sibling_
     fs::write(&key_path, &dev_pem.key_pem)?;
 
     // Startup MUST complete promptly (within 5s) instead of hanging forever on open(FIFO)!
-    let (server, _, kdl) = tokio::time::timeout(
-        Duration::from_secs(5),
-        start_server_with_free_port(
-            "g3-fifo.kdl",
-            |tls_port| {
-                format!(
-                    r#"
+    let (server, _, kdl) = start_server_with_free_port_within(
+        "g3-fifo.kdl",
+        |tls_port| {
+            format!(
+                r#"
 server {{
     listen "127.0.0.1:{tls_port}" protocols="h1"
     tls {{
@@ -543,24 +585,24 @@ site "wasm-fifo.example" {{
     }}
 }}
 "#,
-                    cert = cert_path.to_string_lossy().replace('\\', "/"),
-                    key = key_path.to_string_lossy().replace('\\', "/"),
-                    healthy_root = healthy_root.to_string_lossy().replace('\\', "/"),
-                    rel_fifo_root = rel_fifo_root.to_string_lossy().replace('\\', "/"),
-                    abs_fifo_root = abs_fifo_root.to_string_lossy().replace('\\', "/"),
-                    abs_fifo = abs_fifo.to_string_lossy().replace('\\', "/"),
-                    wasm_fifo_root = wasm_fifo_root.to_string_lossy().replace('\\', "/"),
-                    wasm_fifo = wasm_fifo.to_string_lossy().replace('\\', "/"),
-                )
-            },
-            ServerOptions {
-                apply_sandbox: false,
-                ..ServerOptions::default()
-            },
-        ),
+                cert = cert_path.to_string_lossy().replace('\\', "/"),
+                key = key_path.to_string_lossy().replace('\\', "/"),
+                healthy_root = healthy_root.to_string_lossy().replace('\\', "/"),
+                rel_fifo_root = rel_fifo_root.to_string_lossy().replace('\\', "/"),
+                abs_fifo_root = abs_fifo_root.to_string_lossy().replace('\\', "/"),
+                abs_fifo = abs_fifo.to_string_lossy().replace('\\', "/"),
+                wasm_fifo_root = wasm_fifo_root.to_string_lossy().replace('\\', "/"),
+                wasm_fifo = wasm_fifo.to_string_lossy().replace('\\', "/"),
+            )
+        },
+        ServerOptions {
+            apply_sandbox: false,
+            ..ServerOptions::default()
+        },
+        Duration::from_secs(5),
+        "MiraServeServer::start stalled on tenant FIFO",
     )
-    .await
-    .map_err(|_| "MiraServeServer::start stalled on tenant FIFO")??;
+    .await?;
 
     let https_addr = server
         .bound_listeners()
@@ -1466,32 +1508,57 @@ site "beside.example" {{
         )
     };
 
-    let (cfg_rot, _) = parse_kdl("r5-plain-rot.kdl", &make_kdl(8443))?;
-    let refused = MiraServeServer::start(
-        Arc::new(ConfigStore::new(cfg_rot)),
-        ServerOptions {
-            apply_sandbox: false,
-            log_file_paths: vec![access_log.clone()],
-            log_rotation_paths: vec![access_log.clone()],
-            ..ServerOptions::default()
-        },
-    )
-    .await;
-    assert!(
-        matches!(refused, Err(CoreError::UnsafeDocroot(_))),
-        "a rotating log whose directory contains the site root must be refused"
-    );
+    let (server, kdl) = {
+        let mut last_err: Option<CoreError> = None;
+        let mut started = None;
+        for _ in 0..16 {
+            let tls_port = reserve_free_port()?;
+            let kdl = make_kdl(tls_port);
 
-    let (server, _, kdl) = start_server_with_free_port(
-        "r5-plain.kdl",
-        make_kdl,
-        ServerOptions {
-            apply_sandbox: false,
-            log_file_paths: vec![access_log],
-            ..ServerOptions::default()
-        },
-    )
-    .await?;
+            let (cfg_rot, _) = parse_kdl("r5-plain-rot.kdl", &kdl)?;
+            let refused = MiraServeServer::start(
+                Arc::new(ConfigStore::new(cfg_rot)),
+                ServerOptions {
+                    apply_sandbox: false,
+                    log_file_paths: vec![access_log.clone()],
+                    log_rotation_paths: vec![access_log.clone()],
+                    ..ServerOptions::default()
+                },
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(CoreError::UnsafeDocroot(_))),
+                "a rotating log whose directory contains the site root must be refused"
+            );
+
+            let (cfg, _) = parse_kdl("r5-plain.kdl", &kdl)?;
+            match MiraServeServer::start(
+                Arc::new(ConfigStore::new(cfg)),
+                ServerOptions {
+                    apply_sandbox: false,
+                    log_file_paths: vec![access_log.clone()],
+                    ..ServerOptions::default()
+                },
+            )
+            .await
+            {
+                Ok(server) => {
+                    started = Some((server, kdl));
+                    break;
+                }
+                Err(CoreError::Bind { source, addr })
+                    if source.kind() == std::io::ErrorKind::AddrInUse =>
+                {
+                    last_err = Some(CoreError::Bind { addr, source });
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        let Some(pair) = started else {
+            return Err(last_err.map_or_else(|| "exhausted bind retries".into(), Into::into));
+        };
+        pair
+    };
     let addr = r5_https_addr(&server)?;
     let connector = build_h1_tls_connector(&cert_pem)?;
     let (status, body) = https_get(addr, &connector, "beside.example", "/").await?;
