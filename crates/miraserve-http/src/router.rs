@@ -202,7 +202,8 @@ impl<'a> SplitSigningKeys<'a> {
 /// challenge directory, and `check --fs` reports from it; opening and retaining handles happens
 /// separately in the credential inventory (which skips configured signing keys and matching
 /// entries in `split-daemon` mode and publishes [`miraserve_static::UNIDENTIFIED_CREDENTIAL`]
-/// when a credential is skipped or cannot be opened).
+/// when there is a skipped signing-key match, an open error other than not-found, or a handle
+/// whose identity cannot be read).
 #[must_use]
 pub fn configured_credential_paths(config: &Config) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<std::path::PathBuf> = config
