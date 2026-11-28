@@ -8,7 +8,7 @@
 //! - the old HTTP static content,
 //! - the old TLS leaf certificate DER bytes,
 //! - the old active `ai-publish` content and `active.json`, and
-//! - zero provisioning or opening of padded sibling directories.
+//! - zero provisioning or activation of padded sibling directories.
 //!
 //! MUST fail on `441a58d` and pass on the 0.1.8 branch. Deterministic; no timing.
 
@@ -39,6 +39,7 @@ use tokio_rustls::TlsConnector;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const EXPECTED_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove leading or trailing whitespace from the configured path";
+const EXPECTED_RESOLVED_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove trailing whitespace from the final directory component before any trailing slash or '.'";
 
 struct TempDir {
     path: PathBuf,
@@ -49,10 +50,8 @@ impl TempDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let path = PathBuf::from(format!(
-            "/tmp/ms-pws-core-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ms-pws-core-{tag}-{}-{nanos}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path)?;
         Ok(Self { path })
@@ -144,9 +143,7 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
         &conf_dir,
         &certs_dir,
         &web_unpadded,
-        &web_padded,
         &store_unpadded,
-        &store_padded,
         &src_v1,
         &src_padded,
     ] {
@@ -155,7 +152,12 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
 
     // Distinct harmless sentinel content in unpadded vs padded static roots.
     fs::write(web_unpadded.join("index.html"), b"OLD-STATIC-V1")?;
-    fs::write(web_padded.join("index.html"), b"PADDED-STATIC-SENTINEL")?;
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(&web_padded)?;
+        fs::create_dir_all(&store_padded)?;
+        fs::write(web_padded.join("index.html"), b"PADDED-STATIC-SENTINEL")?;
+    }
 
     // Distinct Ed25519 signing key + distinct signed releases in `store` vs `store `.
     let signing_key = Ed25519SigningKey::generate()?;
@@ -165,10 +167,20 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
     fs::write(src_v1.join("index.html"), b"OLD-PUBLISH-V1")?;
     fs::write(src_padded.join("index.html"), b"PADDED-PUBLISH-SENTINEL")?;
 
-    for (store_dir, src_dir, note) in [
-        (&store_unpadded, &src_v1, "v1-unpadded"),
-        (&store_padded, &src_padded, "padded-sibling"),
-    ] {
+    let stores_to_seed: Vec<(&PathBuf, &PathBuf, &str)> = {
+        #[cfg(unix)]
+        {
+            vec![
+                (&store_unpadded, &src_v1, "v1-unpadded"),
+                (&store_padded, &src_padded, "padded-sibling"),
+            ]
+        }
+        #[cfg(not(unix))]
+        {
+            vec![(&store_unpadded, &src_v1, "v1-unpadded")]
+        }
+    };
+    for (store_dir, src_dir, note) in stores_to_seed {
         let mut bundle = bundle_from_directory(src_dir, Some(note.to_owned()))?;
         bundle.site_id = Some("pub.example".to_owned());
         let signed = SignedBundle::sign(bundle, &signing_key);
@@ -191,6 +203,7 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
     }
 
     let active_v1_before = fs::read(store_unpadded.join("active.json"))?;
+    #[cfg(unix)]
     let active_padded_before = fs::read(store_padded.join("active.json"))?;
 
     // Two distinct TLS certificates (cert-1 for gen 0, cert-2 offered only by rejected candidates).
@@ -342,17 +355,43 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
             };
             assert_eq!(e0.code, "E202");
             assert_eq!(e0.path.as_deref(), Some("site[0].root"));
-            assert_eq!(e0.message, "site root path ends with whitespace (U+0020)");
+            assert_eq!(
+                e0.message,
+                "site 'root' path on site 'static.example' ends with whitespace (U+0020)"
+            );
             assert_eq!(e0.help.as_deref(), Some(EXPECTED_HELP));
             assert_eq!(e1.code, "E202");
             assert_eq!(e1.path.as_deref(), Some("site[1].ai-publish.storage"));
             assert_eq!(
                 e1.message,
-                "ai-publish storage path ends with whitespace (U+0020)"
+                "ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
             );
             assert_eq!(e1.help.as_deref(), Some(EXPECTED_HELP));
         }
         other => {
+            server.shutdown().await;
+            return Err(format!("expected CoreError::Config(Validation), got: {other:?}").into());
+        }
+    }
+
+    // Candidate A2: string reload of the same padded candidate is likewise refused.
+    match server.reload_from_str("candidate-padded.kdl", &padded_cand_kdl) {
+        Ok(gen_id) => {
+            server.shutdown().await;
+            return Err(format!(
+                "padded reload_from_str MUST be refused, but committed generation {gen_id}"
+            )
+            .into());
+        }
+        Err(CoreError::Config(ConfigError::Validation { errors, .. })) => {
+            let [a0, a1] = errors.as_slice() else {
+                server.shutdown().await;
+                return Err(format!("expected 2 E202 errors: {errors:#?}").into());
+            };
+            assert_eq!(a0.code, "E202");
+            assert_eq!(a1.code, "E202");
+        }
+        Err(other) => {
             server.shutdown().await;
             return Err(format!("expected CoreError::Config(Validation), got: {other:?}").into());
         }
@@ -407,7 +446,7 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
             assert_eq!(e0.path.as_deref(), Some("site[1].ai-publish.storage"));
             assert_eq!(
                 e0.message,
-                "ai-publish storage path ends with whitespace (U+0020)"
+                "ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
             );
             assert_eq!(e0.help.as_deref(), Some(EXPECTED_HELP));
             assert!(e0.location.is_some());
@@ -415,9 +454,9 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
             assert_eq!(e1.path.as_deref(), Some("site[0].root"));
             assert_eq!(
                 e1.message,
-                "site root resolved directory name ends with whitespace (U+0020)"
+                "site 'root' resolved directory name on site 'static.example' ends with whitespace (U+0020)"
             );
-            assert_eq!(e1.help.as_deref(), Some(EXPECTED_HELP));
+            assert_eq!(e1.help.as_deref(), Some(EXPECTED_RESOLVED_HELP));
             assert!(e1.location.is_some());
         }
         other => {
@@ -450,16 +489,20 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
         fs::read(store_unpadded.join("active.json"))?,
         active_v1_before
     );
+    #[cfg(unix)]
     assert_eq!(
         fs::read(store_padded.join("active.json"))?,
         active_padded_before
     );
-    assert!(
-        !store_new_padded.exists(),
-        "rejected reload must not create '{}'",
-        store_new_padded.display()
-    );
-    assert!(!conf_dir.join("pub ").exists());
+    #[cfg(unix)]
+    {
+        assert!(
+            !store_new_padded.exists(),
+            "rejected reload must not create '{}'",
+            store_new_padded.display()
+        );
+        assert!(!conf_dir.join("pub ").exists());
+    }
 
     server.shutdown().await;
     Ok(())

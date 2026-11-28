@@ -10,10 +10,10 @@
 //!   refused `reload --dry-run`, and NEVER provision or modify padded or unpadded sibling dirs.
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[path = "../../miraserve-config/tests/common/mod.rs"]
 mod kdl_test_util;
@@ -25,6 +25,7 @@ type RunOutput = (Option<i32>, Vec<u8>, Vec<u8>);
 type CliCase<'a> = (&'a str, Vec<&'a str>, Option<&'a [u8]>);
 
 const EXPECTED_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove leading or trailing whitespace from the configured path";
+const EXPECTED_RESOLVED_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove trailing whitespace from the final directory component before any trailing slash or '.'";
 
 struct TempDir {
     path: PathBuf,
@@ -35,10 +36,8 @@ impl TempDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let path = PathBuf::from(format!(
-            "/tmp/ms-pws-cli-{tag}-{}-{nanos}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ms-pws-cli-{tag}-{}-{nanos}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path)?;
         Ok(Self { path })
@@ -90,6 +89,63 @@ fn run_bin(
     }
     let out = child.wait_with_output()?;
     Ok((out.status.code(), out.stdout, out.stderr))
+}
+
+fn run_bin_with_timeout(
+    bin: &Path,
+    cwd: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<RunOutput, Box<dyn std::error::Error>> {
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut r) = stderr_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_thread.join();
+            let _ = err_thread.join();
+            return Err(format!(
+                "command {:?} did not exit within {}s",
+                args,
+                timeout.as_secs()
+            )
+            .into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stdout = out_thread
+        .join()
+        .map_err(|_| "stdout reader thread panicked")?;
+    let stderr = err_thread
+        .join()
+        .map_err(|_| "stderr reader thread panicked")?;
+    Ok((status.code(), stdout, stderr))
 }
 
 #[test]
@@ -211,7 +267,18 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
     let clean_cfg_str = clean_cfg.to_str().ok_or("non-utf8 cfg")?;
     let acme_str = acme_dir.to_str().ok_or("non-utf8 acme")?;
 
-    let mut invocations: Vec<CliCase<'_>> = vec![
+    #[cfg(unix)]
+    let link_cfg_str = link_cfg.to_str().ok_or("non-utf8 link cfg")?;
+    #[cfg(unix)]
+    let unix_cases: [CliCase<'_>; 1] = [(
+        "check_symlink_dump",
+        vec!["check", "--dump-normalized", link_cfg_str],
+        None,
+    )];
+    #[cfg(not(unix))]
+    let unix_cases: [CliCase<'_>; 0] = [];
+
+    let invocations: Vec<CliCase<'_>> = [
         ("check", vec!["check", clean_cfg_str], None),
         (
             "check_strict",
@@ -317,27 +384,21 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
             ],
             None,
         ),
-    ];
-
-    #[cfg(unix)]
-    let link_cfg_str = link_cfg.to_str().ok_or("non-utf8 link cfg")?;
-    #[cfg(unix)]
-    invocations.push((
-        "check_symlink_dump",
-        vec!["check", "--dump-normalized", link_cfg_str],
-        None,
-    ));
+    ]
+    .into_iter()
+    .chain(unix_cases)
+    .collect();
 
     let baseline = baseline_bin();
     for (name, args, stdin_data) in &invocations {
         let (code, stdout, stderr) = run_bin(&bin, base, args, *stdin_data)?;
 
-        // Always assert clean semantic invariants (must pass on BOTH 441a58d and branch).
+        // Always assert clean semantic invariants for every invocation (no wildcard fallthrough;
+        // must pass on BOTH 441a58d and the 0.1.8 branch).
         match *name {
             "check"
             | "check_allow_w002"
             | "check_dump_norm"
-            | "check_stdin_json"
             | "check_symlink_dump"
             | "service_generate_systemd" => {
                 assert_eq!(
@@ -346,10 +407,19 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                     "case '{name}' failed unexpectedly: stderr={}",
                     String::from_utf8_lossy(&stderr)
                 );
+                assert!(
+                    !stdout.is_empty(),
+                    "case '{name}' produced unexpectedly empty stdout"
+                );
             }
             "check_strict" => {
                 // W002 causes --strict to fail with exit 1.
                 assert_eq!(code, Some(1), "case '{name}' must fail on W002");
+                assert!(
+                    String::from_utf8_lossy(&stderr).contains("W002"),
+                    "case '{name}' stderr must mention W002: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
             }
             "check_json" => {
                 assert_eq!(code, Some(0));
@@ -359,12 +429,104 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                     Some(true)
                 );
                 assert_eq!(
+                    val.get("errors")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(0)
+                );
+                assert_eq!(
                     val.pointer("/warnings/0/code")
                         .and_then(serde_json::Value::as_str),
                     Some("W002")
                 );
             }
-            _ => {}
+            "check_stdin_json" => {
+                assert_eq!(code, Some(0));
+                let val: serde_json::Value = serde_json::from_slice(&stdout)?;
+                assert_eq!(
+                    val.get("valid").and_then(serde_json::Value::as_bool),
+                    Some(true)
+                );
+                assert_eq!(
+                    val.get("errors")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(0)
+                );
+                assert!(
+                    val.get("config").is_some_and(serde_json::Value::is_object),
+                    "check_stdin_json must include normalized config object: {val}"
+                );
+            }
+            "check_fs" | "check_fs_trusted_paths" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stdout={}, stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+                let out_text = String::from_utf8_lossy(&stdout);
+                assert!(
+                    out_text.contains("OK:"),
+                    "case '{name}' stdout must contain OK summary: {out_text}"
+                );
+            }
+            "check_fs_json" | "check_fs_trusted_paths_json" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stdout={}, stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+                let val: serde_json::Value = serde_json::from_slice(&stdout)?;
+                assert_eq!(
+                    val.get("valid").and_then(serde_json::Value::as_bool),
+                    Some(true),
+                    "case '{name}' must report valid=true: {val}"
+                );
+                assert_eq!(
+                    val.get("errors")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(0),
+                    "case '{name}' must report zero errors: {val}"
+                );
+                let has_w002 = val
+                    .get("warnings")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|ws| {
+                        ws.iter().any(|w| {
+                            w.get("code").and_then(serde_json::Value::as_str) == Some("W002")
+                        })
+                    });
+                assert!(has_w002, "case '{name}' must retain W002 warning: {val}");
+            }
+            "check_writable_set" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                let ws_text = String::from_utf8_lossy(&stdout);
+                #[cfg(target_os = "linux")]
+                assert!(
+                    ws_text.trim() == "landlock unavailable"
+                        || (ws_text.contains("releases") && ws_text.contains("acme state")),
+                    "writable-set on Linux must list publish store and acme state dir (or 'landlock unavailable' without kernel Landlock): {ws_text}"
+                );
+                #[cfg(not(target_os = "linux"))]
+                assert_eq!(
+                    ws_text.as_ref(),
+                    "landlock unavailable\n",
+                    "writable-set on non-Linux must report landlock unavailable"
+                );
+            }
+            other => {
+                return Err(format!("unhandled CLI parity case '{other}'").into());
+            }
         }
 
         // If MIRASERVE_BASELINE_BIN is provided (e.g. a 441a58d binary), assert exact
@@ -406,6 +568,7 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
     let certs_dir = base.join("certs");
     let releases_dir = base.join("releases");
     let unpadded_store = releases_dir.join("app");
+    #[cfg(unix)]
     let padded_store = releases_dir.join("app ");
     let unpadded_fresh = releases_dir.join("fresh");
     let padded_fresh = releases_dir.join("fresh "); // intentionally NOT created!
@@ -416,12 +579,15 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
     for d in [
         &certs_dir,
         &unpadded_store,
-        &padded_store,
         &unpadded_fresh,
         &unpadded_root,
-        &padded_root,
         &conf_dir,
     ] {
+        fs::create_dir_all(d)?;
+        set_mode(d, 0o750)?;
+    }
+    #[cfg(unix)]
+    for d in [&padded_store, &padded_root] {
         fs::create_dir_all(d)?;
         set_mode(d, 0o750)?;
     }
@@ -431,13 +597,16 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
         unpadded_store.join("sentinel.txt"),
         b"UNPADDED_STORE_SENTINEL",
     )?;
-    fs::write(padded_store.join("sentinel.txt"), b"PADDED_STORE_SENTINEL")?;
     fs::write(
         unpadded_fresh.join("sentinel.txt"),
         b"UNPADDED_FRESH_SENTINEL",
     )?;
     fs::write(unpadded_root.join("index.html"), b"UNPADDED_ROOT_SENTINEL")?;
-    fs::write(padded_root.join("index.html"), b"PADDED_ROOT_SENTINEL")?;
+    #[cfg(unix)]
+    {
+        fs::write(padded_store.join("sentinel.txt"), b"PADDED_STORE_SENTINEL")?;
+        fs::write(padded_root.join("index.html"), b"PADDED_ROOT_SENTINEL")?;
+    }
 
     let cert_path = certs_dir.join("srv.crt");
     let key_path = certs_dir.join("srv.key");
@@ -523,7 +692,7 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
     assert_eq!(
         json.pointer("/errors/0/message")
             .and_then(serde_json::Value::as_str),
-        Some("ai-publish storage path ends with whitespace (U+0020)")
+        Some("ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)")
     );
     assert_eq!(
         json.pointer("/errors/0/help")
@@ -556,7 +725,9 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
     let ws_err_text = String::from_utf8_lossy(&ws_stderr);
     assert!(
         ws_err_text.contains("E202")
-            && ws_err_text.contains("ai-publish storage path ends with whitespace (U+0020)"),
+            && ws_err_text.contains(
+                "ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
+            ),
         "writable-set stderr must report E202: {ws_err_text}"
     );
 
@@ -588,19 +759,29 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
         rld_errors
             .iter()
             .filter_map(serde_json::Value::as_str)
-            .any(|s| s.contains("[E202] ai-publish storage path ends with whitespace (U+0020)")),
+            .any(|s| s.contains(
+                "[E202] ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
+            )),
         "expected E202 in reload preflight errors, got: {rld_json}"
     );
 
-    // 4. `miraserve run <cand>`: fails immediately at config load; NEVER creates `fresh `!
-    let (run_code, _, run_stderr) =
-        run_bin(&bin, base, &["run", "--no-sandbox", cand_fresh_str], None)?;
+    // 4. `miraserve run <cand>`: fails immediately at config load (bounded timeout so a
+    //    regression that starts serving fails fast); NEVER creates `fresh `!
+    let (run_code, _, run_stderr) = run_bin_with_timeout(
+        &bin,
+        base,
+        &["run", "--no-sandbox", cand_fresh_str],
+        Duration::from_secs(15),
+    )?;
     assert_eq!(run_code, Some(1), "run must refuse padded storage");
     let run_err_text = String::from_utf8_lossy(&run_stderr);
     assert!(
-        run_err_text.contains("[E202] ai-publish storage path ends with whitespace (U+0020)"),
+        run_err_text.contains(
+            "[E202] ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
+        ),
         "run stderr must report E202: {run_err_text}"
     );
+    #[cfg(unix)]
     assert!(
         !padded_fresh.exists(),
         "rejected candidate MUST NOT provision padded sibling '{}'",
@@ -672,7 +853,13 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
         c2_json
             .pointer("/errors/0/message")
             .and_then(serde_json::Value::as_str),
-        Some("site root path ends with whitespace (U+0020)")
+        Some("site 'root' path on site 'web.example' ends with whitespace (U+0020)")
+    );
+    assert_eq!(
+        c2_json
+            .pointer("/errors/0/help")
+            .and_then(serde_json::Value::as_str),
+        Some(EXPECTED_HELP)
     );
     assert_eq!(
         c2_json
@@ -690,7 +877,15 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
         c2_json
             .pointer("/errors/1/message")
             .and_then(serde_json::Value::as_str),
-        Some("ai-publish storage resolved directory name ends with whitespace (U+0020)")
+        Some(
+            "ai-publish 'storage' resolved directory name on site 'rel-dot.example' ends with whitespace (U+0020)"
+        )
+    );
+    assert_eq!(
+        c2_json
+            .pointer("/errors/1/help")
+            .and_then(serde_json::Value::as_str),
+        Some(EXPECTED_RESOLVED_HELP)
     );
 
     // Writable-set on cand-root also exits 1 with empty stdout.
@@ -709,18 +904,21 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
         b"UNPADDED_STORE_SENTINEL"
     );
     assert_eq!(
-        fs::read(padded_store.join("sentinel.txt"))?,
-        b"PADDED_STORE_SENTINEL"
-    );
-    assert_eq!(
         fs::read(unpadded_root.join("index.html"))?,
         b"UNPADDED_ROOT_SENTINEL"
     );
-    assert_eq!(
-        fs::read(padded_root.join("index.html"))?,
-        b"PADDED_ROOT_SENTINEL"
-    );
-    assert!(!conf_dir.join("app ").exists());
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::read(padded_store.join("sentinel.txt"))?,
+            b"PADDED_STORE_SENTINEL"
+        );
+        assert_eq!(
+            fs::read(padded_root.join("index.html"))?,
+            b"PADDED_ROOT_SENTINEL"
+        );
+        assert!(!conf_dir.join("app ").exists());
+    }
     assert!(!conf_dir.join("app").exists());
 
     Ok(())

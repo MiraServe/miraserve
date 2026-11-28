@@ -1915,7 +1915,7 @@ mod linux_tests {
         assert_eq!(
             val.pointer("/errors/0/message")
                 .and_then(serde_json::Value::as_str),
-            Some("keyd-socket path starts with whitespace (U+0020)")
+            Some("server.tls 'keyd-socket' path starts with whitespace (U+0020)")
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -2840,7 +2840,9 @@ mod linux_tests {
             p_val
                 .pointer("/errors/0/message")
                 .and_then(serde_json::Value::as_str),
-            Some("FastCGI Unix socket path starts with whitespace (U+0020)")
+            Some(
+                "'fastcgi-pass' path on route '/lead/*' of site 'rt.example' starts with whitespace (U+0020)"
+            )
         );
         assert_eq!(
             p_val
@@ -2858,7 +2860,9 @@ mod linux_tests {
             p_val
                 .pointer("/errors/1/message")
                 .and_then(serde_json::Value::as_str),
-            Some("FastCGI Unix socket path ends with whitespace (U+0020)")
+            Some(
+                "'fastcgi-pass' path on route '/trail/*' of site 'rt.example' ends with whitespace (U+0020)"
+            )
         );
 
         // 2. Clean `socket-tree` trailing slash continues to load and match runtime normalization.
