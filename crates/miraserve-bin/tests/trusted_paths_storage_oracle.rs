@@ -1,29 +1,28 @@
 //! Stage 3 (0.1.8) oracle tests for `site[N].ai-publish.storage` under
 //! `miraserve check --fs --trusted-paths` (`W034`).
 //!
-//! Covers:
-//! 1. Flag-off differential parity against `bef6865` (`MIRASERVE_BASELINE_BIN`) across text/JSON,
-//!    plain/`--fs`, `--strict`, `--allow-warning`, `--quiet`, `--writable-set`, stdin, rejected
-//!    padded storage, and `reload --dry-run`.
-//! 2. Flag-on parity for the five existing classes on old-only configs (byte-identical modulo the
-//!    exact narrowed-note literal) and on mixed configs (old W034 vector, order, observer note,
-//!    and socket-prefix notes unchanged, with `site[N].ai-publish.storage` appended after the
-//!    rotating-log pass in site source index order).
-//! 3. Storage diagnostics on real accepted local Linux filesystems with exact literal assertions
-//!    for every JSON field (`code`, `severity`, `path`, `message`, `help`, absence of `label`, and
-//!    exact `location`), covering clean `0750`, foreign `0755`, writable parent/leaf/sticky leaf,
-//!    wrong type, missing leaf/intermediate, sticky existing/missing child, trusted/bad/loop
-//!    symlinks, two sites sharing a store, quarantined site, writable descendants under a clean
-//!    store, Windows-drive spelling, file-relative storage via a symlinked config across three
-//!    distinguishable trees, padded rejected input, and stdin relative storage.
-//! 4. Deployment & multi-UID effects: actual service-UID execution (with effective supplementary
-//!    groups), root with `sandbox.user` set and unset, distinct PHP/tenant UIDs, baseline-clean
-//!    `--strict`/`--allow-warning W034`, and separation of `W034` counts from `--fs` write errors.
+//! Parity tests compare against checked-in fixtures under
+//! `tests/fixtures/tp_storage_parity/<profile>/` recorded from `bef6865` (and `v0.1.7` = `9836e8a7`
+//! for Linux flag-on parity), following the structure, path normalisation, and recording procedure
+//! of `tests/check_parity_v016.rs`.
+//!
+//! To re-record fixtures from a reference binary:
+//! - `RECORD_TP_STORAGE_PARITY=bef6865 MIRASERVE_PARITY_BIN=/path/to/bef6865/miraserve`
+//! - `RECORD_TP_STORAGE_PARITY=v017 MIRASERVE_PARITY_BIN=/path/to/v0.1.7/miraserve`
+//!
+//! In ordinary `cargo test`, every parity test unconditionally compares the candidate binary
+//! byte-for-byte against the committed fixtures. Environment-dependent Linux tests (local POSIX
+//! filesystem at `/` and `/tmp`, `overlayfs` at `/`, root vs non-root) are marked with `#[ignore]`
+//! so the test harness reports them as ignored rather than silently skipping them.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 #[path = "../../miraserve-config/tests/common/mod.rs"]
 mod kdl_test_util;
@@ -34,17 +33,67 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 type RunOutput = (Option<i32>, Vec<u8>, Vec<u8>);
 type CliCase<'a> = (&'a str, Vec<&'a str>, Option<&'a [u8]>);
 
+static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CommandSnapshot {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CaseFixture {
+    commands: BTreeMap<String, CommandSnapshot>,
+}
+
 fn miraserve_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_miraserve"))
 }
 
-fn baseline_bin() -> Option<PathBuf> {
-    std::env::var_os("MIRASERVE_BASELINE_BIN").map(PathBuf::from)
+fn parity_bin() -> PathBuf {
+    std::env::var_os("MIRASERVE_PARITY_BIN").map_or_else(miraserve_bin, PathBuf::from)
 }
 
-#[cfg(target_os = "linux")]
-fn v017_bin() -> Option<PathBuf> {
-    std::env::var_os("MIRASERVE_V017_BIN").map(PathBuf::from)
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fixture_profile() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if rustix::process::geteuid().is_root() {
+            "linux-root"
+        } else {
+            "linux-nonroot"
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn fixture_dir(profile: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("tp_storage_parity")
+        .join(profile)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn normalize_output(
+    raw: &[u8],
+    canon_base: &str,
+    raw_base: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut text = String::from_utf8(raw.to_vec())?;
+    if !canon_base.is_empty() && canon_base != raw_base {
+        text = text.replace(canon_base, "<TMPDIR>");
+    }
+    if !raw_base.is_empty() {
+        text = text.replace(raw_base, "<TMPDIR>");
+    }
+    Ok(text)
 }
 
 struct TempDir {
@@ -52,11 +101,14 @@ struct TempDir {
 }
 
 impl TempDir {
-    fn new(tag: &str) -> Result<Self, std::io::Error> {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let path = PathBuf::from(format!("/tmp/ms-tps-{tag}-{}-{nanos}", std::process::id()));
+    /// Creates a temporary directory with a fixed byte length (`/tmp/ms-tps-<c>-<8hex>-<4hex>`,
+    /// always 27 bytes) so generated KDL source offsets and span lengths are invariant across runs.
+    fn new_fixed(tag: char) -> Result<Self, std::io::Error> {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFFF;
+        let path = PathBuf::from(format!(
+            "/tmp/ms-tps-{tag}-{:08x}-{seq:04x}",
+            std::process::id(),
+        ));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path)?;
         set_mode(&path, 0o750)?;
@@ -103,11 +155,15 @@ fn run_bin(
     Ok((out.status.code(), out.stdout, out.stderr))
 }
 
-fn gen_dev_cert(dir: &Path, hosts: &str) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+fn gen_dev_cert(
+    bin: &Path,
+    dir: &Path,
+    hosts: &str,
+) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
     let cert = dir.join("server.crt");
     let key = dir.join("server.key");
     let (code, _, stderr) = run_bin(
-        &miraserve_bin(),
+        bin,
         dir,
         &[
             "cert",
@@ -140,17 +196,63 @@ fn write_pubkey(dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(pub_key)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn assert_fixture_byte_parity(
+    actual: &CaseFixture,
+    fixture_path: &Path,
+    profile: &str,
+) -> TestResult {
+    let expected_raw = fs::read_to_string(fixture_path)
+        .map_err(|err| format!("missing parity fixture '{}': {err}", fixture_path.display()))?;
+    let expected: CaseFixture = serde_json::from_str(&expected_raw)?;
+    assert_eq!(
+        actual.commands.keys().collect::<Vec<_>>(),
+        expected.commands.keys().collect::<Vec<_>>(),
+        "command set mismatch for '{}' (profile={profile})",
+        fixture_path.display()
+    );
+    for (mode_name, exp_snap) in &expected.commands {
+        let act_snap = actual
+            .commands
+            .get(mode_name)
+            .ok_or_else(|| format!("missing mode '{mode_name}' in actual output"))?;
+        assert_eq!(
+            act_snap.exit_code, exp_snap.exit_code,
+            "exit status mismatch for mode '{mode_name}' (profile={profile})"
+        );
+        assert_eq!(
+            act_snap.stdout.as_bytes(),
+            exp_snap.stdout.as_bytes(),
+            "stdout byte mismatch for mode '{mode_name}' (profile={profile})\n--- EXPECTED ---\n{}\n--- ACTUAL ---\n{}",
+            exp_snap.stdout,
+            act_snap.stdout,
+        );
+        assert_eq!(
+            act_snap.stderr.as_bytes(),
+            exp_snap.stderr.as_bytes(),
+            "stderr byte mismatch for mode '{mode_name}' (profile={profile})\n--- EXPECTED ---\n{}\n--- ACTUAL ---\n{}",
+            exp_snap.stderr,
+            act_snap.stderr,
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// 1. Flag-off differential parity against bef6865 (cross-platform)
+// 1. Flag-off byte-for-byte parity against checked-in bef6865 fixtures
 // ---------------------------------------------------------------------------
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 #[allow(clippy::too_many_lines)]
-fn flag_off_bef6865_differential_parity() -> TestResult {
-    let bin = miraserve_bin();
-    let baseline = baseline_bin();
-    let tmp = TempDir::new("flag-off")?;
+fn flag_off_bef6865_parity() -> TestResult {
+    let profile = fixture_profile();
+    let bin = parity_bin();
+    let tmp = TempDir::new_fixed('f')?;
     let base = &tmp.path;
+    let canon_base = fs::canonicalize(base)?;
+    let raw_base_s = base.to_string_lossy().into_owned();
+    let canon_base_s = canon_base.to_string_lossy().into_owned();
 
     let certs = base.join("certs");
     let docroot = base.join("www");
@@ -164,7 +266,7 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
     set_mode(&bad_store, 0o777)?;
     set_mode(&acme, 0o700)?;
 
-    let (cert, key) = gen_dev_cert(&certs, "pub.example,miss.example")?;
+    let (cert, key) = gen_dev_cert(&bin, &certs, "pub.example,miss.example")?;
     let pub_key = write_pubkey(&certs)?;
 
     // Config WITH a 0777 ai-publish.storage AND W002 (min-version 1.2) to exercise all flag-off modes.
@@ -240,13 +342,16 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
     let padded_s = padded_cfg.to_str().ok_or("non-utf8 padded cfg")?;
     let acme_s = acme.to_str().ok_or("non-utf8 acme")?;
 
-    let extra_cases: [CliCase<'_>; 14] = [
+    // Pass `--no-sandbox` on `--fs` invocations so flag-off parity is invariant across Linux
+    // kernels with different Landlock ABIs or refused Landlock queries (zero W035 drift), while
+    // every ordinary `--fs` check still runs in full.
+    let cases: [CliCase<'_>; 14] = [
         ("check_text", vec!["check", cfg_s], None),
         ("check_json", vec!["check", "--format", "json", cfg_s], None),
         ("check_quiet", vec!["check", "--quiet", cfg_s], None),
         (
             "check_fs",
-            vec!["check", "--fs", "--acme-dir", acme_s, cfg_s],
+            vec!["check", "--fs", "--no-sandbox", "--acme-dir", acme_s, cfg_s],
             None,
         ),
         (
@@ -254,6 +359,7 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
             vec![
                 "check",
                 "--fs",
+                "--no-sandbox",
                 "--format",
                 "json",
                 "--acme-dir",
@@ -264,7 +370,15 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
         ),
         (
             "check_fs_strict",
-            vec!["check", "--fs", "--strict", "--acme-dir", acme_s, cfg_s],
+            vec![
+                "check",
+                "--fs",
+                "--no-sandbox",
+                "--strict",
+                "--acme-dir",
+                acme_s,
+                cfg_s,
+            ],
             None,
         ),
         (
@@ -272,6 +386,7 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
             vec![
                 "check",
                 "--fs",
+                "--no-sandbox",
                 "--strict",
                 "--allow-warning",
                 "W002",
@@ -285,7 +400,15 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
         ),
         (
             "check_fs_quiet",
-            vec!["check", "--fs", "--quiet", "--acme-dir", acme_s, cfg_s],
+            vec![
+                "check",
+                "--fs",
+                "--no-sandbox",
+                "--quiet",
+                "--acme-dir",
+                acme_s,
+                cfg_s,
+            ],
             None,
         ),
         (
@@ -293,6 +416,7 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
             vec![
                 "check",
                 "--fs",
+                "--no-sandbox",
                 "--writable-set",
                 "--acme-dir",
                 acme_s,
@@ -307,12 +431,19 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
         ),
         (
             "check_fs_missing_parent",
-            vec!["check", "--fs", "--format", "json", miss_s],
+            vec!["check", "--fs", "--no-sandbox", "--format", "json", miss_s],
             None,
         ),
         (
             "check_fs_rejected_padded",
-            vec!["check", "--fs", "--format", "json", padded_s],
+            vec![
+                "check",
+                "--fs",
+                "--no-sandbox",
+                "--format",
+                "json",
+                padded_s,
+            ],
             None,
         ),
         (
@@ -334,7 +465,8 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
         ),
     ];
 
-    for (name, args, stdin_bytes) in &extra_cases {
+    let mut actual_commands = BTreeMap::new();
+    for (name, args, stdin_bytes) in &cases {
         let (code, stdout, stderr) = run_bin(&bin, base, args, *stdin_bytes)?;
         match *name {
             "check_text" | "check_fs" => {
@@ -371,11 +503,11 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
                     .get("warnings")
                     .and_then(serde_json::Value::as_array)
                     .ok_or("missing warnings")?;
-                assert!(
-                    warns
-                        .iter()
-                        .all(|w| w.get("code").and_then(serde_json::Value::as_str) != Some("W034")),
-                    "flag off must never emit W034: {v}"
+                assert_eq!(warns.len(), 1, "expected only W002: {v}");
+                assert_eq!(
+                    v.pointer("/warnings/0/code")
+                        .and_then(serde_json::Value::as_str),
+                    Some("W002")
                 );
             }
             "check_fs_strict" => {
@@ -383,23 +515,18 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
                 assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
             }
             "check_fs_strict_allow_w002" => {
+                assert_eq!(code, Some(0), "{name} must exit 0 unconditionally");
                 let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                let has_w035 = v
+                assert_eq!(v.get("valid"), Some(&serde_json::Value::Bool(true)));
+                let warns = v
                     .get("warnings")
                     .and_then(serde_json::Value::as_array)
-                    .is_some_and(|a| {
-                        a.iter().any(|w| {
-                            w.get("code").and_then(serde_json::Value::as_str) == Some("W035")
-                        })
-                    });
-                assert_eq!(code, Some(i32::from(has_w035)), "{name}: {v}");
-                assert!(
-                    v.get("warnings")
-                        .and_then(serde_json::Value::as_array)
-                        .is_some_and(|a| a.iter().all(|w| {
-                            w.get("code").and_then(serde_json::Value::as_str) != Some("W034")
-                        })),
-                    "flag off must never emit W034: {v}"
+                    .ok_or("missing warnings")?;
+                assert_eq!(warns.len(), 1, "expected only W002: {v}");
+                assert_eq!(
+                    v.pointer("/warnings/0/code")
+                        .and_then(serde_json::Value::as_str),
+                    Some("W002")
                 );
             }
             "check_fs_writable_set" => {
@@ -451,40 +578,50 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
             other => return Err(format!("unhandled case {other}").into()),
         }
 
-        if let Some(base_bin) = &baseline {
-            let (b_code, b_stdout, b_stderr) = run_bin(base_bin, base, args, *stdin_bytes)?;
-            assert_eq!(code, b_code, "exit code mismatch vs bef6865 on {name}");
-            assert_eq!(
-                stdout,
-                b_stdout,
-                "stdout mismatch vs bef6865 on {name}:\n--- bef6865 ---\n{}\n--- candidate ---\n{}",
-                String::from_utf8_lossy(&b_stdout),
-                String::from_utf8_lossy(&stdout),
-            );
-            assert_eq!(
-                stderr,
-                b_stderr,
-                "stderr mismatch vs bef6865 on {name}:\n--- bef6865 ---\n{}\n--- candidate ---\n{}",
-                String::from_utf8_lossy(&b_stderr),
-                String::from_utf8_lossy(&stderr),
-            );
-        }
+        actual_commands.insert(
+            (*name).to_owned(),
+            CommandSnapshot {
+                exit_code: code,
+                stdout: normalize_output(&stdout, &canon_base_s, &raw_base_s)?,
+                stderr: normalize_output(&stderr, &canon_base_s, &raw_base_s)?,
+            },
+        );
     }
 
-    Ok(())
+    let actual = CaseFixture {
+        commands: actual_commands,
+    };
+    let fdir = fixture_dir(profile);
+    let fixture_path = fdir.join("flag_off_bef6865.json");
+    if matches!(
+        std::env::var("RECORD_TP_STORAGE_PARITY").as_deref(),
+        Ok("1" | "bef6865")
+    ) {
+        fs::create_dir_all(&fdir)?;
+        let json = serde_json::to_string_pretty(&actual)?;
+        fs::write(&fixture_path, format!("{json}\n"))?;
+        return Ok(());
+    }
+
+    assert_fixture_byte_parity(&actual, &fixture_path, profile)
 }
 
 // ---------------------------------------------------------------------------
-// 2. Non-Linux flag-on with storage remains unchanged
+// 2. Non-Linux flag-on with storage byte-for-byte parity against bef6865
 // ---------------------------------------------------------------------------
 
 #[cfg(not(target_os = "linux"))]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
-    let bin = miraserve_bin();
-    let baseline = baseline_bin();
-    let tmp = TempDir::new("nonlinux-store")?;
+    let bin = parity_bin();
+    let tmp = TempDir::new_fixed('n')?;
     let base = &tmp.path;
+    #[cfg(target_os = "macos")]
+    let (canon_base_s, raw_base_s) = (
+        fs::canonicalize(base)?.to_string_lossy().into_owned(),
+        base.to_string_lossy().into_owned(),
+    );
 
     let certs = base.join("certs");
     let docroot = base.join("www");
@@ -494,7 +631,7 @@ fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
         set_mode(d, 0o750)?;
     }
     set_mode(&bad_store, 0o777)?;
-    let (cert, key) = gen_dev_cert(&certs, "pub.example")?;
+    let (cert, key) = gen_dev_cert(&bin, &certs, "pub.example")?;
     let pub_key = write_pubkey(&certs)?;
 
     let cfg = base.join("pub.kdl");
@@ -518,22 +655,39 @@ fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
     )?;
     let cfg_s = cfg.to_str().ok_or("non-utf8 cfg")?;
 
-    for args in [
-        vec!["check", "--fs", "--strict", "--trusted-paths", cfg_s],
-        vec![
-            "check",
-            "--fs",
-            "--strict",
-            "--trusted-paths",
-            "--format",
-            "json",
-            cfg_s,
-        ],
-        vec!["check", "--fs", "--trusted-paths", "--writable-set", cfg_s],
-        vec!["check", "--fs", "--trusted-paths", "--quiet", cfg_s],
-    ] {
-        let (code, stdout, stderr) = run_bin(&bin, base, &args, None)?;
-        assert_eq!(code, Some(0), "non-linux args {args:?} failed");
+    let cases: [(&str, Vec<&str>); 4] = [
+        (
+            "check_fs_strict_tp",
+            vec!["check", "--fs", "--strict", "--trusted-paths", cfg_s],
+        ),
+        (
+            "check_fs_strict_tp_json",
+            vec![
+                "check",
+                "--fs",
+                "--strict",
+                "--trusted-paths",
+                "--format",
+                "json",
+                cfg_s,
+            ],
+        ),
+        (
+            "check_fs_tp_writable_set",
+            vec!["check", "--fs", "--trusted-paths", "--writable-set", cfg_s],
+        ),
+        (
+            "check_fs_tp_quiet",
+            vec!["check", "--fs", "--trusted-paths", "--quiet", cfg_s],
+        ),
+    ];
+
+    #[cfg(target_os = "macos")]
+    let mut actual_commands = BTreeMap::new();
+
+    for (name, args) in &cases {
+        let (code, stdout, stderr) = run_bin(&bin, base, args, None)?;
+        assert_eq!(code, Some(0), "non-linux case {name} failed");
         assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
         if args.contains(&"json") {
             let v: serde_json::Value = serde_json::from_slice(&stdout)?;
@@ -550,12 +704,35 @@ fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
                 Some(0)
             );
         }
-        if let Some(base_bin) = &baseline {
-            let (b_code, b_stdout, b_stderr) = run_bin(base_bin, base, &args, None)?;
-            assert_eq!(code, b_code);
-            assert_eq!(stdout, b_stdout);
-            assert_eq!(stderr, b_stderr);
+        #[cfg(target_os = "macos")]
+        actual_commands.insert(
+            (*name).to_owned(),
+            CommandSnapshot {
+                exit_code: code,
+                stdout: normalize_output(&stdout, &canon_base_s, &raw_base_s)?,
+                stderr: normalize_output(&stderr, &canon_base_s, &raw_base_s)?,
+            },
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let profile = fixture_profile();
+        let actual = CaseFixture {
+            commands: actual_commands,
+        };
+        let fdir = fixture_dir(profile);
+        let fixture_path = fdir.join("non_linux_trusted_paths.json");
+        if matches!(
+            std::env::var("RECORD_TP_STORAGE_PARITY").as_deref(),
+            Ok("1" | "bef6865")
+        ) {
+            fs::create_dir_all(&fdir)?;
+            let json = serde_json::to_string_pretty(&actual)?;
+            fs::write(&fixture_path, format!("{json}\n"))?;
+            return Ok(());
         }
+        assert_fixture_byte_parity(&actual, &fixture_path, profile)?;
     }
 
     Ok(())
@@ -618,18 +795,26 @@ mod linux_storage_oracles {
         )
     }
 
-    fn require_local_root_fs(test_name: &str) -> Result<bool, std::io::Error> {
+    /// Asserts that both `/` and `/tmp` reside on an accepted non-stacking local POSIX filesystem.
+    /// Never skips or returns `Ok(())` on an unsupported filesystem.
+    fn assert_local_root_fs() -> TestResult {
         for p in ["/", "/tmp"] {
             let m = fs_magic_of(p)?;
-            if !is_accepted_local_fs(m) {
-                eprintln!(
-                    "skipping {test_name}: {p} is on filesystem 0x{m:x} \
-                     (not an accepted non-stacking local POSIX filesystem)"
-                );
-                return Ok(false);
-            }
+            assert!(
+                is_accepted_local_fs(m),
+                "precondition failed: {p} is on filesystem 0x{m:x} \
+                 (requires an accepted non-stacking local POSIX filesystem such as tmpfs/ext4)"
+            );
         }
-        Ok(true)
+        Ok(())
+    }
+
+    fn normalize_euid(text: String, euid: u32) -> String {
+        if euid == 0 {
+            return text;
+        }
+        text.replace(&format!("service uid {euid} "), "service uid <EUID> ")
+            .replace(&format!("(uid {euid}, "), "(uid <EUID>, ")
     }
 
     fn expected_default_observer_note() -> String {
@@ -693,11 +878,11 @@ mod linux_storage_oracles {
             .collect()
     }
 
-    fn loc_of_occurrence(
+    fn loc_parts_of_occurrence(
         kdl: &str,
         needle: &str,
         occurrence: usize,
-    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    ) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
         let mut start = 0_usize;
         let mut found = None;
         for _ in 0..=occurrence {
@@ -721,79 +906,206 @@ mod linux_storage_oracles {
                 column += 1;
             }
         }
+        Ok((line, column, offset, needle.len()))
+    }
+
+    fn loc_of_occurrence(
+        kdl: &str,
+        needle: &str,
+        occurrence: usize,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let (line, column, offset, length) = loc_parts_of_occurrence(kdl, needle, occurrence)?;
         Ok(serde_json::json!({
             "line": line,
             "column": column,
             "offset": offset,
-            "length": needle.len(),
+            "length": length,
         }))
     }
 
+    /// Asserts exact whole-object JSON equality for a `W034` issue, including exact `location`
+    /// (`line`, `column`, `offset`, `length`), absent `label`, and zero extra fields.
     fn assert_w034_full(
         issue: &serde_json::Value,
         expected_path: &str,
         expected_message: &str,
         expected_help: &str,
         expected_loc: &serde_json::Value,
-    ) -> TestResult {
-        assert_eq!(jstr(issue, "code"), Some("W034"), "issue: {issue}");
-        assert_eq!(jstr(issue, "severity"), Some("warning"), "issue: {issue}");
-        assert_eq!(jstr(issue, "path"), Some(expected_path), "issue: {issue}");
-        assert_eq!(
-            jstr(issue, "message"),
-            Some(expected_message),
-            "issue: {issue}"
+    ) {
+        let expected = serde_json::json!({
+            "code": "W034",
+            "severity": "warning",
+            "message": expected_message,
+            "path": expected_path,
+            "help": expected_help,
+            "location": expected_loc,
+        });
+        assert_eq!(issue, &expected, "W034 full JSON mismatch");
+    }
+
+    fn format_storage_w034_json_entry(
+        path: &str,
+        message: &str,
+        loc: (usize, usize, usize, usize),
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let (line, column, offset, length) = loc;
+        Ok(format!(
+            ",\n    {{\n      \"code\": \"W034\",\n      \"severity\": \"warning\",\n      \"message\": {},\n      \"path\": {},\n      \"help\": {},\n      \"location\": {{\n        \"line\": {line},\n        \"column\": {column},\n        \"offset\": {offset},\n        \"length\": {length}\n      }}\n    }}",
+            serde_json::to_string(message)?,
+            serde_json::to_string(path)?,
+            serde_json::to_string(HELP_GEN)?,
+        ))
+    }
+
+    // -----------------------------------------------------------------------
+    // Always-run Linux rejection test (runs on ALL Linux filesystems, no skip)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn linux_storage_padded_and_stdin_rejections_never_reach_w034() -> TestResult {
+        let bin = miraserve_bin();
+        let tmp = TempDir::new_fixed('r')?;
+        let base = &tmp.path;
+
+        let certs = base.join("certs");
+        let real_cfg_dir = base.join("real_cfg_tree");
+        let cwd_dir = base.join("cwd_tree");
+        let real_pub = real_cfg_dir.join("www");
+        let bad_padded_dir = base.join("padded_target");
+        for d in [&certs, &real_cfg_dir, &cwd_dir, &real_pub, &bad_padded_dir] {
+            fs::create_dir_all(d)?;
+            set_mode(d, 0o750)?;
+        }
+        set_mode(&bad_padded_dir, 0o777)?;
+
+        let (cert, key) = gen_dev_cert(&bin, &certs, "rel.example")?;
+        let pub_key = write_pubkey(&certs)?;
+
+        for (tag, storage_val, expected_err_msg) in [
+            (
+                "abs_padded",
+                format!("{} ", kdl_escape_path(&bad_padded_dir)),
+                "ai-publish 'storage' path on site 'rel.example' ends with whitespace (U+0020)",
+            ),
+            (
+                "rel_dot_padded",
+                "app /.".to_owned(),
+                "ai-publish 'storage' resolved directory name on site 'rel.example' ends with whitespace (U+0020)",
+            ),
+        ] {
+            let padded_cfg = real_cfg_dir.join(format!("{tag}.kdl"));
+            fs::write(
+                &padded_cfg,
+                format!(
+                    "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                     site \"rel.example\" {{\n\
+                         root \"www\"\n\
+                         ai-publish {{\n\
+                             storage \"{storage_val}\"\n\
+                             require-signature \"ed25519:{}\"\n\
+                         }}\n\
+                     }}\n",
+                    kdl_escape_path(&cert),
+                    kdl_escape_path(&key),
+                    kdl_escape_path(&pub_key),
+                ),
+            )?;
+            let (p_code, p_val, _, _) =
+                run_check_json(&bin, &cwd_dir, &["--fs", "--trusted-paths"], &padded_cfg)?;
+            assert_eq!(p_code, Some(1), "{tag} must exit 1: {p_val}");
+            assert_eq!(p_val.get("valid"), Some(&serde_json::Value::Bool(false)));
+            assert!(w034s(&p_val).is_empty(), "{tag} must emit 0 W034: {p_val}");
+            assert_eq!(
+                p_val
+                    .pointer("/errors/0/code")
+                    .and_then(serde_json::Value::as_str),
+                Some("E202")
+            );
+            assert_eq!(
+                p_val
+                    .pointer("/errors/0/path")
+                    .and_then(serde_json::Value::as_str),
+                Some("site[0].ai-publish.storage")
+            );
+            assert_eq!(
+                p_val
+                    .pointer("/errors/0/message")
+                    .and_then(serde_json::Value::as_str),
+                Some(expected_err_msg)
+            );
+            assert_eq!(
+                notes_of(&p_val),
+                vec![
+                    "trusted-paths: configuration could not be loaded or is invalid; no paths were verified"
+                ]
+            );
+        }
+
+        let stdin_kdl = format!(
+            "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+             site \"rel.example\" {{\n\
+                 root \"{}\"\n\
+                 ai-publish {{\n\
+                     storage \"stores/app\"\n\
+                     require-signature \"ed25519:{}\"\n\
+                 }}\n\
+             }}\n",
+            kdl_escape_path(&cert),
+            kdl_escape_path(&key),
+            kdl_escape_path(&real_pub),
+            kdl_escape_path(&pub_key),
         );
-        assert_eq!(jstr(issue, "help"), Some(expected_help), "issue: {issue}");
+        let (st_code, st_out, _) = run_bin(
+            &bin,
+            &cwd_dir,
+            &["check", "--fs", "--trusted-paths", "--format", "json", "-"],
+            Some(stdin_kdl.as_bytes()),
+        )?;
+        assert_eq!(st_code, Some(1));
+        let st_val: serde_json::Value = serde_json::from_slice(&st_out)?;
         assert!(
-            issue.get("label").is_none(),
-            "label must be absent: {issue}"
-        );
-        let actual_loc = issue.get("location").ok_or("missing location")?;
-        assert_eq!(
-            actual_loc.get("line"),
-            expected_loc.get("line"),
-            "line mismatch: actual={actual_loc}, expected={expected_loc}, issue={issue}"
+            w034s(&st_val).is_empty(),
+            "stdin relative storage must not reach W034: {st_val}"
         );
         assert_eq!(
-            actual_loc.get("column"),
-            expected_loc.get("column"),
-            "column mismatch: actual={actual_loc}, expected={expected_loc}, issue={issue}"
+            st_val
+                .pointer("/errors/0/code")
+                .and_then(serde_json::Value::as_str),
+            Some("E202")
         );
         assert_eq!(
-            actual_loc.get("offset"),
-            expected_loc.get("offset"),
-            "offset mismatch: actual={actual_loc}, expected={expected_loc}, issue={issue}"
+            st_val
+                .pointer("/errors/0/path")
+                .and_then(serde_json::Value::as_str),
+            Some("site[0].ai-publish.storage")
         );
-        // `kdl` node spans cover at least the node text (`storage "..."`).
-        let act_len = actual_loc
-            .get("length")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or("missing length")?;
-        let exp_len = expected_loc
-            .get("length")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or("missing expected length")?;
-        assert!(
-            act_len == exp_len || act_len == exp_len + 1,
-            "length mismatch: actual={actual_loc}, expected={expected_loc}, issue={issue}"
+        assert_eq!(
+            notes_of(&st_val),
+            vec![
+                "trusted-paths: configuration could not be loaded or is invalid; no paths were verified"
+            ]
         );
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Oracle 2: Flag on — old-only and mixed-config exact parity
+    // Oracle 2: Flag on — old-only and mixed-config exact byte parity against
+    // checked-in bef6865 and v0.1.7 (9836e8a7) fixtures
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires an accepted local POSIX filesystem at / and /tmp (not overlayfs); run with --ignored in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_flag_on_old_only_and_mixed_config_exact_parity() -> TestResult {
-        if !require_local_root_fs("linux_flag_on_old_only_and_mixed_config_exact_parity")? {
-            return Ok(());
-        }
-        let bin = miraserve_bin();
-        let tmp = TempDir::new("parity-on")?;
+        assert_local_root_fs()?;
+        let profile = fixture_profile();
+        let bin = parity_bin();
+        let tmp = TempDir::new_fixed('p')?;
         let base = &tmp.path;
+        let canon_base = fs::canonicalize(base)?;
+        let raw_base_s = base.to_string_lossy().into_owned();
+        let canon_base_s = canon_base.to_string_lossy().into_owned();
         let euid = rustix::process::geteuid().as_raw();
 
         let certs = base.join("certs");
@@ -840,11 +1152,12 @@ mod linux_storage_oracles {
         let log_f = log_dir.join("server.log");
         let acc_f = log_dir.join("access.log");
 
-        let (cert, key) = gen_dev_cert(&certs, "s0.example,s1.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "s0.example,s1.example")?;
         let pub_key = write_pubkey(&certs)?;
 
         // Part A: Old-only config (no ai-publish.storage) covering all 5 existing classes +
-        // excluded bad read-tree/site.root + absent socket prefix note + relative fastcgi-pass.
+        // excluded bad read-tree/site.root + absent socket prefix note + relative fastcgi-pass +
+        // independent missing keyd.sock `--fs` error.
         let old_cfg = base.join("old_only.kdl");
         fs::write(
             &old_cfg,
@@ -877,109 +1190,8 @@ mod linux_storage_oracles {
             ),
         )?;
 
-        let acme_s = acme_bad.to_string_lossy().into_owned();
-        let log_s = log_f.to_string_lossy().into_owned();
-        let acc_s = acc_f.to_string_lossy().into_owned();
-        let common_args = [
-            "--fs",
-            "--trusted-paths",
-            "--acme-dir",
-            &acme_s,
-            "--log-file",
-            &log_s,
-            "--access-log",
-            &acc_s,
-            "--log-max-bytes",
-            "1024",
-        ];
-
-        let (old_code, old_val, old_stdout, old_stderr) =
-            run_check_json(&bin, base, &common_args, &old_cfg)?;
-        let old_w = w034s(&old_val);
-        let old_paths: Vec<Option<&str>> = old_w.iter().map(|w| jstr(w, "path")).collect();
-        assert_eq!(
-            old_paths,
-            vec![
-                Some("server.sandbox.socket-tree"),
-                Some("site[0].route[0].fastcgi-pass"),
-                Some("site[0].route[2].fastcgi-pass"),
-                Some("site[0].route[3].fastcgi-pass"),
-                Some("server.tls.keyd-socket"),
-                Some("server.tls.acme"),
-                Some("server.log-file"),
-                Some("server.access-log"),
-            ],
-            "old-only W034 paths: {old_w:#?}"
-        );
-        let old_notes = notes_of(&old_val);
-        assert_eq!(
-            old_notes.first().copied(),
-            Some(expected_default_observer_note().as_str())
-        );
-        assert_eq!(old_notes.get(1).copied(), Some(NEW_NARROWED));
-        assert_eq!(
-            old_notes.get(2).copied(),
-            Some(
-                format!(
-                    "trusted-paths: site 's0.example' FastCGI Unix socket '{}': inspected existing \
-                     prefix '{}' (stopped at 'absent.sock', not found by this lookup)",
-                    absent_sock.display(),
-                    trusted.display(),
-                )
-                .as_str()
-            )
-        );
-        assert_eq!(old_notes.len(), 3, "unexpected notes: {old_notes:?}");
-
-        // Differential comparison of old-only config against bef6865 (and v0.1.7 if provided):
-        // whole JSON AND text output must be byte-identical modulo ONLY the narrowed-note literal!
-        let old_cfg_s = old_cfg.to_str().ok_or("non-utf8 old_cfg")?;
-        let mut text_args = vec!["check"];
-        text_args.extend_from_slice(&common_args);
-        text_args.push(old_cfg_s);
-        let (old_txt_code, old_txt_out, old_txt_err) = run_bin(&bin, base, &text_args, None)?;
-
-        for (label, maybe_ref_bin) in [("bef6865", baseline_bin()), ("v0.1.7", v017_bin())] {
-            if let Some(ref_bin) = maybe_ref_bin {
-                let (b_code, _b_val, b_stdout, b_stderr) =
-                    run_check_json(&ref_bin, base, &common_args, &old_cfg)?;
-                assert_eq!(old_code, b_code, "old-only JSON exit mismatch vs {label}");
-                let b_stdout_s = String::from_utf8(b_stdout)?;
-                assert!(
-                    b_stdout_s.contains(OLD_NARROWED),
-                    "{label} JSON stdout missing OLD_NARROWED"
-                );
-                assert_eq!(
-                    String::from_utf8(old_stdout.clone())?,
-                    b_stdout_s.replacen(OLD_NARROWED, NEW_NARROWED, 1),
-                    "old-only JSON stdout mismatch vs {label} modulo narrowed note"
-                );
-                assert_eq!(
-                    old_stderr, b_stderr,
-                    "old-only JSON stderr mismatch vs {label}"
-                );
-
-                let (bt_code, bt_out, bt_err) = run_bin(&ref_bin, base, &text_args, None)?;
-                assert_eq!(
-                    old_txt_code, bt_code,
-                    "old-only text exit mismatch vs {label}"
-                );
-                let bt_out_s = String::from_utf8(bt_out)?;
-                let bt_err_s = String::from_utf8(bt_err)?;
-                assert_eq!(
-                    String::from_utf8(old_txt_out.clone())?,
-                    bt_out_s.replacen(OLD_NARROWED, NEW_NARROWED, 1),
-                    "old-only text stdout mismatch vs {label} modulo narrowed note"
-                );
-                assert_eq!(
-                    String::from_utf8(old_txt_err.clone())?,
-                    bt_err_s.replacen(OLD_NARROWED, NEW_NARROWED, 1),
-                    "old-only text stderr mismatch vs {label} modulo narrowed note"
-                );
-            }
-        }
-
-        // Part B: Mixed config — exact same 5 classes PLUS bad ai-publish.storage on site[0] & site[1].
+        // Part B: Mixed config — exact same 5 classes + keyd.sock error PLUS bad ai-publish.storage
+        // on site[0] & site[1].
         let mixed_cfg = base.join("mixed.kdl");
         let s0_store_node = format!("storage \"{}\"", kdl_escape_path(&bad_store0));
         let s1_store_node = format!("storage \"{}\"", kdl_escape_path(&bad_store1));
@@ -1022,15 +1234,101 @@ mod linux_storage_oracles {
         );
         fs::write(&mixed_cfg, &mixed_kdl)?;
 
-        let (_m_code, m_val, _, _) = run_check_json(&bin, base, &common_args, &mixed_cfg)?;
-        let m_w = w034s(&m_val);
-        assert_eq!(m_w.len(), old_w.len() + 2, "mixed W034 count: {m_w:#?}");
+        let acme_s = acme_bad.to_string_lossy().into_owned();
+        let log_s = log_f.to_string_lossy().into_owned();
+        let acc_s = acc_f.to_string_lossy().into_owned();
+        let common_args = [
+            "--fs",
+            "--no-sandbox",
+            "--trusted-paths",
+            "--acme-dir",
+            &acme_s,
+            "--log-file",
+            &log_s,
+            "--access-log",
+            &acc_s,
+            "--log-max-bytes",
+            "1024",
+        ];
 
-        // Position rule: the 8 existing diagnostics occupy [0..8] unchanged, and the 2 storage
-        // diagnostics are appended at [8..10] in site source index order (0, 1)!
-        let m_paths: Vec<Option<&str>> = m_w.iter().map(|w| jstr(w, "path")).collect();
+        let (old_code, old_val, old_stdout, old_stderr) =
+            run_check_json(&bin, base, &common_args, &old_cfg)?;
+        let old_cfg_s = old_cfg.to_str().ok_or("non-utf8 old_cfg")?;
+        let mut text_args = vec!["check"];
+        text_args.extend_from_slice(&common_args);
+        text_args.push(old_cfg_s);
+        let (old_txt_code, old_txt_out, old_txt_err) = run_bin(&bin, base, &text_args, None)?;
+        let (m_code, m_val, m_stdout, m_stderr) =
+            run_check_json(&bin, base, &common_args, &mixed_cfg)?;
+
+        let norm = |raw: &[u8]| -> Result<String, Box<dyn std::error::Error>> {
+            Ok(normalize_euid(
+                normalize_output(raw, &canon_base_s, &raw_base_s)?,
+                euid,
+            ))
+        };
+
+        let old_json_norm = norm(&old_stdout)?;
+        let old_json_err_norm = norm(&old_stderr)?;
+        let old_txt_out_norm = norm(&old_txt_out)?;
+        let old_txt_err_norm = norm(&old_txt_err)?;
+        let mixed_json_norm = norm(&m_stdout)?;
+        let mixed_json_err_norm = norm(&m_stderr)?;
+
+        let fdir = fixture_dir(profile);
+        if let Ok(rec) = std::env::var("RECORD_TP_STORAGE_PARITY")
+            && matches!(rec.as_str(), "bef6865" | "v017")
+        {
+            let mut commands = BTreeMap::new();
+            commands.insert(
+                "old_only_json".to_owned(),
+                CommandSnapshot {
+                    exit_code: old_code,
+                    stdout: old_json_norm,
+                    stderr: old_json_err_norm,
+                },
+            );
+            commands.insert(
+                "old_only_text".to_owned(),
+                CommandSnapshot {
+                    exit_code: old_txt_code,
+                    stdout: old_txt_out_norm,
+                    stderr: old_txt_err_norm,
+                },
+            );
+            commands.insert(
+                "mixed_json".to_owned(),
+                CommandSnapshot {
+                    exit_code: m_code,
+                    stdout: mixed_json_norm,
+                    stderr: mixed_json_err_norm,
+                },
+            );
+            fs::create_dir_all(&fdir)?;
+            let fixture_path = fdir.join(format!("flag_on_{rec}.json"));
+            let json = serde_json::to_string_pretty(&CaseFixture { commands })?;
+            fs::write(&fixture_path, format!("{json}\n"))?;
+            return Ok(());
+        }
+
+        // Candidate semantic & position assertions:
+        assert_eq!(old_code, Some(1), "missing keyd.sock must exit 1");
+        assert_eq!(m_code, Some(1), "mixed missing keyd.sock must exit 1");
         assert_eq!(
-            m_paths,
+            old_val
+                .pointer("/errors/0/path")
+                .and_then(serde_json::Value::as_str),
+            Some("server.tls.keyd-socket")
+        );
+        assert_eq!(
+            m_val.get("errors"),
+            old_val.get("errors"),
+            "mixed config errors must match old-only errors"
+        );
+        let old_w = w034s(&old_val);
+        let old_paths: Vec<Option<&str>> = old_w.iter().map(|w| jstr(w, "path")).collect();
+        assert_eq!(
+            old_paths,
             vec![
                 Some("server.sandbox.socket-tree"),
                 Some("site[0].route[0].fastcgi-pass"),
@@ -1040,11 +1338,25 @@ mod linux_storage_oracles {
                 Some("server.tls.acme"),
                 Some("server.log-file"),
                 Some("server.access-log"),
-                Some("site[0].ai-publish.storage"),
-                Some("site[1].ai-publish.storage"),
+            ],
+            "old-only W034 paths: {old_w:#?}"
+        );
+        let old_notes = notes_of(&old_val);
+        assert_eq!(
+            old_notes,
+            vec![
+                expected_default_observer_note().as_str(),
+                NEW_NARROWED,
+                &format!(
+                    "trusted-paths: site 's0.example' FastCGI Unix socket '{}': inspected existing \
+                     prefix '{}' (stopped at 'absent.sock', not found by this lookup)",
+                    absent_sock.display(),
+                    trusted.display(),
+                ),
             ]
         );
-        // Every existing diagnostic (index 0..8) has identical code/severity/path/message/help/location!
+        let m_w = w034s(&m_val);
+        assert_eq!(m_w.len(), old_w.len() + 2, "mixed W034 count: {m_w:#?}");
         for idx in 0..old_w.len() {
             assert_eq!(
                 m_w.get(idx),
@@ -1052,10 +1364,10 @@ mod linux_storage_oracles {
                 "existing W034[{idx}] changed when storage was added"
             );
         }
-        // Notes are 100% identical to old-only!
         assert_eq!(notes_of(&m_val), old_notes);
 
-        // Exact full JSON check of appended storage records [8] and [9]:
+        let s0_loc_parts = loc_parts_of_occurrence(&mixed_kdl, &s0_store_node, 0)?;
+        let s1_loc_parts = loc_parts_of_occurrence(&mixed_kdl, &s1_store_node, 0)?;
         assert_w034_full(
             m_w.get(8).copied().ok_or("missing storage W034[8]")?,
             "site[0].ai-publish.storage",
@@ -1067,7 +1379,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&mixed_kdl, &s0_store_node, 0)?,
-        )?;
+        );
         assert_w034_full(
             m_w.get(9).copied().ok_or("missing storage W034[9]")?,
             "site[1].ai-publish.storage",
@@ -1079,52 +1391,130 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&mixed_kdl, &s1_store_node, 0)?,
+        );
+
+        // Byte-for-byte comparison against BOTH checked-in reference fixtures (`bef6865` & `v0.1.7`).
+        let uid_label = if euid == 0 { "0" } else { "<EUID>" };
+        let s0_entry = format_storage_w034_json_entry(
+            "site[0].ai-publish.storage",
+            &format!(
+                "site 's0.example' ai-publish storage '<TMPDIR>/bad_store0': first untrusted \
+                 component '<TMPDIR>/bad_store0' (uid {uid_label}, mode 0775): group or other writable"
+            ),
+            s0_loc_parts,
+        )?;
+        let s1_entry = format_storage_w034_json_entry(
+            "site[1].ai-publish.storage",
+            &format!(
+                "site 's1.example' ai-publish storage '<TMPDIR>/bad_store1': first untrusted \
+                 component '<TMPDIR>/bad_store1' (uid {uid_label}, mode 0777): group or other writable"
+            ),
+            s1_loc_parts,
         )?;
 
-        // Differential check of the EXACT same mixed config against bef6865 (and v0.1.7):
-        // removing ONLY the exact two storage records leaves the complete ordered old warnings
-        // vector, observer note, and socket-prefix notes 100% identical!
-        for (label, maybe_ref_bin) in [("bef6865", baseline_bin()), ("v0.1.7", v017_bin())] {
-            if let Some(ref_bin) = maybe_ref_bin {
-                let (_bc, b_val, _, _) = run_check_json(&ref_bin, base, &common_args, &mixed_cfg)?;
-                let b_warns = b_val
-                    .get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or("missing baseline warnings")?;
-                let mut m_warns_without_storage: Vec<serde_json::Value> = m_val
-                    .get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or("missing candidate warnings")?
-                    .clone();
-                let removed: Vec<serde_json::Value> = m_warns_without_storage
-                    .iter()
-                    .filter(|w| {
-                        jstr(w, "code") == Some("W034")
-                            && jstr(w, "path").is_some_and(|p| p.ends_with(".ai-publish.storage"))
-                    })
-                    .cloned()
-                    .collect();
-                assert_eq!(
-                    removed.len(),
-                    2,
-                    "expected exactly 2 removed storage records"
-                );
-                m_warns_without_storage.retain(|w| {
-                    !(jstr(w, "code") == Some("W034")
-                        && jstr(w, "path").is_some_and(|p| p.ends_with(".ai-publish.storage")))
-                });
-                assert_eq!(
-                    &m_warns_without_storage, b_warns,
-                    "mixed config warnings (minus storage) diverged from {label}"
-                );
-                let b_notes = notes_of(&b_val);
-                let m_notes = notes_of(&m_val);
-                assert_eq!(b_notes.len(), m_notes.len());
-                assert_eq!(m_notes.first(), b_notes.first());
-                assert_eq!(b_notes.get(1), Some(&OLD_NARROWED));
-                assert_eq!(m_notes.get(1), Some(&NEW_NARROWED));
-                assert_eq!(m_notes.get(2..), b_notes.get(2..));
-            }
+        for label in ["bef6865", "v017"] {
+            let fixture_path = fdir.join(format!("flag_on_{label}.json"));
+            let raw = fs::read_to_string(&fixture_path).map_err(|err| {
+                format!(
+                    "missing flag-on parity fixture '{}': {err}",
+                    fixture_path.display()
+                )
+            })?;
+            let expected: CaseFixture = serde_json::from_str(&raw)?;
+
+            // 1. old_only_json: byte-identical modulo ONLY the narrowed-note literal.
+            let exp_oj = expected
+                .commands
+                .get("old_only_json")
+                .ok_or("missing old_only_json in fixture")?;
+            assert_eq!(
+                old_code, exp_oj.exit_code,
+                "old_only_json exit mismatch vs {label}"
+            );
+            assert_eq!(
+                exp_oj.stdout.matches(OLD_NARROWED).count(),
+                1,
+                "{label} old_only_json must contain OLD_NARROWED once"
+            );
+            let exp_oj_out = exp_oj.stdout.replacen(OLD_NARROWED, NEW_NARROWED, 1);
+            assert_eq!(
+                old_json_norm.as_bytes(),
+                exp_oj_out.as_bytes(),
+                "old_only_json stdout byte mismatch vs {label}\n--- EXPECTED ---\n{exp_oj_out}\n--- ACTUAL ---\n{old_json_norm}"
+            );
+            assert_eq!(
+                old_json_err_norm.as_bytes(),
+                exp_oj.stderr.as_bytes(),
+                "old_only_json stderr byte mismatch vs {label}"
+            );
+
+            // 2. old_only_text: byte-identical modulo ONLY the narrowed-note literal.
+            let exp_ot = expected
+                .commands
+                .get("old_only_text")
+                .ok_or("missing old_only_text in fixture")?;
+            assert_eq!(
+                old_txt_code, exp_ot.exit_code,
+                "old_only_text exit mismatch vs {label}"
+            );
+            let exp_ot_out = exp_ot.stdout.replacen(OLD_NARROWED, NEW_NARROWED, 1);
+            let exp_ot_err = exp_ot.stderr.replacen(OLD_NARROWED, NEW_NARROWED, 1);
+            assert_eq!(
+                old_txt_out_norm.as_bytes(),
+                exp_ot_out.as_bytes(),
+                "old_only_text stdout byte mismatch vs {label}\n--- EXPECTED ---\n{exp_ot_out}\n--- ACTUAL ---\n{old_txt_out_norm}"
+            );
+            assert_eq!(
+                old_txt_err_norm.as_bytes(),
+                exp_ot_err.as_bytes(),
+                "old_only_text stderr byte mismatch vs {label}\n--- EXPECTED ---\n{exp_ot_err}\n--- ACTUAL ---\n{old_txt_err_norm}"
+            );
+
+            // 3. mixed_json: exact byte-for-byte comparison pinning exit status, stderr,
+            //    errors (including keyd.sock), summary counts, all 8 old W034 records,
+            //    the exact 2 appended storage records, and all 3 notes!
+            let exp_mj = expected
+                .commands
+                .get("mixed_json")
+                .ok_or("missing mixed_json in fixture")?;
+            assert_eq!(
+                m_code, exp_mj.exit_code,
+                "mixed_json exit mismatch vs {label}"
+            );
+            assert_eq!(
+                mixed_json_err_norm.as_bytes(),
+                exp_mj.stderr.as_bytes(),
+                "mixed_json stderr byte mismatch vs {label}"
+            );
+            assert_eq!(
+                exp_mj.stdout.matches(OLD_NARROWED).count(),
+                1,
+                "{label} mixed_json must contain OLD_NARROWED once"
+            );
+            let mut exp_mj_out = exp_mj.stdout.replacen(OLD_NARROWED, NEW_NARROWED, 1);
+            assert_eq!(
+                exp_mj_out.matches("    \"warnings\": 8,\n").count(),
+                1,
+                "{label} mixed_json must contain summary warnings=8 once"
+            );
+            exp_mj_out =
+                exp_mj_out.replacen("    \"warnings\": 8,\n", "    \"warnings\": 10,\n", 1);
+            let close_anchor = "\n  ],\n  \"notes\": [";
+            assert_eq!(
+                exp_mj_out.matches(close_anchor).count(),
+                1,
+                "{label} mixed_json must contain warnings closing anchor once"
+            );
+            exp_mj_out = exp_mj_out.replacen(
+                close_anchor,
+                &format!("{s0_entry}{s1_entry}{close_anchor}"),
+                1,
+            );
+            assert_eq!(
+                mixed_json_norm.as_bytes(),
+                exp_mj_out.as_bytes(),
+                "mixed_json stdout byte mismatch vs {label}\n--- EXPECTED ---\n{exp_mj_out}\n--- ACTUAL ---\n{mixed_json_norm}"
+            );
         }
 
         Ok(())
@@ -1135,13 +1525,12 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires an accepted local POSIX filesystem at / and /tmp (not overlayfs); run with --ignored in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_storage_diagnostics_full_json_matrix() -> TestResult {
-        if !require_local_root_fs("linux_storage_diagnostics_full_json_matrix")? {
-            return Ok(());
-        }
+        assert_local_root_fs()?;
         let bin = miraserve_bin();
-        let tmp = TempDir::new("matrix")?;
+        let tmp = TempDir::new_fixed('m')?;
         let base = &tmp.path;
         let euid = rustix::process::geteuid().as_raw();
 
@@ -1209,11 +1598,12 @@ mod linux_storage_oracles {
         symlink(&loop_b, &loop_a)?;
         symlink(&loop_a, &loop_b)?;
 
-        let (cert, key) = gen_dev_cert(&certs, "clean.example,a.example,b.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "clean.example,a.example,b.example")?;
         let pub_key = write_pubkey(&certs)?;
 
         // (a)+(b)+(i)+(k): Clean 0750 store (with 0777/0666 descendants!), sticky existing trusted
         // child, absolute trusted symlink, and relative trusted symlink -> ALL exit 0 under --strict!
+        // Pass `--no-sandbox` so an independent Landlock-refused host (`W035`) cannot disturb clean-store strict checks.
         for (tag, store_path) in [
             ("clean_with_bad_descendants", &clean_store),
             ("sticky_existing_child", &sticky_existing),
@@ -1239,8 +1629,12 @@ mod linux_storage_oracles {
                     kdl_escape_path(&pub_key),
                 ),
             )?;
-            let (code, val, _, _) =
-                run_check_json(&bin, base, &["--fs", "--strict", "--trusted-paths"], &cfg)?;
+            let (code, val, _, _) = run_check_json(
+                &bin,
+                base,
+                &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
+                &cfg,
+            )?;
             assert_eq!(code, Some(0), "case {tag} must pass --strict: {val}");
             assert_eq!(val.get("valid"), Some(&serde_json::Value::Bool(true)));
             assert_eq!(
@@ -1293,7 +1687,7 @@ mod linux_storage_oracles {
         let (s_code, s_val, _, _) = run_check_json(
             &bin,
             base,
-            &["--fs", "--strict", "--trusted-paths"],
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
             &wr_leaf_cfg,
         )?;
         assert_eq!(s_code, Some(1), "wr_leaf --strict must exit 1: {s_val}");
@@ -1313,13 +1707,14 @@ mod linux_storage_oracles {
             &wr_leaf_msg,
             HELP_GEN,
             &wr_leaf_loc,
-        )?;
+        );
 
         let (a_code, a_val, _, _) = run_check_json(
             &bin,
             base,
             &[
                 "--fs",
+                "--no-sandbox",
                 "--strict",
                 "--trusted-paths",
                 "--allow-warning",
@@ -1344,7 +1739,7 @@ mod linux_storage_oracles {
             &wr_leaf_msg,
             HELP_GEN,
             &wr_leaf_loc,
-        )?;
+        );
 
         // (g): Missing leaf under existing 0750 parent -> 0 --fs errors, 1 W034, NO prefix note,
         // --strict exits 1 solely due to W034, --allow-warning W034 exits 0!
@@ -1369,7 +1764,7 @@ mod linux_storage_oracles {
         let (ml_code, ml_val, _, _) = run_check_json(
             &bin,
             base,
-            &["--fs", "--strict", "--trusted-paths"],
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
             &miss_leaf_cfg,
         )?;
         assert_eq!(
@@ -1403,12 +1798,13 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&miss_leaf_kdl, &miss_leaf_node, 0)?,
-        )?;
+        );
         let (mla_code, mla_val, _, _) = run_check_json(
             &bin,
             base,
             &[
                 "--fs",
+                "--no-sandbox",
                 "--strict",
                 "--trusted-paths",
                 "--allow-warning",
@@ -1448,6 +1844,7 @@ mod linux_storage_oracles {
             base,
             &[
                 "--fs",
+                "--no-sandbox",
                 "--strict",
                 "--trusted-paths",
                 "--allow-warning",
@@ -1486,9 +1883,9 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&miss_mid_kdl, &miss_mid_node, 0)?,
-        )?;
+        );
 
-        // (d)+(e)+(f)+(j)+(l)+(o): Single-site failure cases asserted with exact full JSON fields!
+        // (d)+(e)+(f)+(j)+(l)+(o): Single-site failure cases asserted with exact full JSON objects!
         let sticky_miss_leaf = sticky_anc.join("absent_store");
         let sticky_miss_mid = sticky_anc.join("absent_mid/store");
         let failure_cases: Vec<(&str, String, String)> = vec![
@@ -1607,7 +2004,12 @@ mod linux_storage_oracles {
             );
             let cfg = base.join(format!("fail_{tag}.kdl"));
             fs::write(&cfg, &kdl)?;
-            let (_c, val, _, _) = run_check_json(&bin, base, &["--fs", "--trusted-paths"], &cfg)?;
+            let (_c, val, _, _) = run_check_json(
+                &bin,
+                base,
+                &["--fs", "--no-sandbox", "--trusted-paths"],
+                &cfg,
+            )?;
             let ws = w034s(&val);
             assert_eq!(ws.len(), 1, "case {tag} expected 1 W034: {val}");
             assert_w034_full(
@@ -1616,7 +2018,7 @@ mod linux_storage_oracles {
                 expected_msg,
                 HELP_GEN,
                 &loc_of_occurrence(&kdl, &node, 0)?,
-            )?;
+            );
             assert_eq!(
                 notes_of(&val),
                 vec![expected_default_observer_note().as_str(), NEW_NARROWED],
@@ -1625,11 +2027,10 @@ mod linux_storage_oracles {
         }
 
         // (m): Two sites sharing a store:
-        //  - Identical literal storage paths are rejected at KDL load with `E401` (`R5-PUB-5`,
-        //    `crates/miraserve-config/src/validate.rs:1120-1158`) before `--trusted-paths` runs.
-        //  - Two symlinks aliasing the same absent store under `wr_parent` ARE accepted by
-        //    `R5-PUB-5` (the target does not exist yet so canonicalization does not merge them)
-        //    and MUST each emit a per-site W034 in source index order (no deduplication).
+        //  - Identical literal storage paths are rejected at KDL load with `E401` (`R5-PUB-5`)
+        //    before `--trusted-paths` runs.
+        //  - Two symlinks aliasing the same absent store under `wr_parent` pass `R5-PUB-5` and
+        //    each emit a per-site W034 in source index order (no deduplication).
         let dup_node = format!("storage \"{}\"", kdl_escape_path(&wr_leaf));
         let dup_kdl = format!(
             "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
@@ -1656,7 +2057,12 @@ mod linux_storage_oracles {
         );
         let dup_cfg = base.join("dup.kdl");
         fs::write(&dup_cfg, &dup_kdl)?;
-        let (dc, d_val, _, _) = run_check_json(&bin, base, &["--fs", "--trusted-paths"], &dup_cfg)?;
+        let (dc, d_val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &dup_cfg,
+        )?;
         assert_eq!(
             dc,
             Some(1),
@@ -1711,8 +2117,12 @@ mod linux_storage_oracles {
         );
         let shared_cfg = base.join("shared_alias.kdl");
         fs::write(&shared_cfg, &shared_kdl)?;
-        let (_sc, s_alias_val, _, _) =
-            run_check_json(&bin, base, &["--fs", "--trusted-paths"], &shared_cfg)?;
+        let (_sc, s_alias_val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &shared_cfg,
+        )?;
         let saw = w034s(&s_alias_val);
         assert_eq!(
             saw.len(),
@@ -1732,7 +2142,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&shared_kdl, &sa_node, 0)?,
-        )?;
+        );
         assert_w034_full(
             saw.get(1).copied().ok_or("missing shared[1]")?,
             "site[1].ai-publish.storage",
@@ -1746,9 +2156,9 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&shared_kdl, &sb_node, 0)?,
-        )?;
+        );
 
-        // (n): Quarantined owner-dir site (missing/inaccessible docroot) STILL gets storage W034!
+        // (n): Quarantined owner-dir site (missing docroot -> W026) STILL gets storage W034!
         let missing_tenant_root = owner_dir.join("absent_public_html");
         let q_node = format!("storage \"{}\"", kdl_escape_path(&wr_leaf));
         let q_kdl = format!(
@@ -1769,7 +2179,51 @@ mod linux_storage_oracles {
         );
         let q_cfg = base.join("quarantined.kdl");
         fs::write(&q_cfg, &q_kdl)?;
-        let (_qc, q_val, _, _) = run_check_json(&bin, base, &["--fs", "--trusted-paths"], &q_cfg)?;
+        let (qc, q_val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &q_cfg,
+        )?;
+        assert_eq!(
+            qc,
+            Some(0),
+            "quarantined tenant site must not error: {q_val}"
+        );
+        assert_eq!(
+            q_val
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0),
+            "quarantined tenant site must have 0 errors: {q_val}"
+        );
+        let q_w026: Vec<&serde_json::Value> = q_val
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|w| jstr(w, "code") == Some("W026"))
+            .collect();
+        assert_eq!(
+            q_w026.len(),
+            1,
+            "quarantined site must actually receive W026: {q_val}"
+        );
+        assert_eq!(
+            q_w026.first().and_then(|w| jstr(w, "path")),
+            Some("site[0].root"),
+            "W026 must point at site[0].root: {q_val}"
+        );
+        assert!(
+            q_w026
+                .first()
+                .and_then(|w| jstr(w, "message"))
+                .is_some_and(
+                    |m| m.contains("503 Service Unavailable") && m.contains("absent_public_html")
+                ),
+            "W026 message must describe missing tenant root quarantine: {q_val}"
+        );
         let qw = w034s(&q_val);
         assert_eq!(
             qw.len(),
@@ -1787,21 +2241,23 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&q_kdl, &q_node, 0)?,
-        )?;
+        );
 
         Ok(())
     }
 
     // -----------------------------------------------------------------------
     // Oracle 3 (continued): File-relative storage via symlinked config across
-    // three distinguishable trees + padded & stdin rejections
+    // three distinguishable trees (local-fs walk)
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires an accepted local POSIX filesystem at / and /tmp (not overlayfs); run with --ignored in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines)]
-    fn linux_storage_file_relative_symlinked_config_and_padded_rejection() -> TestResult {
+    fn linux_storage_file_relative_symlinked_config_walk() -> TestResult {
+        assert_local_root_fs()?;
         let bin = miraserve_bin();
-        let tmp = TempDir::new("rel-sym")?;
+        let tmp = TempDir::new_fixed('s')?;
         let base = &tmp.path;
         let euid = rustix::process::geteuid().as_raw();
 
@@ -1814,7 +2270,6 @@ mod linux_storage_oracles {
         let link_store = link_cfg_dir.join("stores/app");
         let cwd_store = cwd_dir.join("stores/app");
         let real_pub = real_cfg_dir.join("www");
-        let bad_padded_dir = base.join("padded_target");
         for d in [
             &certs,
             &real_cfg_dir,
@@ -1824,7 +2279,6 @@ mod linux_storage_oracles {
             &link_store,
             &cwd_store,
             &real_pub,
-            &bad_padded_dir,
         ] {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
@@ -1832,119 +2286,9 @@ mod linux_storage_oracles {
         set_mode(&real_cfg_dir.join("stores"), 0o750)?;
         set_mode(&link_cfg_dir.join("stores"), 0o750)?;
         set_mode(&cwd_dir.join("stores"), 0o750)?;
-        set_mode(&bad_padded_dir, 0o777)?;
 
-        let (cert, key) = gen_dev_cert(&certs, "rel.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "rel.example")?;
         let pub_key = write_pubkey(&certs)?;
-
-        // Part 1: Padded rejected storage & stdin relative storage NEVER reach W034 (runs on ALL fs!).
-        for (tag, storage_val, expected_err_msg) in [
-            (
-                "abs_padded",
-                format!("{} ", kdl_escape_path(&bad_padded_dir)),
-                "ai-publish 'storage' path on site 'rel.example' ends with whitespace (U+0020)",
-            ),
-            (
-                "rel_dot_padded",
-                "app /.".to_owned(),
-                "ai-publish 'storage' resolved directory name on site 'rel.example' ends with whitespace (U+0020)",
-            ),
-        ] {
-            let padded_cfg = real_cfg_dir.join(format!("{tag}.kdl"));
-            fs::write(
-                &padded_cfg,
-                format!(
-                    "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-                     site \"rel.example\" {{\n\
-                         root \"www\"\n\
-                         ai-publish {{\n\
-                             storage \"{storage_val}\"\n\
-                             require-signature \"ed25519:{}\"\n\
-                         }}\n\
-                     }}\n",
-                    kdl_escape_path(&cert),
-                    kdl_escape_path(&key),
-                    kdl_escape_path(&pub_key),
-                ),
-            )?;
-            let (p_code, p_val, _, _) =
-                run_check_json(&bin, &cwd_dir, &["--fs", "--trusted-paths"], &padded_cfg)?;
-            assert_eq!(p_code, Some(1), "{tag} must exit 1: {p_val}");
-            assert_eq!(p_val.get("valid"), Some(&serde_json::Value::Bool(false)));
-            assert!(w034s(&p_val).is_empty(), "{tag} must emit 0 W034: {p_val}");
-            assert_eq!(
-                p_val
-                    .pointer("/errors/0/code")
-                    .and_then(serde_json::Value::as_str),
-                Some("E202")
-            );
-            assert_eq!(
-                p_val
-                    .pointer("/errors/0/path")
-                    .and_then(serde_json::Value::as_str),
-                Some("site[0].ai-publish.storage")
-            );
-            assert_eq!(
-                p_val
-                    .pointer("/errors/0/message")
-                    .and_then(serde_json::Value::as_str),
-                Some(expected_err_msg)
-            );
-            assert_eq!(
-                notes_of(&p_val),
-                vec![
-                    "trusted-paths: configuration could not be loaded or is invalid; no paths were verified"
-                ]
-            );
-        }
-
-        // Stdin relative storage fails directory validation at load before W034.
-        let stdin_kdl = format!(
-            "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
-             site \"rel.example\" {{\n\
-                 root \"{}\"\n\
-                 ai-publish {{\n\
-                     storage \"stores/app\"\n\
-                     require-signature \"ed25519:{}\"\n\
-                 }}\n\
-             }}\n",
-            kdl_escape_path(&cert),
-            kdl_escape_path(&key),
-            kdl_escape_path(&real_pub),
-            kdl_escape_path(&pub_key),
-        );
-        let (st_code, st_out, _) = run_bin(
-            &bin,
-            &cwd_dir,
-            &["check", "--fs", "--trusted-paths", "--format", "json", "-"],
-            Some(stdin_kdl.as_bytes()),
-        )?;
-        assert_eq!(st_code, Some(1));
-        let st_val: serde_json::Value = serde_json::from_slice(&st_out)?;
-        assert!(
-            w034s(&st_val).is_empty(),
-            "stdin relative storage must not reach W034: {st_val}"
-        );
-        assert_eq!(
-            st_val
-                .pointer("/errors/0/code")
-                .and_then(serde_json::Value::as_str),
-            Some("E202")
-        );
-        assert_eq!(
-            st_val
-                .pointer("/errors/0/path")
-                .and_then(serde_json::Value::as_str),
-            Some("site[0].ai-publish.storage")
-        );
-
-        // Part 2: Symlinked config file resolving relative `storage "stores/app"` across three
-        // distinguishable trees (`real_cfg_tree`, `link_cfg_tree`, `cwd_tree`).
-        if !require_local_root_fs(
-            "linux_storage_file_relative_symlinked_config_and_padded_rejection(walk)",
-        )? {
-            return Ok(());
-        }
 
         let storage_node = "storage \"stores/app\"";
         let rel_kdl = format!(
@@ -1975,7 +2319,7 @@ mod linux_storage_oracles {
         let (f_code, f_val, _, _) = run_check_json(
             &bin,
             &cwd_dir,
-            &["--fs", "--strict", "--trusted-paths"],
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
             &sym_cfg,
         )?;
         assert_eq!(
@@ -2000,7 +2344,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&rel_kdl, storage_node, 0)?,
-        )?;
+        );
 
         // Pass pair: `real_cfg_tree/stores/app` is clean 0750 while BOTH `link_cfg_tree/stores/app`
         // AND `cwd_tree/stores/app` are 0777 -> MUST pass with exit 0 and 0 W034!
@@ -2010,7 +2354,7 @@ mod linux_storage_oracles {
         let (p_code, p_val, _, _) = run_check_json(
             &bin,
             &cwd_dir,
-            &["--fs", "--strict", "--trusted-paths"],
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
             &sym_cfg,
         )?;
         assert_eq!(
@@ -2025,20 +2369,19 @@ mod linux_storage_oracles {
     }
 
     // -----------------------------------------------------------------------
-    // OverlayFS root rejection for ai-publish.storage (runs on Docker overlayfs /)
+    // OverlayFS root rejection for ai-publish.storage (run in overlayfs container)
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires overlayfs (0x794c7630) at /; run with --ignored in an overlayfs container"]
     fn linux_storage_overlayfs_root_reported_not_verified() -> TestResult {
         let magic = fs_magic_of("/")?;
-        if magic != 0x794C_7630 {
-            eprintln!(
-                "skipping linux_storage_overlayfs_root_reported_not_verified: / is 0x{magic:x}, not overlayfs"
-            );
-            return Ok(());
-        }
+        assert_eq!(
+            magic, 0x794C_7630,
+            "precondition failed: / is 0x{magic:x}, requires overlayfs (0x794c7630)"
+        );
         let bin = miraserve_bin();
-        let tmp = TempDir::new("ovl-store")?;
+        let tmp = TempDir::new_fixed('o')?;
         let base = &tmp.path;
 
         let certs = base.join("certs");
@@ -2048,7 +2391,7 @@ mod linux_storage_oracles {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
-        let (cert, key) = gen_dev_cert(&certs, "ovl.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "ovl.example")?;
         let pub_key = write_pubkey(&certs)?;
         let node = format!("storage \"{}\"", kdl_escape_path(&store));
         let kdl = format!(
@@ -2067,7 +2410,12 @@ mod linux_storage_oracles {
         );
         let cfg = base.join("ovl.kdl");
         fs::write(&cfg, &kdl)?;
-        let (_code, val, _, _) = run_check_json(&bin, base, &["--fs", "--trusted-paths"], &cfg)?;
+        let (_code, val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &cfg,
+        )?;
         let ws = w034s(&val);
         assert_eq!(
             ws.len(),
@@ -2084,7 +2432,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&kdl, &node, 0)?,
-        )?;
+        );
         Ok(())
     }
 
@@ -2093,21 +2441,17 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires non-root (euid != 0) and an accepted local POSIX filesystem at / and /tmp; run with --ignored as uid 1000 in a tmpfs chroot or on a local-fs host"]
     fn linux_storage_nonroot_observer_mismatch_adds_not_verified_w034() -> TestResult {
         let euid = rustix::process::geteuid().as_raw();
-        if euid == 0 {
-            eprintln!(
-                "skipping linux_storage_nonroot_observer_mismatch_adds_not_verified_w034: requires non-root"
-            );
-            return Ok(());
-        }
-        if !require_local_root_fs("linux_storage_nonroot_observer_mismatch_adds_not_verified_w034")?
-        {
-            return Ok(());
-        }
+        assert_ne!(
+            euid, 0,
+            "precondition failed: requires non-root (euid != 0)"
+        );
+        assert_local_root_fs()?;
         let other_uid = if euid == 1000 { 1001 } else { 1000 };
         let bin = miraserve_bin();
-        let tmp = TempDir::new("nonroot-mis")?;
+        let tmp = TempDir::new_fixed('u')?;
         let base = &tmp.path;
         let certs = base.join("certs");
         let docroot = base.join("www");
@@ -2116,7 +2460,7 @@ mod linux_storage_oracles {
             fs::create_dir_all(d)?;
             set_mode(d, 0o750)?;
         }
-        let (cert, key) = gen_dev_cert(&certs, "mis.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "mis.example")?;
         let pub_key = write_pubkey(&certs)?;
         let node = format!("storage \"{}\"", kdl_escape_path(&store));
         let kdl = format!(
@@ -2141,8 +2485,12 @@ mod linux_storage_oracles {
         fs::write(&cfg, &kdl)?;
         let loc = loc_of_occurrence(&kdl, &node, 0)?;
 
-        let (code, val, _, _) =
-            run_check_json(&bin, base, &["--fs", "--strict", "--trusted-paths"], &cfg)?;
+        let (code, val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
+            &cfg,
+        )?;
         assert_eq!(code, Some(1), "observer mismatch must fail --strict: {val}");
         let ws = w034s(&val);
         assert_eq!(
@@ -2161,7 +2509,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc,
-        )?;
+        );
         assert_w034_full(
             ws.get(1).copied().ok_or("missing mismatch W034")?,
             "site[0].ai-publish.storage",
@@ -2172,7 +2520,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc,
-        )?;
+        );
         Ok(())
     }
 
@@ -2182,23 +2530,19 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[ignore = "requires root (euid == 0) and an accepted local POSIX filesystem at / and /tmp; run with --ignored as root in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_root_storage_multi_uid_service_uid_panel_and_supp_groups() -> TestResult {
         use rustix::fs::{Gid, Uid, chown};
 
-        if !rustix::process::geteuid().is_root() {
-            eprintln!(
-                "skipping linux_root_storage_multi_uid_service_uid_panel_and_supp_groups: requires root"
-            );
-            return Ok(());
-        }
-        if !require_local_root_fs("linux_root_storage_multi_uid_service_uid_panel_and_supp_groups")?
-        {
-            return Ok(());
-        }
+        assert!(
+            rustix::process::geteuid().is_root(),
+            "precondition failed: requires root (euid == 0)"
+        );
+        assert_local_root_fs()?;
 
         let bin = miraserve_bin();
-        let tmp = TempDir::new("root-panel")?;
+        let tmp = TempDir::new_fixed('k')?;
         let base = &tmp.path;
         // Let uid 1000 traverse `base` while keeping `base` root-owned 0755.
         set_mode(base, 0o755)?;
@@ -2253,7 +2597,7 @@ mod linux_storage_oracles {
             set_mode(d, 0o755)?;
         }
 
-        let (cert, key) = gen_dev_cert(&certs, "a.example,b.example,pub.example")?;
+        let (cert, key) = gen_dev_cert(&bin, &certs, "a.example,b.example,pub.example")?;
         let pub_key = write_pubkey(&certs)?;
         // Panel certs/keys & pubkey readable by group 1000 (`0640 root:1000` in `0750 root:1000`).
         set_mode(&certs, 0o750)?;
@@ -2341,6 +2685,7 @@ mod linux_storage_oracles {
         let log_f = log_dir.join("server.log").to_string_lossy().into_owned();
         let panel_args = [
             "--fs",
+            "--no-sandbox",
             "--trusted-paths",
             "--acme-dir",
             &acme_s,
@@ -2469,7 +2814,7 @@ mod linux_storage_oracles {
                 ),
                 HELP_GEN,
                 &bad_tenant_loc,
-            )?;
+            );
         }
 
         // 2. Root with sandbox.user UNSET -> uid-1000 store emits W034 (`owner not trusted`)!
@@ -2488,8 +2833,12 @@ mod linux_storage_oracles {
         );
         let unset_cfg = base.join("root_unset.kdl");
         fs::write(&unset_cfg, &unset_kdl)?;
-        let (_uc, u_val, _, _) =
-            run_check_json(&bin, base, &["--fs", "--trusted-paths"], &unset_cfg)?;
+        let (_uc, u_val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &unset_cfg,
+        )?;
         let uw = w034s(&u_val);
         assert_eq!(
             uw.len(),
@@ -2507,7 +2856,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&unset_kdl, &unset_node, 0)?,
-        )?;
+        );
 
         // 3. Foreign-owned existing child in sticky dir (`1777 root:root` / `0750 3001:3001`) -> W034!
         let st_node = format!("storage \"{}\"", kdl_escape_path(&store_sticky_tenant));
@@ -2529,8 +2878,12 @@ mod linux_storage_oracles {
         );
         let st_cfg = base.join("sticky_tenant.kdl");
         fs::write(&st_cfg, &st_kdl)?;
-        let (_stc, st_val, _, _) =
-            run_check_json(&bin, base, &["--fs", "--trusted-paths"], &st_cfg)?;
+        let (_stc, st_val, _, _) = run_check_json(
+            &bin,
+            base,
+            &["--fs", "--no-sandbox", "--trusted-paths"],
+            &st_cfg,
+        )?;
         let stw = w034s(&st_val);
         assert_eq!(
             stw.len(),
@@ -2548,7 +2901,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&st_kdl, &st_node, 0)?,
-        )?;
+        );
 
         // 4. Actual service-UID (uid 1000, gid 1000, supplementary group 2000) deployment effects:
         //    (a) `supp_parent` (0750 root:2000) / `store_supp` (0750 1000:1000) -> exit 0, 0 W034!
@@ -2578,8 +2931,10 @@ mod linux_storage_oracles {
         )?;
         set_mode(&supp_ok_cfg, 0o640)?;
         chown(&supp_ok_cfg, u0, g1000)?;
-        let (sok_c, sok_v) =
-            run_as_service(&["--fs", "--strict", "--trusted-paths"], &supp_ok_cfg)?;
+        let (sok_c, sok_v) = run_as_service(
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
+            &supp_ok_cfg,
+        )?;
         assert_eq!(
             sok_c,
             Some(0),
@@ -2621,8 +2976,10 @@ mod linux_storage_oracles {
         fs::write(&supp_gw_cfg, &gw_kdl)?;
         set_mode(&supp_gw_cfg, 0o640)?;
         chown(&supp_gw_cfg, u0, g1000)?;
-        let (sgw_c, sgw_v) =
-            run_as_service(&["--fs", "--strict", "--trusted-paths"], &supp_gw_cfg)?;
+        let (sgw_c, sgw_v) = run_as_service(
+            &["--fs", "--no-sandbox", "--strict", "--trusted-paths"],
+            &supp_gw_cfg,
+        )?;
         assert_eq!(
             sgw_c,
             Some(1),
@@ -2641,7 +2998,7 @@ mod linux_storage_oracles {
             ),
             HELP_GEN,
             &loc_of_occurrence(&gw_kdl, &gw_node, 0)?,
-        )?;
+        );
 
         let root_ro_cfg = base.join("root_ro.kdl");
         fs::write(
@@ -2666,7 +3023,8 @@ mod linux_storage_oracles {
         )?;
         set_mode(&root_ro_cfg, 0o640)?;
         chown(&root_ro_cfg, u0, g1000)?;
-        let (rro_c, rro_v) = run_as_service(&["--fs", "--trusted-paths"], &root_ro_cfg)?;
+        let (rro_c, rro_v) =
+            run_as_service(&["--fs", "--no-sandbox", "--trusted-paths"], &root_ro_cfg)?;
         assert_eq!(
             rro_c,
             Some(1),

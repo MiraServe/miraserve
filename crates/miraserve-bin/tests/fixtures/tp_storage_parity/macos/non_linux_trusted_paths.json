@@ -1,0 +1,24 @@
+{
+  "commands": {
+    "check_fs_strict_tp": {
+      "exit_code": 0,
+      "stdout": "OK: '<TMPDIR>/pub.kdl' is valid (1 listener(s), 1 site(s), 0 route(s), TLS >= 1.3, PQC: X25519MLKEM768 enabled, 0 warning(s))\nnote: --trusted-paths is Linux-only; no paths were verified\n",
+      "stderr": ""
+    },
+    "check_fs_strict_tp_json": {
+      "exit_code": 0,
+      "stdout": "{\n  \"valid\": true,\n  \"strict\": true,\n  \"source\": \"<TMPDIR>/pub.kdl\",\n  \"summary\": {\n    \"listeners\": 1,\n    \"sites\": 1,\n    \"routes\": 0,\n    \"tls_min_version\": \"1.3\",\n    \"pqc_hybrid\": true,\n    \"warnings\": 0,\n    \"errors\": 0\n  },\n  \"errors\": [],\n  \"warnings\": [],\n  \"notes\": [\n    \"--trusted-paths is Linux-only; no paths were verified\"\n  ]\n}\n",
+      "stderr": ""
+    },
+    "check_fs_tp_quiet": {
+      "exit_code": 0,
+      "stdout": "",
+      "stderr": "note: --trusted-paths is Linux-only; no paths were verified\n"
+    },
+    "check_fs_tp_writable_set": {
+      "exit_code": 0,
+      "stdout": "landlock unavailable\n",
+      "stderr": "note: --trusted-paths is Linux-only; no paths were verified\n"
+    }
+  }
+}

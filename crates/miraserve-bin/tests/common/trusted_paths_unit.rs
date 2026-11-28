@@ -563,10 +563,21 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
     let ro_store_before = stat_snap(&ro_store)?;
     let ro_parent_before = stat_snap(&ro_parent)?;
 
-    let root_fd = op(CWD, "/", OFlags::DIRECTORY)?;
-    let root_sf = fstatfs(&root_fd)?;
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let root_magic = root_sf.f_type as u32;
+    let fs_magic = |p: &str| -> Result<u32, std::io::Error> {
+        let fd = op(CWD, p, OFlags::DIRECTORY).map_err(std::io::Error::from)?;
+        let sf = fstatfs(&fd).map_err(std::io::Error::from)?;
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        Ok(sf.f_type as u32)
+    };
+    let root_magic = fs_magic("/")?;
+    let tmp_magic = fs_magic("/tmp")?;
+    let unsupported_magic = if !is_local_posix_fs(root_magic) {
+        Some(root_magic)
+    } else if !is_local_posix_fs(tmp_magic) {
+        Some(tmp_magic)
+    } else {
+        None
+    };
 
     let arch = TargetArch::try_from(std::env::consts::ARCH)?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -679,8 +690,29 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
         "expected observer + narrowed notes only: {notes:?}"
     );
 
-    // Assert the single exact deterministic result for the actual `/` filesystem.
-    if is_local_posix_fs(root_magic) {
+    // Assert the single exact deterministic result for the actual `/` and `/tmp` filesystems.
+    if let Some(bad_magic) = unsupported_magic {
+        let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                Some("site[0].ai-publish.storage"),
+                Some("site[1].ai-publish.storage"),
+                Some("site[2].ai-publish.storage"),
+                Some("site[3].ai-publish.storage"),
+                Some("site[4].ai-publish.storage"),
+            ],
+            "expected W034 for all 5 sites on unsupported fs 0x{bad_magic:x}: {issues:#?}"
+        );
+        let expected_fs_frag = format!("(filesystem 0x{bad_magic:x})");
+        for issue in &issues {
+            assert!(
+                issue.message.contains(&expected_fs_frag),
+                "expected {expected_fs_frag} in {}",
+                issue.message
+            );
+        }
+    } else {
         let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
         assert_eq!(
             paths,
@@ -692,27 +724,6 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
             ],
             "expected W034 on wr_store + absent_leaf + absent_mid + dup wr_store (and 0 on 0550 ro_store): {issues:#?}"
         );
-    } else {
-        let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
-        assert_eq!(
-            paths,
-            vec![
-                Some("site[0].ai-publish.storage"),
-                Some("site[1].ai-publish.storage"),
-                Some("site[2].ai-publish.storage"),
-                Some("site[3].ai-publish.storage"),
-                Some("site[4].ai-publish.storage"),
-            ],
-            "expected W034 for all 5 sites on unsupported root fs 0x{root_magic:x}: {issues:#?}"
-        );
-        let expected_fs_frag = format!("(filesystem 0x{root_magic:x})");
-        for issue in &issues {
-            assert!(
-                issue.message.contains(&expected_fs_frag),
-                "expected {expected_fs_frag} in {}",
-                issue.message
-            );
-        }
     }
 
     // Restore writable mode before cleanup.
