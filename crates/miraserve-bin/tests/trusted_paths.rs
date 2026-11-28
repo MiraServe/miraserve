@@ -133,7 +133,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "encryption",
         "writable view",
         "Run as the service account or as root with `server.sandbox.user` set; when no service account is configured, the check trusts the account that runs it (only root when run as root), so run it as the service account.",
-        "0.1.6",
+        "with the flag, the listed path classes are walked and `W034` can be reported while existing `--fs` probes still run; nothing else is affected by the flag",
         "unresponsive",
         "atime",
     ] {
