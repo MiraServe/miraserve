@@ -1,10 +1,12 @@
 //! Stage 2 (0.1.8) CLI parity and security oracle tests.
 //!
 //! - `parity_*`: MUST pass on both `441a58d` and the 0.1.8 branch. When `MIRASERVE_BASELINE_BIN`
-//!   points to a `441a58d` binary, asserts exact byte-for-byte equality of exit status, stdout,
-//!   and stderr across all clean CLI modes (`check`, `--strict`, `--allow-warning`, `--fs`,
-//!   `--format json`, `--writable-set`, `--dump-normalized`, `--trusted-paths`, stdin `-`,
-//!   symlinked config, internal spaces, padded `index` basenames, and `service generate`).
+//!   points to a `441a58d` or `bef6865` binary, asserts exact byte-for-byte equality of exit
+//!   status, stdout, and stderr across all clean CLI modes (`check`, `--strict`,
+//!   `--allow-warning`, `--fs`, `--format json`, `--writable-set`, `--dump-normalized`,
+//!   `--trusted-paths`, stdin `-`, symlinked config, internal spaces, padded `index` basenames,
+//!   and `service generate`), allowing on Linux `--trusted-paths` only the exact narrowed-note
+//!   update and the single `site[1].ai-publish.storage` `W034` delta when a shared ancestor fails.
 //! - `security_*`: MUST fail on `441a58d` and pass on the 0.1.8 branch. Proves that rejected
 //!   padded candidates emit exact `E202` JSON fields, nonzero exit, empty `--writable-set` stdout,
 //!   refused `reload --dry-run`, and NEVER provision or modify padded or unpadded sibling dirs.
@@ -172,8 +174,6 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
     let link_dir = base.join("conf link");
     let rel_pub = conf_dir.join("public");
     let rel_store = conf_dir.join("releases");
-    #[cfg(unix)]
-    let sock_dir = base.join("php socks");
     let acme_dir = base.join("acme state");
     for d in [
         &certs_dir,
@@ -188,10 +188,15 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
         set_mode(d, 0o750)?;
     }
     #[cfg(unix)]
-    {
-        fs::create_dir_all(&sock_dir)?;
-        set_mode(&sock_dir, 0o750)?;
-    }
+    let sock_dir = {
+        let raw_sock_dir = base.join("php socks");
+        fs::create_dir_all(&raw_sock_dir)?;
+        set_mode(&raw_sock_dir, 0o750)?;
+        // Canonicalize so `socket-tree` shares the exact symlink-free ancestor chain that
+        // `miraserve-config` resolves for relative `ai-publish.storage` (preventing a `TMPDIR`
+        // symlink under sticky `/tmp` from flagging `socket-tree` as root when storage is clean).
+        fs::canonicalize(&raw_sock_dir)?
+    };
     set_mode(&acme_dir, 0o700)?;
     fs::write(root_spaces.join(" index.html"), b"padded-index-ok")?;
     fs::write(rel_pub.join("index.html"), b"rel-pub-ok")?;
@@ -828,10 +833,12 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                         let mut expected_str = b_str.replacen(OLD_NARROWED, NEW_NARROWED, 1);
 
                         // Read-only inspection of baseline JSON to learn whether the shared
-                        // ancestor prefix up to `base` (e.g. overlayfs `/` or a writable non-sticky
-                        // `TMPDIR` ancestor) already triggered a `server.sandbox.socket-tree` W034
-                        // (whose own leaf is 0750 owned by euid, so it only fails on a shared
-                        // ancestor — unlike ACME, which as root also flags unknown service uid).
+                        // canonical ancestor prefix up to `base` (e.g. overlayfs `/` or a writable
+                        // non-sticky ancestor) already triggered a `server.sandbox.socket-tree`
+                        // W034 (`sock_dir` is canonicalized and 0750 owned by euid, so it walks
+                        // the exact same ancestor chain as canonical relative `ai-publish.storage`
+                        // and fails iff a shared ancestor fails — unlike ACME, which as root also
+                        // flags unknown service uid).
                         let b_val: serde_json::Value = serde_json::from_str(&b_str)?;
                         let shared_anc_tail: Option<String> = b_val
                             .get("warnings")

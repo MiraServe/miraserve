@@ -1,18 +1,16 @@
 //! Stage 3 (0.1.8) oracle tests for `site[N].ai-publish.storage` under
 //! `miraserve check --fs --trusted-paths` (`W034`).
 //!
-//! Parity tests compare against checked-in fixtures under
-//! `tests/fixtures/tp_storage_parity/<profile>/` recorded from `bef6865` (and `v0.1.7` = `9836e8a7`
-//! for Linux flag-on parity), following the structure, path normalisation, and recording procedure
-//! of `tests/check_parity_v016.rs`.
+//! Every test always invokes Cargo's candidate binary (`env!("CARGO_BIN_EXE_miraserve")`); no
+//! environment variable can redirect verification to another executable or switch into a recording
+//! mode. On macOS and Linux, parity tests compare unconditionally byte-for-byte against checked-in
+//! fixtures under `tests/fixtures/tp_storage_parity/<profile>/` recorded from `bef6865` (and
+//! `v0.1.7` = commit `48ab7fa` / tag `9836e8a7` for Linux flag-on parity). On all platforms
+//! (including Windows), platform-independent exact stream literals and non-Linux flag-on vs
+//! flag-off invariance are also verified unconditionally.
 //!
-//! To re-record fixtures from a reference binary:
-//! - `RECORD_TP_STORAGE_PARITY=bef6865 MIRASERVE_PARITY_BIN=/path/to/bef6865/miraserve`
-//! - `RECORD_TP_STORAGE_PARITY=v017 MIRASERVE_PARITY_BIN=/path/to/v0.1.7/miraserve`
-//!
-//! In ordinary `cargo test`, every parity test unconditionally compares the candidate binary
-//! byte-for-byte against the committed fixtures. Environment-dependent Linux tests (local POSIX
-//! filesystem at `/` and `/tmp`, `overlayfs` at `/`, root vs non-root) are marked with `#[ignore]`
+//! Environment-dependent Linux tests (local POSIX filesystem at `/` and `/tmp`, `overlayfs` at
+//! `/`, root vs non-root) are marked with `#[ignore]` and assert their preconditions when selected
 //! so the test harness reports them as ignored rather than silently skipping them.
 
 use std::collections::BTreeMap;
@@ -22,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use serde::Deserialize;
 
 #[path = "../../miraserve-config/tests/common/mod.rs"]
 mod kdl_test_util;
@@ -35,14 +34,16 @@ type CliCase<'a> = (&'a str, Vec<&'a str>, Option<&'a [u8]>);
 
 static TEMP_SEQ: AtomicU32 = AtomicU32::new(0);
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), derive(Deserialize))]
 struct CommandSnapshot {
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), derive(Deserialize))]
 struct CaseFixture {
     commands: BTreeMap<String, CommandSnapshot>,
 }
@@ -51,8 +52,35 @@ fn miraserve_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_miraserve"))
 }
 
-fn parity_bin() -> PathBuf {
-    std::env::var_os("MIRASERVE_PARITY_BIN").map_or_else(miraserve_bin, PathBuf::from)
+fn loc_parts_of_occurrence(
+    kdl: &str,
+    needle: &str,
+    occurrence: usize,
+) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
+    let mut start = 0_usize;
+    let mut found = None;
+    for _ in 0..=occurrence {
+        let rel = kdl
+            .get(start..)
+            .and_then(|s| s.find(needle))
+            .ok_or_else(|| format!("needle '{needle}' occurrence {occurrence} not found"))?;
+        let abs = start + rel;
+        found = Some(abs);
+        start = abs + needle.len();
+    }
+    let offset = found.ok_or("offset missing")?;
+    let prefix = kdl.get(..offset).ok_or("invalid offset")?;
+    let mut line = 1_usize;
+    let mut column = 1_usize;
+    for ch in prefix.chars() {
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    Ok((line, column, offset, needle.len()))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -81,19 +109,15 @@ fn fixture_dir(profile: &str) -> PathBuf {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-fn normalize_output(
-    raw: &[u8],
-    canon_base: &str,
-    raw_base: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut text = String::from_utf8(raw.to_vec())?;
+fn normalize_output(raw_text: &str, canon_base: &str, raw_base: &str) -> String {
+    let mut text = raw_text.to_owned();
     if !canon_base.is_empty() && canon_base != raw_base {
         text = text.replace(canon_base, "<TMPDIR>");
     }
     if !raw_base.is_empty() {
         text = text.replace(raw_base, "<TMPDIR>");
     }
-    Ok(text)
+    text
 }
 
 struct TempDir {
@@ -101,14 +125,20 @@ struct TempDir {
 }
 
 impl TempDir {
-    /// Creates a temporary directory with a fixed byte length (`/tmp/ms-tps-<c>-<8hex>-<4hex>`,
-    /// always 27 bytes) so generated KDL source offsets and span lengths are invariant across runs.
+    /// Creates a temporary directory. On Unix this uses a fixed 27-byte path
+    /// (`/tmp/ms-tps-<c>-<8hex>-<4hex>`) so generated KDL source offsets and span lengths stay
+    /// invariant against the committed Unix parity fixtures; on non-Unix it uses the platform
+    /// temporary directory.
     fn new_fixed(tag: char) -> Result<Self, std::io::Error> {
         let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed) & 0xFFFF;
+        #[cfg(unix)]
         let path = PathBuf::from(format!(
             "/tmp/ms-tps-{tag}-{:08x}-{seq:04x}",
             std::process::id(),
         ));
+        #[cfg(not(unix))]
+        let path = std::env::temp_dir()
+            .join(format!("ms-tps-{tag}-{:08x}-{seq:04x}", std::process::id(),));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path)?;
         set_mode(&path, 0o750)?;
@@ -239,20 +269,238 @@ fn assert_fixture_byte_parity(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Flag-off byte-for-byte parity against checked-in bef6865 fixtures
+// 1. Flag-off parity against checked-in bef6865 fixtures and exact literals
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct FlagOffLiteralInputs<'a> {
+    cfg_s: &'a str,
+    miss_s: &'a str,
+    padded_s: &'a str,
+    miss_kdl: &'a str,
+    padded_kdl: &'a str,
+    missing_parent_store: &'a Path,
+    bad_store: &'a Path,
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_flag_off_exact_literals(
+    raw: &CaseFixture,
+    inputs: &FlagOffLiteralInputs<'_>,
+) -> TestResult {
+    let expected_keys = [
+        "check_fs",
+        "check_fs_json",
+        "check_fs_missing_parent",
+        "check_fs_quiet",
+        "check_fs_rejected_padded",
+        "check_fs_strict",
+        "check_fs_strict_allow_w002",
+        "check_fs_writable_set",
+        "check_json",
+        "check_quiet",
+        "check_stdin_json",
+        "check_text",
+        "reload_dry_run_rejected",
+        "reload_dry_run_valid",
+    ];
+    assert_eq!(
+        raw.commands.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_keys,
+        "flag-off command key set mismatch"
+    );
+
+    let get = |k: &str| -> Result<&CommandSnapshot, Box<dyn std::error::Error>> {
+        raw.commands
+            .get(k)
+            .ok_or_else(|| format!("missing flag-off snapshot '{k}'").into())
+    };
+
+    let w002_json = |source: &str, strict: bool| -> Result<String, Box<dyn std::error::Error>> {
+        let src_json = serde_json::to_string(source)?;
+        Ok(format!(
+            "{{\n  \"valid\": true,\n  \"strict\": {strict},\n  \"source\": {src_json},\n  \
+             \"summary\": {{\n    \"listeners\": 1,\n    \"sites\": 1,\n    \"routes\": 0,\n    \
+             \"tls_min_version\": \"1.2\",\n    \"pqc_hybrid\": true,\n    \"warnings\": 1,\n    \
+             \"errors\": 0\n  }},\n  \"errors\": [],\n  \"warnings\": [\n    {{\n      \
+             \"code\": \"W002\",\n      \"severity\": \"warning\",\n      \
+             \"message\": \"global TLS min-version is downgraded to 1.2\",\n      \
+             \"path\": \"server.tls.min-version\",\n      \
+             \"help\": \"keep global min-version \\\"1.3\\\" and opt in per legacy site via 'tls {{ compat-tls-1-2 true }}'\",\n      \
+             \"location\": {{\n        \"line\": 3,\n        \"column\": 7,\n        \
+             \"offset\": 29,\n        \"length\": 17\n      }}\n    }}\n  ]\n}}\n"
+        ))
+    };
+
+    for (mode, source, strict) in [
+        ("check_json", inputs.cfg_s, false),
+        ("check_fs_json", inputs.cfg_s, false),
+        ("check_fs_strict_allow_w002", inputs.cfg_s, true),
+        ("check_stdin_json", "<stdin>", false),
+    ] {
+        let snap = get(mode)?;
+        assert_eq!(snap.exit_code, Some(0), "{mode} exit code");
+        assert_eq!(snap.stderr, "", "{mode} stderr must be empty");
+        assert_eq!(
+            snap.stdout.as_bytes(),
+            w002_json(source, strict)?.as_bytes(),
+            "{mode} exact JSON literal mismatch"
+        );
+    }
+
+    let miss_node = format!(
+        "storage \"{}\"",
+        kdl_escape_path(inputs.missing_parent_store)
+    );
+    let (m_line, m_col, m_off, m_len) = loc_parts_of_occurrence(inputs.miss_kdl, &miss_node, 0)?;
+    assert_eq!((m_line, m_col), (8, 1));
+    let miss_msg = format!(
+        "site 'miss.example' ai-publish.storage directory '{}' does not exist and its parent is missing",
+        inputs.missing_parent_store.display()
+    );
+    let expected_miss_json = format!(
+        "{{\n  \"valid\": false,\n  \"strict\": false,\n  \"source\": {},\n  \"summary\": {{\n    \
+         \"listeners\": 1,\n    \"sites\": 1,\n    \"routes\": 0,\n    \
+         \"tls_min_version\": \"1.3\",\n    \"pqc_hybrid\": true,\n    \"warnings\": 0,\n    \
+         \"errors\": 1\n  }},\n  \"errors\": [\n    {{\n      \"code\": \"E301\",\n      \
+         \"severity\": \"error\",\n      \"message\": {},\n      \
+         \"path\": \"site[0].ai-publish.storage\",\n      \"location\": {{\n        \
+         \"line\": {m_line},\n        \"column\": {m_col},\n        \"offset\": {m_off},\n        \
+         \"length\": {m_len}\n      }}\n    }}\n  ],\n  \"warnings\": []\n}}\n",
+        serde_json::to_string(inputs.miss_s)?,
+        serde_json::to_string(&miss_msg)?,
+    );
+    let miss_snap = get("check_fs_missing_parent")?;
+    assert_eq!(miss_snap.exit_code, Some(1));
+    assert_eq!(miss_snap.stderr, "");
+    assert_eq!(
+        miss_snap.stdout.as_bytes(),
+        expected_miss_json.as_bytes(),
+        "check_fs_missing_parent exact JSON literal mismatch"
+    );
+
+    let padded_quoted = format!("\"{} \"", kdl_escape_path(inputs.bad_store));
+    let (p_line, p_col, p_off, p_len) =
+        loc_parts_of_occurrence(inputs.padded_kdl, &padded_quoted, 0)?;
+    assert_eq!((p_line, p_col), (7, 9));
+    let expected_padded_json = format!(
+        "{{\n  \"valid\": false,\n  \"strict\": false,\n  \"source\": {},\n  \"errors\": [\n    \
+         {{\n      \"code\": \"E202\",\n      \"severity\": \"error\",\n      \
+         \"message\": \"ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)\",\n      \
+         \"path\": \"site[0].ai-publish.storage\",\n      \
+         \"help\": \"verify which directory or file currently holds live data before editing the path; remove leading or trailing whitespace from the configured path\",\n      \
+         \"location\": {{\n        \"line\": {p_line},\n        \"column\": {p_col},\n        \
+         \"offset\": {p_off},\n        \"length\": {p_len}\n      }}\n    }}\n  ],\n  \
+         \"warnings\": []\n}}\n",
+        serde_json::to_string(inputs.padded_s)?,
+    );
+    let padded_snap = get("check_fs_rejected_padded")?;
+    assert_eq!(padded_snap.exit_code, Some(1));
+    assert_eq!(padded_snap.stderr, "");
+    assert_eq!(
+        padded_snap.stdout.as_bytes(),
+        expected_padded_json.as_bytes(),
+        "check_fs_rejected_padded exact JSON literal mismatch"
+    );
+
+    let expected_reload_valid = "{\n  \"reloaded\": null,\n  \"outcome\": \"dry_run_passed\",\n  \
+         \"quarantined_source\": \"preflight\",\n  \"dry_run\": true,\n  \"warnings\": [\n    \
+         {\n      \"code\": \"W002\",\n      \"path\": \"server.tls.min-version\",\n      \
+         \"message\": \"global TLS min-version is downgraded to 1.2\"\n    }\n  ],\n  \
+         \"quarantined\": [],\n  \"restart_required\": [],\n  \"errors\": []\n}\n";
+    let reload_ok = get("reload_dry_run_valid")?;
+    assert_eq!(reload_ok.exit_code, Some(0));
+    assert_eq!(reload_ok.stderr, "");
+    assert_eq!(
+        reload_ok.stdout.as_bytes(),
+        expected_reload_valid.as_bytes(),
+        "reload_dry_run_valid exact JSON literal mismatch"
+    );
+
+    let reload_refuse_line = format!(
+        "refusing to signal reload because '{}' is invalid: configuration validation failed with 1 error(s)",
+        inputs.padded_s
+    );
+    let expected_reload_refused = format!(
+        "{{\n  \"reloaded\": null,\n  \"outcome\": \"dry_run_refused\",\n  \
+         \"quarantined_source\": \"preflight\",\n  \"dry_run\": true,\n  \"warnings\": [],\n  \
+         \"quarantined\": [],\n  \"restart_required\": [],\n  \"errors\": [\n    {},\n    \
+         \"[E202] ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020) (line 7, col 9)\"\n  ]\n}}\n",
+        serde_json::to_string(&reload_refuse_line)?,
+    );
+    let reload_bad = get("reload_dry_run_rejected")?;
+    assert_eq!(reload_bad.exit_code, Some(1));
+    assert_eq!(reload_bad.stderr, "");
+    assert_eq!(
+        reload_bad.stdout.as_bytes(),
+        expected_reload_refused.as_bytes(),
+        "reload_dry_run_rejected exact JSON literal mismatch"
+    );
+
+    let expected_ok_stdout = format!(
+        "OK: '{}' is valid (1 listener(s), 1 site(s), 0 route(s), TLS >= 1.2, PQC: X25519MLKEM768 enabled, 1 warning(s))\n",
+        inputs.cfg_s
+    );
+    let check_text = get("check_text")?;
+    assert_eq!(check_text.exit_code, Some(0));
+    assert_eq!(check_text.stdout, expected_ok_stdout);
+    assert!(
+        check_text.stderr.contains("miraserve::W002")
+            && check_text
+                .stderr
+                .contains("global TLS min-version is downgraded to 1.2")
+            && check_text
+                .stderr
+                .contains("help: keep global min-version \"1.3\"")
+            && !check_text.stderr.contains("W034"),
+        "unexpected check_text stderr:\n{}",
+        check_text.stderr
+    );
+
+    let check_fs = get("check_fs")?;
+    assert_eq!(check_fs.exit_code, Some(0));
+    assert_eq!(check_fs.stdout, expected_ok_stdout);
+    assert_eq!(check_fs.stderr, check_text.stderr);
+
+    for q_mode in ["check_quiet", "check_fs_quiet"] {
+        let q = get(q_mode)?;
+        assert_eq!(q.exit_code, Some(0));
+        assert_eq!(q.stdout, "");
+        assert_eq!(q.stderr, check_text.stderr);
+    }
+
+    let strict = get("check_fs_strict")?;
+    assert_eq!(strict.exit_code, Some(1));
+    assert_eq!(strict.stdout, "");
+    let expected_strict_stderr = format!(
+        "{}error: configuration '{}' failed --strict check due to 1 security warning(s) not covered by --allow-warning\n",
+        check_text.stderr, inputs.cfg_s
+    );
+    assert_eq!(strict.stderr, expected_strict_stderr);
+
+    let expected_ws_stdout = if cfg!(target_os = "linux") {
+        "landlock disabled\n"
+    } else {
+        "landlock unavailable\n"
+    };
+    let ws = get("check_fs_writable_set")?;
+    assert_eq!(ws.exit_code, Some(0));
+    assert_eq!(ws.stdout, expected_ws_stdout);
+    assert_eq!(ws.stderr, check_text.stderr);
+
+    Ok(())
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn flag_off_bef6865_parity() -> TestResult {
-    let profile = fixture_profile();
-    let bin = parity_bin();
+    let bin = miraserve_bin();
     let tmp = TempDir::new_fixed('f')?;
     let base = &tmp.path;
-    let canon_base = fs::canonicalize(base)?;
-    let raw_base_s = base.to_string_lossy().into_owned();
-    let canon_base_s = canon_base.to_string_lossy().into_owned();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let (canon_base_s, raw_base_s) = (
+        fs::canonicalize(base)?.to_string_lossy().into_owned(),
+        base.to_string_lossy().into_owned(),
+    );
 
     let certs = base.join("certs");
     let docroot = base.join("www");
@@ -293,49 +541,45 @@ fn flag_off_bef6865_parity() -> TestResult {
 
     // Config WITH missing parent of ai-publish.storage (triggers --fs error, still zero W034 when flag off).
     let miss_cfg = base.join("miss.kdl");
-    fs::write(
-        &miss_cfg,
-        format!(
-            "server {{\n\
-                 listen \":443\"\n\
-                 tls {{ cert \"{}\"; key \"{}\" }}\n\
+    let miss_kdl = format!(
+        "server {{\n\
+             listen \":443\"\n\
+             tls {{ cert \"{}\"; key \"{}\" }}\n\
+         }}\n\
+         site \"miss.example\" {{\n\
+             root \"{}\"\n\
+             ai-publish {{\n\
+                 storage \"{}\"\n\
+                 require-signature \"ed25519:{}\"\n\
              }}\n\
-             site \"miss.example\" {{\n\
-                 root \"{}\"\n\
-                 ai-publish {{\n\
-                     storage \"{}\"\n\
-                     require-signature \"ed25519:{}\"\n\
-                 }}\n\
-             }}\n",
-            kdl_escape_path(&cert),
-            kdl_escape_path(&key),
-            kdl_escape_path(&docroot),
-            kdl_escape_path(&missing_parent_store),
-            kdl_escape_path(&pub_key),
-        ),
-    )?;
+         }}\n",
+        kdl_escape_path(&cert),
+        kdl_escape_path(&key),
+        kdl_escape_path(&docroot),
+        kdl_escape_path(&missing_parent_store),
+        kdl_escape_path(&pub_key),
+    );
+    fs::write(&miss_cfg, &miss_kdl)?;
 
     // Rejected config (trailing space on ai-publish.storage -> E202).
     let padded_cfg = base.join("padded.kdl");
-    fs::write(
-        &padded_cfg,
-        format!(
-            "server {{\n\
-                 listen \":443\"\n\
-                 tls {{ cert \"{}\"; key \"{}\" }}\n\
+    let padded_kdl = format!(
+        "server {{\n\
+             listen \":443\"\n\
+             tls {{ cert \"{}\"; key \"{}\" }}\n\
+         }}\n\
+         site \"pub.example\" {{\n\
+             ai-publish {{\n\
+                 storage \"{} \"\n\
+                 require-signature \"ed25519:{}\"\n\
              }}\n\
-             site \"pub.example\" {{\n\
-                 ai-publish {{\n\
-                     storage \"{} \"\n\
-                     require-signature \"ed25519:{}\"\n\
-                 }}\n\
-             }}\n",
-            kdl_escape_path(&cert),
-            kdl_escape_path(&key),
-            kdl_escape_path(&bad_store),
-            kdl_escape_path(&pub_key),
-        ),
-    )?;
+         }}\n",
+        kdl_escape_path(&cert),
+        kdl_escape_path(&key),
+        kdl_escape_path(&bad_store),
+        kdl_escape_path(&pub_key),
+    );
+    fs::write(&padded_cfg, &padded_kdl)?;
 
     let cfg_s = cfg.to_str().ok_or("non-utf8 cfg")?;
     let miss_s = miss_cfg.to_str().ok_or("non-utf8 miss cfg")?;
@@ -465,156 +709,141 @@ fn flag_off_bef6865_parity() -> TestResult {
         ),
     ];
 
-    let mut actual_commands = BTreeMap::new();
+    let mut raw_commands = BTreeMap::new();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    let mut normalized_commands = BTreeMap::new();
+
     for (name, args, stdin_bytes) in &cases {
         let (code, stdout, stderr) = run_bin(&bin, base, args, *stdin_bytes)?;
-        match *name {
-            "check_text" | "check_fs" => {
-                assert_eq!(
-                    code,
-                    Some(0),
-                    "{name} failed: {}",
-                    String::from_utf8_lossy(&stderr)
-                );
-                assert!(
-                    !String::from_utf8_lossy(&stderr).contains("W034"),
-                    "{name} emitted W034"
-                );
-            }
-            "check_quiet" | "check_fs_quiet" => {
-                assert_eq!(code, Some(0), "{name} failed");
-                assert_eq!(stdout, b"", "{name} stdout must be empty");
-                assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
-            }
-            "check_json" | "check_stdin_json" => {
-                assert_eq!(code, Some(0), "{name} failed");
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(v.get("valid"), Some(&serde_json::Value::Bool(true)));
-                assert_eq!(
-                    v.pointer("/warnings/0/code")
-                        .and_then(serde_json::Value::as_str),
-                    Some("W002")
-                );
-            }
-            "check_fs_json" => {
-                assert_eq!(code, Some(0), "{name} failed");
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                let warns = v
-                    .get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or("missing warnings")?;
-                assert_eq!(warns.len(), 1, "expected only W002: {v}");
-                assert_eq!(
-                    v.pointer("/warnings/0/code")
-                        .and_then(serde_json::Value::as_str),
-                    Some("W002")
-                );
-            }
-            "check_fs_strict" => {
-                assert_eq!(code, Some(1), "W002 must fail --strict");
-                assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
-            }
-            "check_fs_strict_allow_w002" => {
-                assert_eq!(code, Some(0), "{name} must exit 0 unconditionally");
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(v.get("valid"), Some(&serde_json::Value::Bool(true)));
-                let warns = v
-                    .get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .ok_or("missing warnings")?;
-                assert_eq!(warns.len(), 1, "expected only W002: {v}");
-                assert_eq!(
-                    v.pointer("/warnings/0/code")
-                        .and_then(serde_json::Value::as_str),
-                    Some("W002")
-                );
-            }
-            "check_fs_writable_set" => {
-                assert_eq!(code, Some(0), "{name} failed");
-                assert!(String::from_utf8_lossy(&stdout).starts_with("landlock "));
-                assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
-            }
-            "check_fs_missing_parent" => {
-                assert_eq!(code, Some(1));
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(v.get("valid"), Some(&serde_json::Value::Bool(false)));
-                assert_eq!(
-                    v.get("errors")
-                        .and_then(serde_json::Value::as_array)
-                        .map(Vec::len),
-                    Some(1)
-                );
-            }
-            "check_fs_rejected_padded" => {
-                assert_eq!(code, Some(1));
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(
-                    v.pointer("/errors/0/code")
-                        .and_then(serde_json::Value::as_str),
-                    Some("E202")
-                );
-                assert_eq!(
-                    v.pointer("/errors/0/path")
-                        .and_then(serde_json::Value::as_str),
-                    Some("site[0].ai-publish.storage")
-                );
-            }
-            "reload_dry_run_valid" => {
-                assert_eq!(code, Some(0));
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(
-                    v.get("outcome").and_then(serde_json::Value::as_str),
-                    Some("dry_run_passed")
-                );
-            }
-            "reload_dry_run_rejected" => {
-                assert_eq!(code, Some(1));
-                let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-                assert_eq!(
-                    v.get("outcome").and_then(serde_json::Value::as_str),
-                    Some("dry_run_refused")
-                );
-            }
-            other => return Err(format!("unhandled case {other}").into()),
-        }
-
-        actual_commands.insert(
+        let stdout_s = String::from_utf8(stdout)?;
+        let stderr_s = String::from_utf8(stderr)?;
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        normalized_commands.insert(
             (*name).to_owned(),
             CommandSnapshot {
                 exit_code: code,
-                stdout: normalize_output(&stdout, &canon_base_s, &raw_base_s)?,
-                stderr: normalize_output(&stderr, &canon_base_s, &raw_base_s)?,
+                stdout: normalize_output(&stdout_s, &canon_base_s, &raw_base_s),
+                stderr: normalize_output(&stderr_s, &canon_base_s, &raw_base_s),
+            },
+        );
+        raw_commands.insert(
+            (*name).to_owned(),
+            CommandSnapshot {
+                exit_code: code,
+                stdout: stdout_s,
+                stderr: stderr_s,
             },
         );
     }
 
-    let actual = CaseFixture {
-        commands: actual_commands,
+    let raw_fixture = CaseFixture {
+        commands: raw_commands,
     };
-    let fdir = fixture_dir(profile);
-    let fixture_path = fdir.join("flag_off_bef6865.json");
-    if matches!(
-        std::env::var("RECORD_TP_STORAGE_PARITY").as_deref(),
-        Ok("1" | "bef6865")
-    ) {
-        fs::create_dir_all(&fdir)?;
-        let json = serde_json::to_string_pretty(&actual)?;
-        fs::write(&fixture_path, format!("{json}\n"))?;
-        return Ok(());
+    assert_flag_off_exact_literals(
+        &raw_fixture,
+        &FlagOffLiteralInputs {
+            cfg_s,
+            miss_s,
+            padded_s,
+            miss_kdl: &miss_kdl,
+            padded_kdl: &padded_kdl,
+            missing_parent_store: &missing_parent_store,
+            bad_store: &bad_store,
+        },
+    )?;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let profile = fixture_profile();
+        let actual = CaseFixture {
+            commands: normalized_commands,
+        };
+        let fixture_path = fixture_dir(profile).join("flag_off_bef6865.json");
+        assert_fixture_byte_parity(&actual, &fixture_path, profile)?;
     }
 
-    assert_fixture_byte_parity(&actual, &fixture_path, profile)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// 2. Non-Linux flag-on with storage byte-for-byte parity against bef6865
+// 2. Non-Linux flag-on with storage parity against literals, flag-off, and
+//    checked-in bef6865 fixture
 // ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
+fn assert_non_linux_exact_literals(raw: &CaseFixture, cfg_s: &str) -> TestResult {
+    const NOTE_TEXT: &str = "--trusted-paths is Linux-only; no paths were verified";
+    const NOTE_LINE: &str = "note: --trusted-paths is Linux-only; no paths were verified\n";
+
+    let expected_keys = [
+        "check_fs_strict_tp",
+        "check_fs_strict_tp_json",
+        "check_fs_tp_quiet",
+        "check_fs_tp_writable_set",
+    ];
+    assert_eq!(
+        raw.commands.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected_keys,
+        "non-Linux command key set mismatch"
+    );
+
+    let get = |k: &str| -> Result<&CommandSnapshot, Box<dyn std::error::Error>> {
+        raw.commands
+            .get(k)
+            .ok_or_else(|| format!("missing non-Linux snapshot '{k}'").into())
+    };
+
+    let txt = get("check_fs_strict_tp")?;
+    assert_eq!(txt.exit_code, Some(0));
+    assert_eq!(txt.stderr, "");
+    let expected_txt_stdout = format!(
+        "OK: '{cfg_s}' is valid (1 listener(s), 1 site(s), 0 route(s), TLS >= 1.3, PQC: X25519MLKEM768 enabled, 0 warning(s))\n{NOTE_LINE}"
+    );
+    assert_eq!(
+        txt.stdout.as_bytes(),
+        expected_txt_stdout.as_bytes(),
+        "non-Linux check_fs_strict_tp stdout mismatch"
+    );
+
+    let json_snap = get("check_fs_strict_tp_json")?;
+    assert_eq!(json_snap.exit_code, Some(0));
+    assert_eq!(json_snap.stderr, "");
+    let expected_json_stdout = format!(
+        "{{\n  \"valid\": true,\n  \"strict\": true,\n  \"source\": {},\n  \"summary\": {{\n    \
+         \"listeners\": 1,\n    \"sites\": 1,\n    \"routes\": 0,\n    \
+         \"tls_min_version\": \"1.3\",\n    \"pqc_hybrid\": true,\n    \"warnings\": 0,\n    \
+         \"errors\": 0\n  }},\n  \"errors\": [],\n  \"warnings\": [],\n  \"notes\": [\n    \
+         \"{NOTE_TEXT}\"\n  ]\n}}\n",
+        serde_json::to_string(cfg_s)?,
+    );
+    assert_eq!(
+        json_snap.stdout.as_bytes(),
+        expected_json_stdout.as_bytes(),
+        "non-Linux check_fs_strict_tp_json stdout mismatch"
+    );
+
+    let quiet = get("check_fs_tp_quiet")?;
+    assert_eq!(quiet.exit_code, Some(0));
+    assert_eq!(quiet.stdout, "");
+    assert_eq!(quiet.stderr, NOTE_LINE);
+
+    let ws = get("check_fs_tp_writable_set")?;
+    assert_eq!(ws.exit_code, Some(0));
+    assert_eq!(ws.stdout, "landlock unavailable\n");
+    assert_eq!(ws.stderr, NOTE_LINE);
+
+    Ok(())
+}
 
 #[cfg(not(target_os = "linux"))]
 #[test]
 #[allow(clippy::too_many_lines)]
 fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
-    let bin = parity_bin();
+    const NOTE_LINE: &str = "note: --trusted-paths is Linux-only; no paths were verified\n";
+    const NOTE_JSON_BLOCK: &str =
+        ",\n  \"notes\": [\n    \"--trusted-paths is Linux-only; no paths were verified\"\n  ]";
+
+    let bin = miraserve_bin();
     let tmp = TempDir::new_fixed('n')?;
     let base = &tmp.path;
     #[cfg(target_os = "macos")]
@@ -655,10 +884,11 @@ fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
     )?;
     let cfg_s = cfg.to_str().ok_or("non-utf8 cfg")?;
 
-    let cases: [(&str, Vec<&str>); 4] = [
+    let cases: [(&str, Vec<&str>, Vec<&str>); 4] = [
         (
             "check_fs_strict_tp",
             vec!["check", "--fs", "--strict", "--trusted-paths", cfg_s],
+            vec!["check", "--fs", "--strict", cfg_s],
         ),
         (
             "check_fs_strict_tp_json",
@@ -671,67 +901,88 @@ fn non_linux_trusted_paths_with_storage_unchanged() -> TestResult {
                 "json",
                 cfg_s,
             ],
+            vec!["check", "--fs", "--strict", "--format", "json", cfg_s],
         ),
         (
             "check_fs_tp_writable_set",
             vec!["check", "--fs", "--trusted-paths", "--writable-set", cfg_s],
+            vec!["check", "--fs", "--writable-set", cfg_s],
         ),
         (
             "check_fs_tp_quiet",
             vec!["check", "--fs", "--trusted-paths", "--quiet", cfg_s],
+            vec!["check", "--fs", "--quiet", cfg_s],
         ),
     ];
 
+    let mut raw_commands = BTreeMap::new();
     #[cfg(target_os = "macos")]
-    let mut actual_commands = BTreeMap::new();
+    let mut normalized_commands = BTreeMap::new();
 
-    for (name, args) in &cases {
-        let (code, stdout, stderr) = run_bin(&bin, base, args, None)?;
+    for (name, on_args, off_args) in &cases {
+        let (code, stdout, stderr) = run_bin(&bin, base, on_args, None)?;
+        let (off_code, off_stdout, off_stderr) = run_bin(&bin, base, off_args, None)?;
         assert_eq!(code, Some(0), "non-linux case {name} failed");
-        assert!(!String::from_utf8_lossy(&stderr).contains("W034"));
-        if args.contains(&"json") {
-            let v: serde_json::Value = serde_json::from_slice(&stdout)?;
-            assert_eq!(
-                v.get("notes"),
-                Some(&serde_json::json!([
-                    "--trusted-paths is Linux-only; no paths were verified"
-                ]))
-            );
-            assert_eq!(
-                v.get("warnings")
-                    .and_then(serde_json::Value::as_array)
-                    .map(Vec::len),
-                Some(0)
-            );
+        assert_eq!(code, off_code, "non-linux case {name} changed exit code");
+
+        let on_out_s = String::from_utf8(stdout)?;
+        let on_err_s = String::from_utf8(stderr)?;
+        let off_out_s = String::from_utf8(off_stdout)?;
+        let off_err_s = String::from_utf8(off_stderr)?;
+
+        // Prove on every non-Linux target (macOS and Windows) that enabling `--trusted-paths`
+        // adds ONLY the single plain Linux-only note and leaves all other stdout/stderr bytes
+        // identical to running without `--trusted-paths`.
+        match *name {
+            "check_fs_strict_tp" => {
+                assert_eq!(on_out_s, format!("{off_out_s}{NOTE_LINE}"));
+                assert_eq!(on_err_s, off_err_s);
+            }
+            "check_fs_strict_tp_json" => {
+                let off_body = off_out_s
+                    .strip_suffix("\n}\n")
+                    .ok_or("flag-off JSON missing closing brace")?;
+                assert_eq!(on_out_s, format!("{off_body}{NOTE_JSON_BLOCK}\n}}\n"));
+                assert_eq!(on_err_s, off_err_s);
+            }
+            "check_fs_tp_writable_set" | "check_fs_tp_quiet" => {
+                assert_eq!(on_out_s, off_out_s);
+                assert_eq!(on_err_s, format!("{off_err_s}{NOTE_LINE}"));
+            }
+            other => return Err(format!("unhandled non-linux case {other}").into()),
         }
+
         #[cfg(target_os = "macos")]
-        actual_commands.insert(
+        normalized_commands.insert(
             (*name).to_owned(),
             CommandSnapshot {
                 exit_code: code,
-                stdout: normalize_output(&stdout, &canon_base_s, &raw_base_s)?,
-                stderr: normalize_output(&stderr, &canon_base_s, &raw_base_s)?,
+                stdout: normalize_output(&on_out_s, &canon_base_s, &raw_base_s),
+                stderr: normalize_output(&on_err_s, &canon_base_s, &raw_base_s),
+            },
+        );
+        raw_commands.insert(
+            (*name).to_owned(),
+            CommandSnapshot {
+                exit_code: code,
+                stdout: on_out_s,
+                stderr: on_err_s,
             },
         );
     }
+
+    let raw_fixture = CaseFixture {
+        commands: raw_commands,
+    };
+    assert_non_linux_exact_literals(&raw_fixture, cfg_s)?;
 
     #[cfg(target_os = "macos")]
     {
         let profile = fixture_profile();
         let actual = CaseFixture {
-            commands: actual_commands,
+            commands: normalized_commands,
         };
-        let fdir = fixture_dir(profile);
-        let fixture_path = fdir.join("non_linux_trusted_paths.json");
-        if matches!(
-            std::env::var("RECORD_TP_STORAGE_PARITY").as_deref(),
-            Ok("1" | "bef6865")
-        ) {
-            fs::create_dir_all(&fdir)?;
-            let json = serde_json::to_string_pretty(&actual)?;
-            fs::write(&fixture_path, format!("{json}\n"))?;
-            return Ok(());
-        }
+        let fixture_path = fixture_dir(profile).join("non_linux_trusted_paths.json");
         assert_fixture_byte_parity(&actual, &fixture_path, profile)?;
     }
 
@@ -876,37 +1127,6 @@ mod linux_storage_oracles {
             .flatten()
             .filter_map(serde_json::Value::as_str)
             .collect()
-    }
-
-    fn loc_parts_of_occurrence(
-        kdl: &str,
-        needle: &str,
-        occurrence: usize,
-    ) -> Result<(usize, usize, usize, usize), Box<dyn std::error::Error>> {
-        let mut start = 0_usize;
-        let mut found = None;
-        for _ in 0..=occurrence {
-            let rel = kdl
-                .get(start..)
-                .and_then(|s| s.find(needle))
-                .ok_or_else(|| format!("needle '{needle}' occurrence {occurrence} not found"))?;
-            let abs = start + rel;
-            found = Some(abs);
-            start = abs + needle.len();
-        }
-        let offset = found.ok_or("offset missing")?;
-        let prefix = kdl.get(..offset).ok_or("invalid offset")?;
-        let mut line = 1_usize;
-        let mut column = 1_usize;
-        for ch in prefix.chars() {
-            if ch == '\n' {
-                line += 1;
-                column = 1;
-            } else {
-                column += 1;
-            }
-        }
-        Ok((line, column, offset, needle.len()))
     }
 
     fn loc_of_occurrence(
@@ -1100,7 +1320,7 @@ mod linux_storage_oracles {
     fn linux_flag_on_old_only_and_mixed_config_exact_parity() -> TestResult {
         assert_local_root_fs()?;
         let profile = fixture_profile();
-        let bin = parity_bin();
+        let bin = miraserve_bin();
         let tmp = TempDir::new_fixed('p')?;
         let base = &tmp.path;
         let canon_base = fs::canonicalize(base)?;
@@ -1262,8 +1482,9 @@ mod linux_storage_oracles {
             run_check_json(&bin, base, &common_args, &mixed_cfg)?;
 
         let norm = |raw: &[u8]| -> Result<String, Box<dyn std::error::Error>> {
+            let text = String::from_utf8(raw.to_vec())?;
             Ok(normalize_euid(
-                normalize_output(raw, &canon_base_s, &raw_base_s)?,
+                normalize_output(&text, &canon_base_s, &raw_base_s),
                 euid,
             ))
         };
@@ -1276,40 +1497,6 @@ mod linux_storage_oracles {
         let mixed_json_err_norm = norm(&m_stderr)?;
 
         let fdir = fixture_dir(profile);
-        if let Ok(rec) = std::env::var("RECORD_TP_STORAGE_PARITY")
-            && matches!(rec.as_str(), "bef6865" | "v017")
-        {
-            let mut commands = BTreeMap::new();
-            commands.insert(
-                "old_only_json".to_owned(),
-                CommandSnapshot {
-                    exit_code: old_code,
-                    stdout: old_json_norm,
-                    stderr: old_json_err_norm,
-                },
-            );
-            commands.insert(
-                "old_only_text".to_owned(),
-                CommandSnapshot {
-                    exit_code: old_txt_code,
-                    stdout: old_txt_out_norm,
-                    stderr: old_txt_err_norm,
-                },
-            );
-            commands.insert(
-                "mixed_json".to_owned(),
-                CommandSnapshot {
-                    exit_code: m_code,
-                    stdout: mixed_json_norm,
-                    stderr: mixed_json_err_norm,
-                },
-            );
-            fs::create_dir_all(&fdir)?;
-            let fixture_path = fdir.join(format!("flag_on_{rec}.json"));
-            let json = serde_json::to_string_pretty(&CaseFixture { commands })?;
-            fs::write(&fixture_path, format!("{json}\n"))?;
-            return Ok(());
-        }
 
         // Candidate semantic & position assertions:
         assert_eq!(old_code, Some(1), "missing keyd.sock must exit 1");
