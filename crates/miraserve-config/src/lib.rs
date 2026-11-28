@@ -167,7 +167,7 @@ pub fn parse_kdl_detailed_with_base_dir(
     let source_name = source_name.into();
     let mut parsed = parser::parse_document(kdl);
     if let Some(dir) = base_dir {
-        resolve_relative_dir_paths(&mut parsed.config, dir);
+        resolve_relative_dir_paths(&mut parsed, kdl, dir);
     }
     let outcome =
         validate::validate_config(&parsed.config, kdl, &parsed.spans, parsed.errors, base_dir);
@@ -195,37 +195,60 @@ pub fn parse_kdl_detailed_with_base_dir(
 
 /// Resolves relative directory paths (`site.root`, `route.root`, `ai-publish.storage`) against
 /// the config file's absolute parent directory while leaving traversal (`..`), empty, null-byte,
-/// or already-absolute paths untouched so validator diagnostics stay exact (`R6-CFG-1`).
-fn resolve_relative_dir_paths(config: &mut Config, base_dir: &Path) {
+/// edge-whitespace, or already-absolute paths untouched so validator diagnostics stay exact
+/// (`R6-CFG-1`), and rejects any resolved directory name ending in Unicode whitespace.
+fn resolve_relative_dir_paths(parsed: &mut parser::ParsedDocument, source: &str, base_dir: &Path) {
     let base_str = strip_windows_verbatim_prefix(base_dir);
     if !validate::is_absolute_config_path(&base_str) {
         return;
     }
     let clean_base = PathBuf::from(&base_str);
+    let mut check_dir = |raw: &mut String, key: String, label: &str| {
+        if resolve_single_relative_dir(raw, &clean_base)
+            && let Some(reason) = parser::edge_whitespace_reason(raw)
+        {
+            let msg = format!("{label} resolved directory name {reason}");
+            let span = parsed.spans.get(&key).copied();
+            parsed.errors.push(
+                ConfigIssue::error("E202", msg, source, span)
+                    .with_path(key)
+                    .with_help(parser::PATH_EDGE_WHITESPACE_HELP),
+            );
+        }
+    };
 
-    for site in &mut config.sites {
+    for (site_idx, site) in parsed.config.sites.iter_mut().enumerate() {
         if let Some(root) = &mut site.root {
-            resolve_single_relative_dir(root, &clean_base);
+            check_dir(root, format!("site[{site_idx}].root"), "site root");
         }
         if let Some(publish) = &mut site.ai_publish {
-            resolve_single_relative_dir(&mut publish.storage, &clean_base);
+            check_dir(
+                &mut publish.storage,
+                format!("site[{site_idx}].ai-publish.storage"),
+                "ai-publish storage",
+            );
         }
-        for route in &mut site.routes {
+        for (route_idx, route) in site.routes.iter_mut().enumerate() {
             if let Some(root) = &mut route.root {
-                resolve_single_relative_dir(root, &clean_base);
+                check_dir(
+                    root,
+                    format!("site[{site_idx}].route[{route_idx}].root"),
+                    "route root",
+                );
             }
         }
     }
 }
 
-fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) {
+fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) -> bool {
     let trimmed = raw.trim();
-    if trimmed.is_empty()
+    if raw.as_str() != trimmed
+        || trimmed.is_empty()
         || trimmed.contains('\0')
         || validate::has_parent_traversal(trimmed)
         || validate::is_absolute_config_path(trimmed)
     {
-        return;
+        return false;
     }
 
     let mut joined = base_dir.to_path_buf();
@@ -236,6 +259,7 @@ fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) {
         joined.push(seg);
     }
     *raw = normalize_abs_path_string(&joined);
+    true
 }
 
 fn normalize_abs_path_string(path: &Path) -> String {

@@ -36,6 +36,46 @@ pub(crate) struct ParsedDocument {
     pub(crate) errors: Vec<ConfigIssue>,
 }
 
+pub(crate) const PATH_EDGE_WHITESPACE_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove leading or trailing whitespace from the configured path";
+
+/// Describes leading and/or trailing Unicode whitespace in `value` (`value != value.trim()`),
+/// using printable `U+XXXX` code points safe for text, JSON, and writable-set output.
+pub(crate) fn edge_whitespace_reason(value: &str) -> Option<String> {
+    if value == value.trim() {
+        return None;
+    }
+    let fmt = |c: char| format!("U+{:04X}", u32::from(c));
+    match (
+        value.chars().next().filter(|c| c.is_whitespace()),
+        value.chars().next_back().filter(|c| c.is_whitespace()),
+    ) {
+        (Some(l), Some(t)) if l == t => {
+            Some(format!("starts and ends with whitespace ({})", fmt(l)))
+        }
+        (Some(l), Some(t)) => Some(format!(
+            "starts with whitespace ({}) and ends with whitespace ({})",
+            fmt(l),
+            fmt(t),
+        )),
+        (Some(l), None) => Some(format!("starts with whitespace ({})", fmt(l))),
+        (None, Some(t)) => Some(format!("ends with whitespace ({})", fmt(t))),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn tagged_path_whitespace_reason(raw: &str, prefix: &str) -> Option<String> {
+    raw.trim().strip_prefix(prefix)?;
+    raw.strip_prefix(prefix)
+        .and_then(edge_whitespace_reason)
+        .or_else(|| edge_whitespace_reason(raw))
+}
+
+pub(crate) fn keyd_socket_whitespace_reason(raw: &str) -> Option<String> {
+    raw.strip_prefix("unix:")
+        .and_then(edge_whitespace_reason)
+        .or_else(|| edge_whitespace_reason(raw))
+}
+
 /// Maximum permitted KDL block (`{ ... }`) or block-comment (`/* ... */`) nesting depth.
 ///
 /// Defends against recursive-descent parser stack-overflow DoS on hostile inputs
@@ -118,6 +158,60 @@ impl<'a> ParserCtx<'a> {
 
     fn record_span(&mut self, key: impl Into<String>, span: SourceSpan) {
         self.spans.insert(key.into(), span);
+    }
+
+    fn push_path_ws_error(&mut self, key: &str, label: &str, reason: &str, span: SourceSpan) {
+        let msg = format!("{label} path {reason}");
+        self.errors.push(
+            ConfigIssue::error("E202", msg, self.source, Some(span))
+                .with_path(key)
+                .with_help(PATH_EDGE_WHITESPACE_HELP),
+        );
+    }
+
+    fn check_path_ws(&mut self, raw: &str, key: &str, label: &str, span: SourceSpan) -> bool {
+        edge_whitespace_reason(raw).is_some_and(|r| {
+            self.push_path_ws_error(key, label, &r, span);
+            true
+        })
+    }
+
+    fn path_node(&mut self, child: &KdlNode, key: &str, label: &str) -> Option<String> {
+        self.record_span(key, child.span());
+        let (val, span) = self.single_string_with_span(child)?;
+        self.check_path_ws(val, key, label, span);
+        Some(val.to_owned())
+    }
+
+    fn tree_list(&mut self, child: &KdlNode, name: &str) -> Option<Vec<String>> {
+        let (key, label) = (
+            format!("server.sandbox.{name}"),
+            format!("sandbox '{name}'"),
+        );
+        self.record_span(&key, child.span());
+        let items = self.string_list_with_spans(child, name)?;
+        Some(
+            items
+                .into_iter()
+                .filter(|(s, sp)| !self.check_path_ws(s, &key, &label, *sp))
+                .map(|(s, _)| s)
+                .collect(),
+        )
+    }
+
+    fn tagged_path(
+        &mut self,
+        child: &KdlNode,
+        key: &str,
+        prefix: &str,
+        label: &str,
+    ) -> Option<String> {
+        self.record_span(key, child.span());
+        let (val, span) = self.single_string_with_span(child)?;
+        if let Some(reason) = tagged_path_whitespace_reason(val, prefix) {
+            self.push_path_ws_error(key, label, &reason, span);
+        }
+        Some(val.to_owned())
     }
 
     fn push_error(
@@ -251,17 +345,20 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "acme-webroot" => {
-                    self.record_span("server.acme-webroot", child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        config.acme_webroot = Some(val.to_owned());
+                    if let Some(v) =
+                        self.path_node(child, "server.acme-webroot", "server.acme-webroot")
+                    {
+                        config.acme_webroot = Some(v);
                     }
                 }
                 "allow-docroot" => {
                     self.record_span("server.allow-docroot", child.span());
-                    if let Some(items) = self.parse_string_list_node(child, "allow-docroot") {
-                        for item in items {
-                            let idx = config.allow_docroots.len();
-                            self.record_span(format!("server.allow-docroot[{idx}]"), child.span());
+                    if let Some(items) = self.string_list_with_spans(child, "allow-docroot") {
+                        for (item, span) in items {
+                            let key =
+                                format!("server.allow-docroot[{}]", config.allow_docroots.len());
+                            self.record_span(&key, child.span());
+                            self.check_path_ws(&item, &key, "server.allow-docroot", span);
                             config.allow_docroots.push(item);
                         }
                     }
@@ -418,7 +515,15 @@ impl<'a> ParserCtx<'a> {
                 }
                 "keyd-socket" => {
                     self.record_span("server.tls.keyd-socket", child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
+                    if let Some((val, span)) = self.single_string_with_span(child) {
+                        if let Some(reason) = keyd_socket_whitespace_reason(val) {
+                            self.push_path_ws_error(
+                                "server.tls.keyd-socket",
+                                "keyd-socket",
+                                &reason,
+                                span,
+                            );
+                        }
                         cfg.keyd_socket = Some(val.to_owned());
                     }
                 }
@@ -450,23 +555,11 @@ impl<'a> ParserCtx<'a> {
                         }
                     }
                 }
-                "cert" => {
-                    self.record_span("server.tls.cert", child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.cert = Some(val.to_owned());
-                    }
-                }
-                "key" => {
-                    self.record_span("server.tls.key", child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.key = Some(val.to_owned());
-                    }
-                }
+                "cert" => cfg.cert = self.path_node(child, "server.tls.cert", "TLS certificate"),
+                "key" => cfg.key = self.path_node(child, "server.tls.key", "TLS private key"),
                 "client-ca" => {
-                    self.record_span("server.tls.client-ca", child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.client_ca = Some(val.to_owned());
-                    }
+                    cfg.client_ca =
+                        self.path_node(child, "server.tls.client-ca", "mTLS client CA bundle");
                 }
                 "acme" => {
                     self.record_span("server.tls.acme", child.span());
@@ -613,15 +706,13 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "read-tree" => {
-                    self.record_span("server.sandbox.read-tree", child.span());
-                    if let Some(items) = self.parse_string_list_node(child, "read-tree") {
-                        cfg.read_trees = items;
+                    if let Some(trees) = self.tree_list(child, "read-tree") {
+                        cfg.read_trees = trees;
                     }
                 }
                 "socket-tree" => {
-                    self.record_span("server.sandbox.socket-tree", child.span());
-                    if let Some(items) = self.parse_string_list_node(child, "socket-tree") {
-                        cfg.socket_trees = items;
+                    if let Some(trees) = self.tree_list(child, "socket-tree") {
+                        cfg.socket_trees = trees;
                     }
                 }
                 "landlock" => {
@@ -1019,6 +1110,12 @@ impl<'a> ParserCtx<'a> {
         let module_path = self
             .expect_string(path_entry, "wasm-plugin module path")?
             .to_owned();
+        self.check_path_ws(
+            &module_path,
+            &format!("{route_prefix}.wasm-plugin"),
+            "wasm-plugin module",
+            path_entry.span(),
+        );
 
         let mut cfg = WasmPluginConfig {
             module_path,
@@ -1207,12 +1304,7 @@ impl<'a> ParserCtx<'a> {
                     self.record_span(format!("{prefix}.tls"), child.span());
                     tls = Some(self.parse_site_tls(child, &prefix));
                 }
-                "root" => {
-                    self.record_span(format!("{prefix}.root"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        root = Some(val.to_owned());
-                    }
-                }
+                "root" => root = self.path_node(child, &format!("{prefix}.root"), "site root"),
                 "index" => {
                     self.record_span(format!("{prefix}.index"), child.span());
                     if let Some(items) = self.parse_string_list_node(child, "index") {
@@ -1238,15 +1330,15 @@ impl<'a> ParserCtx<'a> {
                     error_pages = Some(self.parse_error_pages(child, &prefix));
                 }
                 "owner-dir" => {
-                    self.record_span(format!("{prefix}.owner-dir"), child.span());
+                    let key = format!("{prefix}.owner-dir");
+                    self.record_span(key.clone(), child.span());
                     self.expect_no_children(child, "owner-dir");
                     let (args, _) = self.split_entries(child);
                     if let Some(()) =
                         self.expect_exact_arg_count(&args, 1, "owner-dir", child.span())
-                        && let Some(dir) = args
-                            .first()
-                            .and_then(|arg| self.expect_string(arg, "owner-dir"))
-                            .map(str::to_owned)
+                        && let Some(arg) = args.first().copied()
+                        && let Some(dir) = self.expect_string(arg, "owner-dir").map(str::to_owned)
+                        && !self.check_path_ws(&dir, &key, "owner-dir", arg.span())
                     {
                         if !std::path::Path::new(&dir).is_absolute() {
                             self.push_error(
@@ -1266,7 +1358,8 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "basic-auth" => {
-                    self.record_span(format!("{prefix}.basic-auth"), child.span());
+                    let key = format!("{prefix}.basic-auth");
+                    self.record_span(key.clone(), child.span());
                     if basic_auth.is_some() {
                         self.push_error(
                             "E005",
@@ -1275,7 +1368,7 @@ impl<'a> ParserCtx<'a> {
                             None,
                         );
                     } else {
-                        basic_auth = self.parse_basic_auth(child);
+                        basic_auth = self.parse_basic_auth(child, Some(&key));
                     }
                 }
                 "access" => {
@@ -1500,13 +1593,21 @@ impl<'a> ParserCtx<'a> {
     }
 
     /// Parses `basic-auth "/abs/path/htpasswd" realm="Members"`.
-    fn parse_basic_auth(&mut self, node: &KdlNode) -> Option<BasicAuthConfig> {
+    fn parse_basic_auth(
+        &mut self,
+        node: &KdlNode,
+        site_path: Option<&str>,
+    ) -> Option<BasicAuthConfig> {
         self.expect_no_children(node, "basic-auth");
         let (args, props) = self.split_entries(node);
         self.expect_exact_arg_count(&args, 1, "basic-auth", node.span())?;
-        let users_file = self
-            .expect_string(*args.first()?, "basic-auth users file")?
-            .to_owned();
+        let arg = *args.first()?;
+        let users_file = self.expect_string(arg, "basic-auth users file")?.to_owned();
+        if let Some(key) = site_path
+            && self.check_path_ws(&users_file, key, "basic-auth users file", arg.span())
+        {
+            return None;
+        }
         if !std::path::Path::new(&users_file).is_absolute() {
             self.push_error(
                 "E311",
@@ -1805,7 +1906,7 @@ impl<'a> ParserCtx<'a> {
                         continue;
                     };
                     let span_key = format!("{site_prefix}.error-pages.page.{status_u16}");
-                    self.record_span(span_key, child.span());
+                    self.record_span(span_key.clone(), child.span());
                     if cfg.pages.contains_key(&status_u16) {
                         self.push_error(
                             "E005",
@@ -1815,6 +1916,7 @@ impl<'a> ParserCtx<'a> {
                         );
                         continue;
                     }
+                    self.check_path_ws(path, &span_key, "error page", path_entry.span());
                     cfg.pages.insert(status_u16, path.to_owned());
                 }
                 other => {
@@ -1999,22 +2101,22 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "cert" => {
-                    self.record_span(format!("{site_prefix}.tls.cert"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.cert = Some(val.to_owned());
-                    }
+                    cfg.cert = self.path_node(
+                        child,
+                        &format!("{site_prefix}.tls.cert"),
+                        "TLS certificate",
+                    );
                 }
                 "key" => {
-                    self.record_span(format!("{site_prefix}.tls.key"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.key = Some(val.to_owned());
-                    }
+                    cfg.key =
+                        self.path_node(child, &format!("{site_prefix}.tls.key"), "TLS private key");
                 }
                 "client-ca" => {
-                    self.record_span(format!("{site_prefix}.tls.client-ca"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.client_ca = Some(val.to_owned());
-                    }
+                    cfg.client_ca = self.path_node(
+                        child,
+                        &format!("{site_prefix}.tls.client-ca"),
+                        "site mTLS client CA bundle",
+                    );
                 }
                 other => {
                     self.push_error(
@@ -2175,13 +2277,11 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "agent-keys-file" => {
-                    self.record_span(
-                        format!("{site_prefix}.bot-auth.agent-keys-file"),
-                        child.span(),
+                    cfg.agent_keys_file = self.path_node(
+                        child,
+                        &format!("{site_prefix}.bot-auth.agent-keys-file"),
+                        "bot-auth agent-keys-file",
                     );
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        cfg.agent_keys_file = Some(val.to_owned());
-                    }
                 }
                 "on-unverified-ai-ua" => {
                     if let Some(val) = self.expect_single_string_node(child) {
@@ -2248,10 +2348,11 @@ impl<'a> ParserCtx<'a> {
             }
             match name {
                 "storage" => {
-                    self.record_span(format!("{site_prefix}.ai-publish.storage"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        storage = Some(val.to_owned());
-                    }
+                    storage = self.path_node(
+                        child,
+                        &format!("{site_prefix}.ai-publish.storage"),
+                        "ai-publish storage",
+                    );
                 }
                 "site-id" => {
                     self.record_span(format!("{site_prefix}.ai-publish.site-id"), child.span());
@@ -2260,13 +2361,12 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "jwt-public-key" => {
-                    self.record_span(
-                        format!("{site_prefix}.ai-publish.jwt-public-key"),
-                        child.span(),
+                    jwt_public_key = self.tagged_path(
+                        child,
+                        &format!("{site_prefix}.ai-publish.jwt-public-key"),
+                        "ed25519:",
+                        "ai-publish JWT public key",
                     );
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        jwt_public_key = Some(val.to_owned());
-                    }
                 }
                 "jwt-issuer" => {
                     self.record_span(format!("{site_prefix}.ai-publish.jwt-issuer"), child.span());
@@ -2313,12 +2413,24 @@ impl<'a> ParserCtx<'a> {
                     }
                 }
                 "require-signature" => {
-                    self.record_span(
-                        format!("{site_prefix}.ai-publish.require-signature"),
-                        child.span(),
-                    );
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        if let Some((algo_raw, key_path)) = val.split_once(':') {
+                    let key = format!("{site_prefix}.ai-publish.require-signature");
+                    self.record_span(key.clone(), child.span());
+                    if let Some((val, span)) = self.single_string_with_span(child) {
+                        if let Some(reason) = tagged_path_whitespace_reason(val, "ed25519:") {
+                            self.push_path_ws_error(
+                                &key,
+                                "require-signature public key",
+                                &reason,
+                                span,
+                            );
+                            require_signature = Some(SignatureRequirement {
+                                algorithm: SignatureAlgorithm::Ed25519,
+                                public_key_path: val
+                                    .strip_prefix("ed25519:")
+                                    .unwrap_or(val)
+                                    .to_owned(),
+                            });
+                        } else if let Some((algo_raw, key_path)) = val.split_once(':') {
                             match algo_raw {
                                 "ed25519" => {
                                     if key_path.trim().is_empty() {
@@ -2598,10 +2710,7 @@ impl<'a> ParserCtx<'a> {
                         );
                         continue;
                     }
-                    self.record_span(format!("{route_prefix}.root"), child.span());
-                    if let Some(val) = self.expect_single_string_node(child) {
-                        root = Some(val.to_owned());
-                    }
+                    root = self.path_node(child, &format!("{route_prefix}.root"), "route root");
                 }
                 "basic-auth" => {
                     self.record_span(format!("{route_prefix}.basic-auth"), child.span());
@@ -2613,7 +2722,7 @@ impl<'a> ParserCtx<'a> {
                             None,
                         );
                     } else {
-                        basic_auth = self.parse_basic_auth(child);
+                        basic_auth = self.parse_basic_auth(child, None);
                     }
                 }
                 "access" => {
@@ -2663,7 +2772,7 @@ impl<'a> ParserCtx<'a> {
                         continue;
                     }
                     self.record_span(format!("{route_prefix}.fastcgi-pass"), child.span());
-                    if let Some(fcgi) = self.parse_fastcgi_pass(child) {
+                    if let Some(fcgi) = self.parse_fastcgi_pass(child, route_prefix) {
                         handler = Some(RouteHandler::FastCgi(fcgi));
                     }
                 }
@@ -2848,11 +2957,12 @@ impl<'a> ParserCtx<'a> {
     }
 
     #[allow(clippy::too_many_lines, reason = "one arm per property")]
-    fn parse_fastcgi_pass(&mut self, node: &KdlNode) -> Option<FastCgiConfig> {
+    fn parse_fastcgi_pass(&mut self, node: &KdlNode, route_prefix: &str) -> Option<FastCgiConfig> {
         self.expect_no_children(node, "fastcgi-pass");
         let (args, props) = self.split_entries(node);
         self.expect_exact_arg_count(&args, 1, "fastcgi-pass", node.span())?;
-        let raw = self.expect_string(*args.first()?, "fastcgi-pass endpoint")?;
+        let arg = *args.first()?;
+        let raw = self.expect_string(arg, "fastcgi-pass endpoint")?;
 
         let mut timeout = Duration::from_secs(30);
         let mut replay_safe_methods = false;
@@ -2905,7 +3015,17 @@ impl<'a> ParserCtx<'a> {
             }
         }
 
-        let target = if let Some(sock_path) = raw.strip_prefix("unix:") {
+        let target = if let Some(reason) = tagged_path_whitespace_reason(raw, "unix:") {
+            self.push_path_ws_error(
+                &format!("{route_prefix}.fastcgi-pass"),
+                "FastCGI Unix socket",
+                &reason,
+                arg.span(),
+            );
+            FastCgiTarget::Unix {
+                path: raw.strip_prefix("unix:").unwrap_or(raw).to_owned(),
+            }
+        } else if let Some(sock_path) = raw.strip_prefix("unix:") {
             if sock_path.trim().is_empty() {
                 self.push_error(
                     "E304",
@@ -3039,13 +3159,12 @@ impl<'a> ParserCtx<'a> {
                         }
                     }
                     "jwt-public-key" => {
-                        self.record_span(
-                            format!("{route_prefix}.mcp-gateway.jwt-public-key"),
-                            child.span(),
+                        jwt_public_key = self.tagged_path(
+                            child,
+                            &format!("{route_prefix}.mcp-gateway.jwt-public-key"),
+                            "ed25519:",
+                            "mcp-gateway JWT public key",
                         );
-                        if let Some(val) = self.expect_single_string_node(child) {
-                            jwt_public_key = Some(val.to_owned());
-                        }
                     }
                     "jwks-url" => {
                         self.record_span(
@@ -3538,22 +3657,22 @@ impl<'a> ParserCtx<'a> {
             }
             match name {
                 "ca-cert" => {
-                    self.record_span(format!("{prefix}.ca-cert"), child.span());
-                    if let Some(v) = self.expect_single_string_node(child) {
-                        ca_cert = Some(v.to_owned());
-                    }
+                    ca_cert =
+                        self.path_node(child, &format!("{prefix}.ca-cert"), "upstream-tls ca-cert");
                 }
                 "client-cert" => {
-                    self.record_span(format!("{prefix}.client-cert"), child.span());
-                    if let Some(v) = self.expect_single_string_node(child) {
-                        client_cert = Some(v.to_owned());
-                    }
+                    client_cert = self.path_node(
+                        child,
+                        &format!("{prefix}.client-cert"),
+                        "upstream-tls client-cert",
+                    );
                 }
                 "client-key" => {
-                    self.record_span(format!("{prefix}.client-key"), child.span());
-                    if let Some(v) = self.expect_single_string_node(child) {
-                        client_key = Some(v.to_owned());
-                    }
+                    client_key = self.path_node(
+                        child,
+                        &format!("{prefix}.client-key"),
+                        "upstream-tls client-key",
+                    );
                 }
                 other => {
                     self.push_error(
@@ -4045,6 +4164,10 @@ impl<'a> ParserCtx<'a> {
     }
 
     fn expect_single_string_node<'n>(&mut self, node: &'n KdlNode) -> Option<&'n str> {
+        self.single_string_with_span(node).map(|(s, _)| s)
+    }
+
+    fn single_string_with_span<'n>(&mut self, node: &'n KdlNode) -> Option<(&'n str, SourceSpan)> {
         let directive = node.name().value();
         self.expect_no_children(node, directive);
         let (args, props) = self.split_entries(node);
@@ -4059,6 +4182,7 @@ impl<'a> ParserCtx<'a> {
         self.expect_exact_arg_count(&args, 1, directive, node.span())?;
         let entry = args.first().copied()?;
         self.expect_string(entry, directive)
+            .map(|s| (s, entry.span()))
     }
 
     fn expect_single_bool_node(&mut self, node: &KdlNode) -> Option<bool> {
@@ -4147,6 +4271,15 @@ impl<'a> ParserCtx<'a> {
     }
 
     fn parse_string_list_node(&mut self, node: &KdlNode, directive: &str) -> Option<Vec<String>> {
+        self.string_list_with_spans(node, directive)
+            .map(|items| items.into_iter().map(|(s, _)| s).collect())
+    }
+
+    fn string_list_with_spans(
+        &mut self,
+        node: &KdlNode,
+        directive: &str,
+    ) -> Option<Vec<(String, SourceSpan)>> {
         self.expect_no_children(node, directive);
         let (args, props) = self.split_entries(node);
         for (prop, entry) in props {
@@ -4169,7 +4302,7 @@ impl<'a> ParserCtx<'a> {
         let mut out = Vec::with_capacity(args.len());
         for arg in args {
             if let Some(s) = self.expect_string(arg, directive) {
-                out.push(s.to_owned());
+                out.push((s.to_owned(), arg.span()));
             }
         }
         Some(out)
