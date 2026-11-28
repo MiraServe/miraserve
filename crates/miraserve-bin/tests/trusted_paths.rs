@@ -1856,12 +1856,11 @@ mod linux_tests {
 
     #[test]
     fn linux_p1_1_keyd_leading_space_walks_trimmed_endpoint() -> TestResult {
-        if !require_local_root_fs("linux_p1_1_keyd_leading_space_walks_trimmed_endpoint")? {
-            return Ok(());
-        }
+        // Since 0.1.8, leading or trailing whitespace in KDL `server.tls.keyd-socket` is
+        // rejected at configuration load with E202 before `--trusted-paths` runs (runs on
+        // all Linux filesystems, including overlayfs).
         let base = make_temp_base("p1-keyd-space")?;
         let (cert, key) = gen_dev_cert(&base)?;
-        let euid = rustix::process::geteuid().as_raw();
         let docroot = base.join("www");
         let good_cwd = base.join("good_cwd");
         let bad_dir = base.join("bad_keyd_dir");
@@ -1888,28 +1887,35 @@ mod linux_tests {
             ),
         )?;
 
-        let (_code, val) = run_json_in(&["--fs", "--trusted-paths"], &cfg, Some(&good_cwd))?;
-        let ws = w034s(&val);
+        let (code, val) = run_json_in(&["--fs", "--trusted-paths"], &cfg, Some(&good_cwd))?;
         assert_eq!(
-            ws.len(),
-            1,
-            "leading-space keyd-socket must emit W034: {val}"
+            code,
+            Some(1),
+            "leading-space keyd-socket must exit 1: {val}"
+        );
+        assert_eq!(val.get("valid"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(w034s(&val).len(), 0, "expected zero W034 on E202: {val}");
+        assert_eq!(
+            val.get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(1),
+            "expected single E202 error: {val}"
         );
         assert_eq!(
-            ws.first().and_then(|w| jstr(w, "path")),
+            val.pointer("/errors/0/code")
+                .and_then(serde_json::Value::as_str),
+            Some("E202")
+        );
+        assert_eq!(
+            val.pointer("/errors/0/path")
+                .and_then(serde_json::Value::as_str),
             Some("server.tls.keyd-socket")
         );
         assert_eq!(
-            ws.first().and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "server.tls.keyd-socket '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 0775): group or other writable",
-                    keyd_sock.display(),
-                    bad_dir.display()
-                )
-                .as_str()
-            )
+            val.pointer("/errors/0/message")
+                .and_then(serde_json::Value::as_str),
+            Some("keyd-socket path starts with whitespace (U+0020)")
         );
 
         let _ = fs::remove_dir_all(&base);
@@ -2766,11 +2772,6 @@ mod linux_tests {
 
     #[test]
     fn linux_point2_fastcgi_untrimmed_and_socket_tree_trailing_slash_match_runtime() -> TestResult {
-        if !require_local_root_fs(
-            "linux_point2_fastcgi_untrimmed_and_socket_tree_trailing_slash_match_runtime",
-        )? {
-            return Ok(());
-        }
         let base = make_temp_base("p2-runtime-match")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let euid = rustix::process::geteuid().as_raw();
@@ -2785,23 +2786,19 @@ mod linux_tests {
         set_mode(&sticky, 0o1777)?;
         set_mode(&tree_bad, 0o775)?;
 
-        // Existing trusted socket at `pool.sock`; distinct entry `pool.sock ` (trailing space)
-        // is absent in the sticky directory. FastCGI connects to the raw untrimmed string, so
-        // `unix:<sticky>/pool.sock ` must inspect `pool.sock ` (and report missing component in
-        // sticky dir) rather than trimming to `pool.sock`, and `unix: <sock>` (leading space)
-        // must be reported as relative rather than trimmed!
         let sock = sticky.join("pool.sock");
         let _listener = UnixListener::bind(&sock)?;
         set_mode(&sock, 0o660)?;
 
-        let cfg = base.join("rt.kdl");
+        // 1. Since 0.1.8, leading/trailing whitespace after `unix:` on `fastcgi-pass` is
+        //    rejected at KDL load with E202 before `--trusted-paths` runs.
+        let padded_cfg = base.join("rt-padded.kdl");
         fs::write(
-            &cfg,
+            &padded_cfg,
             format!(
                 "server {{\n\
                      listen \":443\"\n\
                      tls {{ cert \"{}\"; key \"{}\" }}\n\
-                     sandbox {{ socket-tree \"{}/\" \"{}/\" }}\n\
                  }}\n\
                  site \"rt.example\" {{\n\
                      root \"{}\"\n\
@@ -2810,68 +2807,104 @@ mod linux_tests {
                  }}\n",
                 kdl_escape_path(&cert),
                 kdl_escape_path(&key),
-                kdl_escape_path(&tree_ok),
-                kdl_escape_path(&tree_bad),
                 kdl_escape_path(&docroot),
                 kdl_escape_path(&sock),
                 kdl_escape_path(&sock),
             ),
         )?;
-
-        let (_code, val) = run_json(&["--fs", "--trusted-paths"], &cfg)?;
-        let ws = w034s(&val);
-        assert_eq!(ws.len(), 3, "expected 3 W034s: {ws:#?}");
+        let (p_code, p_val) = run_json(&["--fs", "--trusted-paths"], &padded_cfg)?;
+        assert_eq!(p_code, Some(1), "padded fastcgi-pass must exit 1: {p_val}");
+        assert_eq!(p_val.get("valid"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(w034s(&p_val).len(), 0, "expected 0 W034 on E202: {p_val}");
         assert_eq!(
-            ws.first().and_then(|w| jstr(w, "path")),
-            Some("server.sandbox.socket-tree")
+            p_val
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2),
+            "expected 2 E202 errors: {p_val}"
         );
         assert_eq!(
-            ws.first().and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "server.sandbox socket-tree root '{}': first untrusted component '{}' \
-                     (uid {euid}, mode 0775): {TREE_WR_LITERAL}",
-                    tree_bad.display(),
-                    tree_bad.display()
-                )
-                .as_str()
-            )
+            p_val
+                .pointer("/errors/0/code")
+                .and_then(serde_json::Value::as_str),
+            Some("E202")
         );
         assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "path")),
+            p_val
+                .pointer("/errors/0/path")
+                .and_then(serde_json::Value::as_str),
             Some("site[0].route[0].fastcgi-pass")
         );
         assert_eq!(
-            ws.get(1).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "site 'rt.example' FastCGI Unix socket ' {}': first untrusted component ' {}' \
-                     (uid unknown, mode unknown): not verified: relative path depends on the \
-                     working directory of the server",
-                    sock.display(),
-                    sock.display()
-                )
-                .as_str()
-            )
+            p_val
+                .pointer("/errors/0/message")
+                .and_then(serde_json::Value::as_str),
+            Some("FastCGI Unix socket path starts with whitespace (U+0020)")
         );
         assert_eq!(
-            ws.get(2).and_then(|w| jstr(w, "path")),
+            p_val
+                .pointer("/errors/1/code")
+                .and_then(serde_json::Value::as_str),
+            Some("E202")
+        );
+        assert_eq!(
+            p_val
+                .pointer("/errors/1/path")
+                .and_then(serde_json::Value::as_str),
             Some("site[0].route[1].fastcgi-pass")
         );
         assert_eq!(
-            ws.get(2).and_then(|w| jstr(w, "message")),
-            Some(
-                format!(
-                    "site 'rt.example' FastCGI Unix socket '{} ': first untrusted component '{}' \
-                     (uid {euid}, mode 1777): missing component 'pool.sock ' under a parent where \
-                     another account could create it, and if it is created later the permissions it \
-                     would inherit are not verified",
-                    sock.display(),
-                    sticky.display()
-                )
-                .as_str()
-            )
+            p_val
+                .pointer("/errors/1/message")
+                .and_then(serde_json::Value::as_str),
+            Some("FastCGI Unix socket path ends with whitespace (U+0020)")
         );
+
+        // 2. Clean `socket-tree` trailing slash continues to load and match runtime normalization.
+        if require_local_root_fs(
+            "linux_point2_fastcgi_untrimmed_and_socket_tree_trailing_slash_match_runtime",
+        )? {
+            let cfg = base.join("rt.kdl");
+            fs::write(
+                &cfg,
+                format!(
+                    "server {{\n\
+                         listen \":443\"\n\
+                         tls {{ cert \"{}\"; key \"{}\" }}\n\
+                         sandbox {{ socket-tree \"{}/\" \"{}/\" }}\n\
+                     }}\n\
+                     site \"rt.example\" {{\n\
+                         root \"{}\"\n\
+                     }}\n",
+                    kdl_escape_path(&cert),
+                    kdl_escape_path(&key),
+                    kdl_escape_path(&tree_ok),
+                    kdl_escape_path(&tree_bad),
+                    kdl_escape_path(&docroot),
+                ),
+            )?;
+
+            let (_code, val) = run_json(&["--fs", "--trusted-paths"], &cfg)?;
+            let ws = w034s(&val);
+            assert_eq!(ws.len(), 1, "expected 1 W034: {ws:#?}");
+            assert_eq!(
+                ws.first().and_then(|w| jstr(w, "path")),
+                Some("server.sandbox.socket-tree")
+            );
+            assert_eq!(
+                ws.first().and_then(|w| jstr(w, "message")),
+                Some(
+                    format!(
+                        "server.sandbox socket-tree root '{}': first untrusted component '{}' \
+                         (uid {euid}, mode 0775): {TREE_WR_LITERAL}",
+                        tree_bad.display(),
+                        tree_bad.display()
+                    )
+                    .as_str()
+                )
+            );
+        }
 
         let _ = fs::remove_dir_all(&base);
         Ok(())
