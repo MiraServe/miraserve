@@ -45,6 +45,7 @@ pub(crate) fn validate_config(
     ctx.validate_server(&config.server);
     ctx.validate_acme_webroot_credentials(config);
     ctx.validate_sites(&config.sites, config.server.tls.client_ca.is_some());
+    ctx.validate_split_daemon(config);
 
     // R7-CFG-1: Refuse any site/route document root that equals or is an ancestor of the
     // configuration file's directory so `root "."` (or an ancestor) can never serve the `.kdl`
@@ -394,6 +395,87 @@ impl ValidatorCtx<'_> {
                     &key_path,
                     None,
                 );
+            }
+        }
+    }
+
+    fn validate_split_daemon(&mut self, cfg: &Config) {
+        if cfg.server.tls.key_isolation != KeyIsolation::SplitDaemon {
+            return;
+        }
+        for (i, s) in cfg.sites.iter().enumerate() {
+            if s.owner_dir.is_some()
+                && let Some(t) = &s.tls
+                && (t.cert.is_some() || t.key.is_some())
+            {
+                let h = s.hosts.first().map_or("<site>", String::as_str);
+                let msg = format!(
+                    "site '{h}' uses 'owner-dir' and declares its own TLS certificate/key pair, \
+                     which is not supported with key-isolation \"split-daemon\" in this release"
+                );
+                let help = Some("remove site.tls cert/key for server pair, or use in-process mode");
+                self.error("E109", msg, &format!("site[{i}].tls"), help);
+            }
+        }
+        let keys: Vec<_> = split_daemon_signing_keys(cfg)
+            .into_iter()
+            .map(|(f, k)| (f, k, split_lexical_path_key(k)))
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let sb = &cfg.server.sandbox;
+        let t_help = Some("store split-daemon keys outside worker-readable trees");
+        let (rt, st, aw) = (&sb.read_trees, &sb.socket_trees, &cfg.server.acme_webroot);
+        let trees = [
+            ("read-tree", "server.sandbox.read-tree", &rt[..]),
+            ("socket-tree", "server.sandbox.socket-tree", &st[..]),
+            ("acme-webroot", "server.acme-webroot", aw.as_slice()),
+        ];
+        for (kind, span, list) in trees {
+            for raw in list {
+                let t = split_lexical_path_key(raw);
+                for (kf, rk, kn) in &keys {
+                    let sub = kn.strip_prefix(&t).is_some_and(|r| r.starts_with('/'));
+                    if !t.is_empty() && (kn == &t || (t == "/" && kn.starts_with('/')) || sub) {
+                        let m = format!(
+                            "split-daemon signing key {kf} '{rk}' lies inside read-bearing {kind} '{raw}'"
+                        );
+                        self.error("E109", m, span, t_help);
+                    }
+                }
+            }
+        }
+        let c_help = Some("keep inbound signing keys separate from certificates and worker inputs");
+        let mut inputs: Vec<&str> = Vec::new();
+        inputs.extend(cfg.server.tls.cert.as_deref());
+        inputs.extend(cfg.server.tls.client_ca.as_deref());
+        for s in &cfg.sites {
+            if let Some(t) = &s.tls {
+                inputs.extend(t.cert.as_deref());
+                inputs.extend(t.client_ca.as_deref());
+            }
+            inputs.extend(s.basic_auth.as_ref().map(|a| a.users_file.as_str()));
+            for r in &s.routes {
+                inputs.extend(r.basic_auth.as_ref().map(|a| a.users_file.as_str()));
+                if let RouteHandler::ReverseProxy(rp) = &r.handler
+                    && let Some(u) = &rp.upstream_tls
+                {
+                    inputs.extend(u.ca_cert.as_deref());
+                    inputs.extend(u.client_cert.as_deref());
+                    inputs.extend(u.client_key.as_deref());
+                }
+            }
+        }
+        for raw in inputs {
+            let norm = split_lexical_path_key(raw);
+            for (kf, rk, kn) in &keys {
+                if !norm.is_empty() && norm == *kn {
+                    let m = format!(
+                        "split-daemon signing key {kf} '{rk}' collides with worker-read input '{raw}'"
+                    );
+                    self.error("E109", m, kf, c_help);
+                }
             }
         }
     }
@@ -3291,6 +3373,34 @@ fn lexical_path_key(raw: &str) -> String {
     }
 }
 
+/// Split-daemon lexical normalisation: matches [`lexical_path_key`] except letter case is never
+/// folded on any platform so paths differing only in case do not collide.
+fn split_lexical_path_key(raw: &str) -> String {
+    use std::path::{Component, Path};
+    let mut parts: Vec<String> = Vec::new();
+    let mut has_root = false;
+    for comp in Path::new(raw.trim()).components() {
+        match comp {
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(seg) => parts.push(seg.to_string_lossy().into_owned()),
+            Component::Prefix(p) => {
+                let s = p.as_os_str().to_string_lossy();
+                let stripped = s.strip_prefix(r"\\?\").unwrap_or(&s);
+                parts.push(stripped.to_owned());
+            }
+        }
+    }
+    if has_root {
+        format!("/{}", parts.join("/"))
+    } else {
+        parts.join("/")
+    }
+}
+
 /// Returns `true` when two normalized storage directory keys are identical OR one is nested
 /// inside the other (`a` vs `a/releases`, `R5-PUB-5`).
 fn storage_paths_overlap(a: &str, b: &str) -> bool {
@@ -3459,6 +3569,22 @@ pub fn sandbox_tree_rejection(raw: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Configured inbound TLS signing-key paths (`server.tls.key`, `site[N].tls.key`).
+#[must_use]
+pub fn split_daemon_signing_keys(cfg: &Config) -> Vec<(String, &str)> {
+    let mut out = Vec::new();
+    if let Some(k) = cfg.server.tls.key.as_deref() {
+        out.push(("server.tls.key".to_owned(), k));
+    }
+    for (i, s) in cfg.sites.iter().enumerate() {
+        if let Some(k) = s.tls.as_ref().and_then(|t| t.key.as_deref()) {
+            out.push((format!("site[{i}].tls.key"), k));
+        }
+    }
+    out.retain(|(_, k)| !k.is_empty());
+    out
 }
 
 /// The header RFC 9110 requires on a response with this status, when a `respond` route cannot

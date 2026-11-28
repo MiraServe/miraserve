@@ -1675,6 +1675,14 @@ impl RunningServer {
 
         let prev_cfg = self.store.snapshot();
 
+        if self.startup_config.server.tls.key_isolation != next_cfg.server.tls.key_isolation {
+            warn!("reload refused: server.tls.key-isolation changed; restart required");
+            return Err(CoreError::RestartRequired(
+                "server.tls.key-isolation changed; restart MiraServe to switch key isolation mode"
+                    .into(),
+            ));
+        }
+
         // R7-SBX-1 & R7-SBX-2 (Reload parity): Run the EXACT SAME docroot confinement checks on
         // reload as at startup — checking against both the previous and next effective ACME dirs,
         // the config directory, TLS keys, publish stores, and symlink targets!

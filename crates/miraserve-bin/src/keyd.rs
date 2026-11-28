@@ -1,5 +1,5 @@
 //! Implementation of `miraserve keyd` — the split-privilege TLS signing daemon
-//! (Threat Model T2: TLS private keys never enter HTTP worker process memory).
+//! (Threat Model T2: the inbound resolver delegates signing to keyd).
 
 use std::io::{self, Write as _};
 use std::path::PathBuf;

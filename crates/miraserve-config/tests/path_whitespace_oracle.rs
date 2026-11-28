@@ -233,11 +233,6 @@ site "spaces.example" {{
     owner-dir "{owner_dir}"
     basic-auth "{users_file}" realm="Members"
     root "/srv/tenants/alice home/public html"
-    tls {{
-        cert "/etc/my certs/alice cert.pem"
-        key "/etc/my keys/alice key.pem"
-        client-ca "/etc/my certs/alice ca.pem"
-    }}
     bot-auth {{
         agent-keys-file "/etc/my bots/agent keys.json"
     }}
@@ -277,6 +272,11 @@ site "spaces.example" {{
     }}
 }}
 site "publish.example" {{
+    tls {{
+        cert "/etc/my certs/alice cert.pem"
+        key "/etc/my keys/alice key.pem"
+        client-ca "/etc/my certs/alice ca.pem"
+    }}
     ai-publish {{
         storage "/srv/publish stores/my site"
         require-signature "ed25519:/etc/my keys/deploy pub.pub"
@@ -1166,11 +1166,6 @@ site \"full.example\" {{\n\
     owner-dir \"{owner_dir}\"\n\
     basic-auth \"{basic_auth}\"\n\
     root \"/srv/www/site\\n\"\n\
-    tls {{\n\
-        cert \"/etc/miraserve/site.crt \"\n\
-        key \" /etc/miraserve/site.key\"\n\
-        client-ca \"/etc/miraserve/site-ca.pem\\r\"\n\
-    }}\n\
     bot-auth {{\n\
         agent-keys-file \" /etc/miraserve/agents.json\"\n\
     }}\n\
@@ -1207,6 +1202,11 @@ site \"full.example\" {{\n\
     }}\n\
 }}\n\
 site \"pub.example\" {{\n\
+    tls {{\n\
+        cert \"/etc/miraserve/site.crt \"\n\
+        key \" /etc/miraserve/site.key\"\n\
+        client-ca \"/etc/miraserve/site-ca.pem\\r\"\n\
+    }}\n\
     ai-publish {{\n\
         storage #\"/srv/publish/app \"#\n\
         require-signature \"ed25519: /etc/miraserve/deploy.pub\"\n\
@@ -1289,76 +1289,76 @@ site \"pub.example\" {{\n\
             (20, 6, "\"/srv/www/site\\n\""),
         ),
         (
-            "site[0].tls.cert",
-            "site.tls 'cert' path on site 'full.example' ends with whitespace (U+0020)",
-            EXPECTED_HELP,
-            (22, 6, "\"/etc/miraserve/site.crt \""),
-        ),
-        (
-            "site[0].tls.key",
-            "site.tls 'key' path on site 'full.example' starts with whitespace (U+0020)",
-            EXPECTED_HELP,
-            (23, 5, "\" /etc/miraserve/site.key\""),
-        ),
-        (
-            "site[0].tls.client-ca",
-            "site.tls 'client-ca' path on site 'full.example' ends with whitespace (U+000D)",
-            EXPECTED_HELP,
-            (24, 11, "\"/etc/miraserve/site-ca.pem\\r\""),
-        ),
-        (
             "site[0].bot-auth.agent-keys-file",
             "bot-auth 'agent-keys-file' path on site 'full.example' starts with whitespace (U+0020)",
             EXPECTED_HELP,
-            (27, 17, "\" /etc/miraserve/agents.json\""),
+            (22, 17, "\" /etc/miraserve/agents.json\""),
         ),
         (
             "site[0].error-pages.page.404",
             "error-pages 'page' 404 path on site 'full.example' ends with whitespace (U+0020)",
             EXPECTED_HELP,
-            (30, 10, "\"errors/404.html \""),
+            (25, 10, "\"errors/404.html \""),
         ),
         (
             "site[0].route[1].root",
             "route 'root' path on route '/bad/*' of site 'full.example' ends with whitespace (U+0020)",
             EXPECTED_HELP,
-            (36, 6, "\"/srv/www/route \""),
+            (31, 6, "\"/srv/www/route \""),
         ),
         (
             "site[0].route[1].fastcgi-pass",
             "'fastcgi-pass' path on route '/bad/*' of site 'full.example' ends with whitespace (U+0020)",
             EXPECTED_HELP,
-            (37, 14, "\"unix:/run/php/fpm.sock \""),
+            (32, 14, "\"unix:/run/php/fpm.sock \""),
         ),
         (
             "site[0].route[2].wasm-plugin",
             "'wasm-plugin' path on route '/wasm/*' of site 'full.example' starts with whitespace (U+0020)",
             EXPECTED_HELP,
-            (40, 13, "\" /opt/plugins/app.wasm\""),
+            (35, 13, "\" /opt/plugins/app.wasm\""),
         ),
         (
             "site[0].route[3].mcp-gateway.jwt-public-key",
             "mcp-gateway 'jwt-public-key' path on route '/mcp/*' of site 'full.example' ends with whitespace (U+0020)",
             EXPECTED_HELP,
-            (44, 16, "\"ed25519:/etc/miraserve/mcp.pub \""),
+            (39, 16, "\"ed25519:/etc/miraserve/mcp.pub \""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.ca-cert",
             "upstream-tls 'ca-cert' path on route '/proxy/*' of site 'full.example' starts with whitespace (U+0020)",
             EXPECTED_HELP,
-            (54, 9, "\" /etc/miraserve/up-ca.pem\""),
+            (49, 9, "\" /etc/miraserve/up-ca.pem\""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.client-cert",
             "upstream-tls 'client-cert' path on route '/proxy/*' of site 'full.example' ends with whitespace (U+0020)",
             EXPECTED_HELP,
-            (55, 13, "\"/etc/miraserve/up-cert.pem \""),
+            (50, 13, "\"/etc/miraserve/up-cert.pem \""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.client-key",
             "upstream-tls 'client-key' path on route '/proxy/*' of site 'full.example' ends with whitespace (U+00A0)",
             EXPECTED_HELP,
-            (56, 12, "\"/etc/miraserve/up-key.pem\\u{00A0}\""),
+            (51, 12, "\"/etc/miraserve/up-key.pem\\u{00A0}\""),
+        ),
+        (
+            "site[1].tls.cert",
+            "site.tls 'cert' path on site 'pub.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (58, 6, "\"/etc/miraserve/site.crt \""),
+        ),
+        (
+            "site[1].tls.key",
+            "site.tls 'key' path on site 'pub.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (59, 5, "\" /etc/miraserve/site.key\""),
+        ),
+        (
+            "site[1].tls.client-ca",
+            "site.tls 'client-ca' path on site 'pub.example' ends with whitespace (U+000D)",
+            EXPECTED_HELP,
+            (60, 11, "\"/etc/miraserve/site-ca.pem\\r\""),
         ),
         (
             "site[1].ai-publish.storage",

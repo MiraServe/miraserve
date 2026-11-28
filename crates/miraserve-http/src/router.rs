@@ -149,12 +149,60 @@ type CredentialInventory = (
     Vec<std::path::PathBuf>,
 );
 
-/// The credential files of `config` (users files, private keys, command-line secrets), held
-/// open, and their identities for static serving to refuse (with
-/// [`miraserve_static::UNIDENTIFIED_CREDENTIAL`] when one exists but cannot be opened).
-/// Every credential file `config` names: users files, the server's and sites' private keys, and
-/// upstream client keys. The server refuses them in static responses and reserves their names in
-/// an ACME challenge directory; `check --fs` reports from the same list.
+#[derive(Default)]
+struct SplitSigningKeys<'a> {
+    paths: Vec<&'a str>,
+    ids: Vec<(u64, u64)>,
+    has_unidentifiable: bool,
+}
+
+impl<'a> SplitSigningKeys<'a> {
+    fn metadata_id(path: &Path) -> Option<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(path)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|m| (m.dev(), m.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    fn from_config(config: &'a Config) -> Self {
+        let mut out = Self::default();
+        if config.server.tls.key_isolation == miraserve_config::KeyIsolation::SplitDaemon {
+            for (_, k) in miraserve_config::split_daemon_signing_keys(config) {
+                out.paths.push(k);
+                if let Some(id) = Self::metadata_id(Path::new(k)) {
+                    out.ids.push(id);
+                } else {
+                    out.has_unidentifiable = true;
+                }
+            }
+        }
+        out
+    }
+
+    fn matches(&self, path: &Path) -> bool {
+        !self.paths.is_empty()
+            && (self.paths.iter().any(|k| Path::new(k) == path)
+                || (!self.ids.is_empty()
+                    && Self::metadata_id(path).is_some_and(|id| self.ids.contains(&id))))
+    }
+}
+
+/// Every credential file path `config` names: users files, the server's and sites' private keys,
+/// and upstream client keys. Returns path names only (it does not open files). The server uses
+/// this list to refuse credentials in static responses and reserve their names in an ACME
+/// challenge directory, and `check --fs` reports from it; opening and retaining handles happens
+/// separately in the credential inventory (which skips configured signing keys and matching
+/// entries in `split-daemon` mode and publishes [`miraserve_static::UNIDENTIFIED_CREDENTIAL`]
+/// when a credential is skipped or cannot be opened).
 #[must_use]
 pub fn configured_credential_paths(config: &Config) -> Vec<std::path::PathBuf> {
     let mut paths: Vec<std::path::PathBuf> = config
@@ -186,6 +234,7 @@ fn credential_inventory(
     config: &Config,
     sources: &CredentialSources,
     read_users_files: Vec<std::fs::File>,
+    split_keys: &SplitSigningKeys<'_>,
 ) -> CredentialInventory {
     let users_files: Vec<std::path::PathBuf> = config
         .sites
@@ -200,13 +249,19 @@ fn credential_inventory(
     for dir in &sources.dirs {
         collect_files(dir, 4, &mut secret_paths);
     }
-    // Each credential is opened once and its handle kept. One that exists but cannot be opened,
+    // Each credential is opened once and its handle kept, except configured signing keys (and
+    // matching entries) skipped in `split-daemon` mode. One that exists but cannot be opened,
     // or whose identity cannot be read, is unidentified: static serving then refuses every
     // multi-linked file instead (it could be an alias).
     let mut unidentified = false;
+    let mut split_skipped = false;
     // The users files as they were read are credentials too, even when replaced since.
     let mut credential_handles = read_users_files;
     for path in &secret_paths {
+        if split_keys.matches(path) {
+            split_skipped = true;
+            continue;
+        }
         match std::fs::File::open(path) {
             Ok(file) => credential_handles.push(file),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -223,7 +278,19 @@ fn credential_inventory(
              files with several hard links are not served until it can"
         );
     }
-    if unidentified {
+    if split_skipped {
+        warn!(
+            "in split-daemon mode the credential inventory skips signing keys; multi-linked \
+             files are refused, the file cache is not used, and on Linux descriptor retention \
+             falls back to a fresh lookup"
+        );
+        let mut all = secret_files.to_vec();
+        all.extend(&split_keys.ids);
+        all.push(miraserve_static::UNIDENTIFIED_CREDENTIAL);
+        all.sort_unstable();
+        all.dedup();
+        secret_files = all.into();
+    } else if unidentified {
         let mut with_marker = secret_files.to_vec();
         with_marker.push(miraserve_static::UNIDENTIFIED_CREDENTIAL);
         secret_files = with_marker.into();
@@ -1699,6 +1766,9 @@ impl CompiledRouter {
         );
         let trusted_proxies = &config.server.limits.trusted_proxies;
         let served_roots = served_document_roots(&config.sites);
+        let is_split =
+            config.server.tls.key_isolation == miraserve_config::KeyIsolation::SplitDaemon;
+        let split_keys = SplitSigningKeys::from_config(config);
         // The server's users files are never served as static content, under any name or link
         // that reaches them (identity checked when a file is opened).
         let (areas, read_users_files) = crate::basic_auth::LoadedAreas::load(
@@ -1707,15 +1777,15 @@ impl CompiledRouter {
                 .iter()
                 // An isolated site answers 503 without its area (kept while it matters).
                 .filter(|site| site.quarantine.is_none())
-                .filter_map(|site| site.basic_auth.as_ref()),
+                .filter_map(|site| site.basic_auth.as_ref())
+                .filter(|auth| !split_keys.matches(Path::new(&auth.users_file))),
             &served_roots,
         );
         let (users_files, credential_handles, secret_files, secret_paths) =
-            credential_inventory(config, credentials, read_users_files);
+            credential_inventory(config, credentials, read_users_files, &split_keys);
         miraserve_static::publish_secret_files(&secret_files);
         let (acme_webroot, acme_reserved) = acme_webroot_with_reserved(config, &secret_paths);
-        let uses_workers = config.server.workers != miraserve_config::Workers::Shared
-            && config.server.tls.key_isolation != miraserve_config::KeyIsolation::SplitDaemon;
+        let uses_workers = config.server.workers != miraserve_config::Workers::Shared && !is_split;
         let proxy_worker_pools = proxy_worker_pool_count(config);
         let uses_h2 =
             config.server.listeners.iter().any(|l| {
@@ -1742,6 +1812,7 @@ impl CompiledRouter {
                     agent_keys,
                     is_reload,
                     probe_root_policy,
+                    is_split.then_some(&split_keys),
                     file_cache.as_ref(),
                 )
             };
@@ -4947,6 +5018,7 @@ fn compile_site(
     runtime_agent_keys: &Arc<AgentKeyRegistry>,
     is_reload: bool,
     probe_root_policy: bool,
+    split_keys: Option<&SplitSigningKeys<'_>>,
     file_cache: Option<&Arc<miraserve_static::FileCache>>,
 ) -> Result<CompiledSite, HttpError> {
     // A quarantined site answers 503 and nothing else: it is compiled from a copy without
@@ -4978,7 +5050,19 @@ fn compile_site(
     };
     // A tenant site whose own certificate pair cannot be loaded is not served under some other
     // certificate: the error makes the caller compile it as a quarantined 503 site.
-    if site.owner_dir.is_some()
+    if split_keys.is_some()
+        && site.owner_dir.is_some()
+        && site.quarantine.is_none()
+        && let Some(t) = &site.tls
+        && (t.cert.is_some() || t.key.is_some())
+    {
+        return Err(HttpError::Router(format!(
+            "site '{}' uses 'owner-dir' with its own TLS pair, unsupported with split-daemon",
+            site.hosts.first().map_or("<site>", String::as_str)
+        )));
+    }
+    if split_keys.is_none()
+        && site.owner_dir.is_some()
         && site.quarantine.is_none()
         && let Some(tls) = &site.tls
         && let (Some(cert), Some(key)) = (&tls.cert, &tls.key)
@@ -5445,6 +5529,7 @@ fn compile_site(
         default_static.as_ref(),
         credential_files,
         secret_files,
+        split_keys,
     );
 
     let default_static_has_script_index = !routed_fastcgi_extensions.is_empty()
@@ -5615,6 +5700,7 @@ fn load_site_error_pages(
     default_static: Option<&StaticServer>,
     credential_files: &[std::path::PathBuf],
     secret_files: &[(u64, u64)],
+    split_keys: Option<&SplitSigningKeys<'_>>,
 ) -> SiteErrorPages {
     let mut compiled = SiteErrorPages::default();
     let Some(cfg) = &site.error_pages else {
@@ -5663,7 +5749,15 @@ fn load_site_error_pages(
                 let page_dir = p.parent().and_then(|d| std::fs::canonicalize(d).ok());
                 !matches!((owner_real, page_dir), (Some(o), Some(d)) if d.starts_with(&o))
             });
-            if outside_owner {
+            if split_keys.is_some_and(|sk| sk.has_unidentifiable) {
+                Err(format!(
+                    "error page '{raw_path}' for status {status} outside site root is refused in split-daemon mode while a configured signing key cannot be identified"
+                ))
+            } else if split_keys.is_some_and(|sk| sk.matches(p)) {
+                Err(format!(
+                    "error page '{raw_path}' for status {status} matches a split-daemon signing key"
+                ))
+            } else if outside_owner {
                 Err(format!(
                     "error page '{raw_path}' for status {status} is outside the site's owner-dir"
                 ))

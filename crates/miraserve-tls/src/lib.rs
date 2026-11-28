@@ -445,8 +445,8 @@ pub fn populate_resolver_from_config_with_keyd_secret(
     dev_tls: bool,
     keyd_auth_secret: Option<[u8; 32]>,
 ) -> Result<Option<GeneratedCertPem>, TlsError> {
-    // Split-privilege mode (Threat Model T2): worker never reads private keys from disk;
-    // all signing is delegated to the isolated `miraserve-keyd` daemon over IPC.
+    // Split-privilege mode (Threat Model T2): the inbound resolver delegates signing to keyd
+    // over IPC.
     if config.server.tls.key_isolation == KeyIsolation::SplitDaemon {
         let socket_spec = config.server.tls.keyd_socket.as_deref().ok_or_else(|| {
             TlsError::KeyLoad(

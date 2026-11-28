@@ -24,9 +24,9 @@ This document defines the assets, trust boundaries, adversary classes, and concr
 [ Untrusted Internet Clients / Bots / Attackers ]
         │
         ▼  TB-1: Network Edge (TCP/UDP, TLS 1.3 + PQC, QUIC anti-amplification)
-[ Sandboxed Worker Process (No Private Keys, Landlock + seccomp, cap-std) ]
+[ Sandboxed Worker Process (Landlock + seccomp, cap-std; optional keyd inbound signing) ]
         │
-        ├──► TB-2: IPC to miraserve-keyd (Restricted Unix socket / named pipe: sign-only API)
+        ├──► TB-2: IPC to miraserve-keyd (Restricted Unix socket / loopback TCP HMAC: public chains + handshake signing)
         ├──► TB-3: WASM Plugin Sandbox (Wasmtime wasi:http: strict fuel + RAM + capability caps)
         ├──► TB-4: Kernel Filesystem Boundary (cap-std / openat2 RESOLVE_BENEATH)
         ├──► TB-5: AI Publish Gate (Ed25519 signature + pre-flight checks -> Atomic Release Swap)
@@ -45,11 +45,11 @@ This document defines the assets, trust boundaries, adversary classes, and concr
   - No OpenSSL C linkage (`cargo-deny` explicitly bans `openssl` / `openssl-sys`); TLS handled by memory-safe `rustls` + `aws-lc-rs`.
   - Continuous `cargo-fuzz` targets on every untrusted parser boundary.
 
-### T2. TLS Private Key Exfiltration (Heartbleed-Class)
-- **Vector:** A vulnerability in a worker, dependency, or extension reads worker heap memory.
-- **Mitigations:**
-  - Split-privilege `miraserve-keyd` mode keeps TLS private keys in a minimal isolated signing daemon; workers implement `rustls::sign::SigningKey` over IPC and never hold raw private key bytes.
-  - Short-lived ACME certificates (6 days) + RFC 9773 ARI minimize blast radius even if a leaf key were ever compromised.
+### T2. Inbound TLS Signing-Key Isolation
+- **Design & Behaviour:**
+  - In split-daemon mode, the worker's TLS set-up (inbound TLS resolver) obtains public certificate chains from `miraserve-keyd` and delegates handshake signatures to it without loading configured signing keys (`server.tls.key`, `site[N].tls.key`), and the worker's credential inventory does not open a configured signing key nor another inventory entry that is the same file by name or, on Unix, by `(device, inode)` read from metadata. Outbound mTLS client keys are loaded by the worker. Reloading the worker refreshes its view of the running `keyd` certificate table.
+  - Naming a signing key also as another file input is a configuration error; load-time `E109` checks are early diagnostics for obvious configuration mistakes only (read/socket/acme-webroot trees and exact lexical collisions with `server.tls.cert`, `site[N].tls.cert`, `server.tls.client-ca`, `site[N].tls.client-ca`, `upstream-tls.ca-cert`, `upstream-tls.client-cert`, `upstream-tls.client-key`, and `basic-auth` users file). Ensuring that the worker account cannot read a signing key at all depends on the key-storage layout in `docs/DEPLOYMENT.md` §2.3; MiraServe does not verify it. Per-tenant TLS key pairs on `owner-dir` sites are rejected at configuration load (`E109`) in this release; tenant sites using the server certificate pair stay available.
+  - In in-process mode, MiraServe can request the CA's `shortlived` profile and use RFC 9773 ARI to schedule renewal.
   - Zeroize secret buffers in memory (`zeroize` crate) on drop.
 
 ### T3. Harvest-Now-Decrypt-Later & SNI Metadata Surveillance

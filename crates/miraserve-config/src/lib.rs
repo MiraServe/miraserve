@@ -32,7 +32,7 @@ pub use store::ConfigStore;
 pub use units::{BindAddr, ByteSize, IpCidr, Protocol, UnitParseError, parse_duration};
 pub use validate::{
     DirPathVerdict, classify_dir_path, is_forbidden_dir_path, normalize_site_host,
-    sandbox_tree_rejection,
+    sandbox_tree_rejection, split_daemon_signing_keys,
 };
 
 /// Result of parsing and validating a configuration document, including the raw source text
