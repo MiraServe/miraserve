@@ -79,8 +79,8 @@ pub(crate) struct CheckArgs {
 
     /// Opt-in Linux-only check (requires `--fs`); its only warning code is `W034`; it also prints
     /// notes. It does not change what the server does (with the flag, the listed path classes are
-    /// walked and `W034` can be reported while existing `--fs` probes still run; nothing else is
-    /// affected by the flag). Walks the
+    /// walked and `W034` can be reported while existing `--fs` probes still run; `W034` counts as
+    /// a warning for `--strict` unless allowed with `--allow-warning W034`). Walks the
     /// directories on the way to covered configured paths and stops at the first component it
     /// reports or does not find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets,
     /// `keyd-socket` (path of the endpoint the server connects to), ACME dir (`--acme-dir` or

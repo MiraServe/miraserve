@@ -133,7 +133,7 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "encryption",
         "writable view",
         "Run as the service account or as root with `server.sandbox.user` set; when no service account is configured, the check trusts the account that runs it (only root when run as root), so run it as the service account.",
-        "with the flag, the listed path classes are walked and `W034` can be reported while existing `--fs` probes still run; nothing else is affected by the flag",
+        "with the flag, the listed path classes are walked and `W034` can be reported while existing `--fs` probes still run; `W034` counts as a warning for `--strict` unless allowed with `--allow-warning W034`",
         "unresponsive",
         "atime",
     ] {
@@ -342,6 +342,20 @@ mod linux_tests {
         Ok(true)
     }
 
+    /// Asserts that both `/` and `/tmp` sit on an accepted non-stacking local POSIX filesystem.
+    /// Used by `#[ignore]`d tests touched in 0.1.8 so they never report success without running.
+    fn assert_local_root_fs() -> TestResult {
+        for p in ["/", "/tmp"] {
+            let m = fs_magic_of(p)?;
+            assert!(
+                is_accepted_local_fs(m),
+                "precondition failed: {p} is on filesystem 0x{m:x} \
+                 (requires an accepted non-stacking local POSIX filesystem such as tmpfs/ext4)"
+            );
+        }
+        Ok(())
+    }
+
     fn expected_default_observer_note() -> String {
         let euid = rustix::process::geteuid().as_raw();
         if euid == 0 {
@@ -415,11 +429,91 @@ mod linux_tests {
     }
 
     #[test]
+    fn linux_narrowed_scope_note_always_emitted_in_json_and_text() -> TestResult {
+        let base = make_temp_base("narrowed-note")?;
+        let (cert, key) = gen_dev_cert(&base)?;
+        let docroot = base.join("www");
+        fs::create_dir_all(&docroot)?;
+        set_mode(&docroot, 0o750)?;
+
+        // Minimal config with no covered path classes: runs on every Linux filesystem (including
+        // overlayfs) and every UID with zero W034 and always reaches the updated narrowed note.
+        let clean_cfg = base.join("clean.kdl");
+        fs::write(
+            &clean_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"tp.example\" {{ root \"{}\" }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+
+        let (code, val) = run_json(&["--fs", "--no-sandbox", "--trusted-paths"], &clean_cfg)?;
+        assert_eq!(code, Some(0), "clean json: {val}");
+        assert_eq!(val.get("valid"), Some(&serde_json::Value::Bool(true)));
+        assert!(w034s(&val).is_empty(), "expected 0 W034, got: {val}");
+        assert_eq!(
+            note_at(&val, 0),
+            Some(expected_default_observer_note().as_str())
+        );
+        assert_eq!(note_at(&val, 1), Some(NARROWED_NOTE_LITERAL));
+
+        let ok_txt = Command::new(miraserve_bin())
+            .args(["check", "--fs", "--no-sandbox", "--trusted-paths"])
+            .arg(&clean_cfg)
+            .output()?;
+        assert_eq!(ok_txt.status.code(), Some(0));
+        let ok_stdout = String::from_utf8(ok_txt.stdout)?;
+        assert!(
+            ok_stdout.contains(&format!("note: {NARROWED_NOTE_LITERAL}\n")),
+            "stdout:\n{ok_stdout}"
+        );
+
+        // Relative FastCGI socket triggers W034 before walking `/`, so failed `--strict` text
+        // output reaches the updated narrowed note on stderr on every Linux filesystem.
+        let rel_cfg = base.join("rel.kdl");
+        fs::write(
+            &rel_cfg,
+            format!(
+                "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+                 site \"tp.example\" {{\n\
+                     root \"{}\"\n\
+                     route \"*.php\" {{ fastcgi-pass \"unix:rel/pool.sock\" }}\n\
+                 }}\n",
+                kdl_escape_path(&cert),
+                kdl_escape_path(&key),
+                kdl_escape_path(&docroot),
+            ),
+        )?;
+        let strict_txt = Command::new(miraserve_bin())
+            .args([
+                "check",
+                "--fs",
+                "--no-sandbox",
+                "--strict",
+                "--trusted-paths",
+            ])
+            .arg(&rel_cfg)
+            .output()?;
+        assert_eq!(strict_txt.status.code(), Some(1));
+        assert_eq!(String::from_utf8(strict_txt.stdout)?, "");
+        let strict_stderr = String::from_utf8(strict_txt.stderr)?;
+        assert!(
+            strict_stderr.contains(&format!("note: {NARROWED_NOTE_LITERAL}\n")),
+            "stderr:\n{strict_stderr}"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires an accepted local POSIX filesystem at / and /tmp (not overlayfs); run with --ignored in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines)]
     fn linux_trusted_chain_all_five_classes_and_narrowed_exclusions() -> TestResult {
-        if !require_local_root_fs("linux_trusted_chain_all_five_classes_and_narrowed_exclusions")? {
-            return Ok(());
-        }
+        assert_local_root_fs()?;
         let base = make_temp_base("clean")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let euid = rustix::process::geteuid().as_raw();
@@ -547,14 +641,11 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires an accepted local POSIX filesystem at / and /tmp (not overlayfs); run with --ignored in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines)]
     fn linux_group_and_other_writable_first_component_strict_allow_and_writable_set() -> TestResult
     {
-        if !require_local_root_fs(
-            "linux_group_and_other_writable_first_component_strict_allow_and_writable_set",
-        )? {
-            return Ok(());
-        }
+        assert_local_root_fs()?;
         let base = make_temp_base("writable")?;
         let (cert, key) = gen_dev_cert(&base)?;
         let euid = rustix::process::geteuid().as_raw();
@@ -2515,20 +2606,15 @@ mod linux_tests {
     }
 
     #[test]
+    #[ignore = "requires non-root (euid != 0) and an accepted local POSIX filesystem at / and /tmp; run with --ignored as uid 1000 in a tmpfs chroot or on a local-fs host"]
     #[allow(clippy::too_many_lines)]
     fn linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified() -> TestResult {
         let euid = rustix::process::geteuid().as_raw();
-        if euid == 0 {
-            eprintln!(
-                "skipping linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified: requires non-root"
-            );
-            return Ok(());
-        }
-        if !require_local_root_fs(
-            "linux_c1_service_uid_mismatch_uses_configured_uid_and_reports_not_verified",
-        )? {
-            return Ok(());
-        }
+        assert_ne!(
+            euid, 0,
+            "precondition failed: requires non-root (euid != 0)"
+        );
+        assert_local_root_fs()?;
 
         let other_uid = if euid == 1000 { 1001 } else { 1000 };
         let base = make_temp_base("c1-mismatch")?;
