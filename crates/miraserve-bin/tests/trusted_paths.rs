@@ -1888,13 +1888,17 @@ mod linux_tests {
         )?;
 
         let (code, val) = run_json_in(&["--fs", "--trusted-paths"], &cfg, Some(&good_cwd))?;
+        // The configuration now fails to load, so `check` exits non-zero.
         assert_eq!(
             code,
             Some(1),
             "leading-space keyd-socket must exit 1: {val}"
         );
+        // The configuration now fails to load, so the report marks it invalid.
         assert_eq!(val.get("valid"), Some(&serde_json::Value::Bool(false)));
+        // The configuration now fails to load, so `--trusted-paths` does not run.
         assert_eq!(w034s(&val).len(), 0, "expected zero W034 on E202: {val}");
+        // The configuration now fails to load with a single E202 load error.
         assert_eq!(
             val.get("errors")
                 .and_then(serde_json::Value::as_array)
@@ -1902,16 +1906,19 @@ mod linux_tests {
             Some(1),
             "expected single E202 error: {val}"
         );
+        // The configuration now fails to load with code E202.
         assert_eq!(
             val.pointer("/errors/0/code")
                 .and_then(serde_json::Value::as_str),
             Some("E202")
         );
+        // The configuration now fails to load on `server.tls.keyd-socket`.
         assert_eq!(
             val.pointer("/errors/0/path")
                 .and_then(serde_json::Value::as_str),
             Some("server.tls.keyd-socket")
         );
+        // The configuration now fails to load naming `keyd-socket` and its whitespace.
         assert_eq!(
             val.pointer("/errors/0/message")
                 .and_then(serde_json::Value::as_str),
@@ -2813,9 +2820,13 @@ mod linux_tests {
             ),
         )?;
         let (p_code, p_val) = run_json(&["--fs", "--trusted-paths"], &padded_cfg)?;
+        // The configuration now fails to load, so `check` exits non-zero.
         assert_eq!(p_code, Some(1), "padded fastcgi-pass must exit 1: {p_val}");
+        // The configuration now fails to load, so the report marks it invalid.
         assert_eq!(p_val.get("valid"), Some(&serde_json::Value::Bool(false)));
+        // The configuration now fails to load, so `--trusted-paths` does not run.
         assert_eq!(w034s(&p_val).len(), 0, "expected 0 W034 on E202: {p_val}");
+        // The configuration now fails to load with two E202 load errors.
         assert_eq!(
             p_val
                 .get("errors")
@@ -2824,18 +2835,21 @@ mod linux_tests {
             Some(2),
             "expected 2 E202 errors: {p_val}"
         );
+        // The configuration now fails to load with E202 on the leading-space route.
         assert_eq!(
             p_val
                 .pointer("/errors/0/code")
                 .and_then(serde_json::Value::as_str),
             Some("E202")
         );
+        // The configuration now fails to load on `site[0].route[0].fastcgi-pass`.
         assert_eq!(
             p_val
                 .pointer("/errors/0/path")
                 .and_then(serde_json::Value::as_str),
             Some("site[0].route[0].fastcgi-pass")
         );
+        // The configuration now fails to load naming `/lead/*` and its leading space.
         assert_eq!(
             p_val
                 .pointer("/errors/0/message")
@@ -2844,18 +2858,21 @@ mod linux_tests {
                 "'fastcgi-pass' path on route '/lead/*' of site 'rt.example' starts with whitespace (U+0020)"
             )
         );
+        // The configuration now fails to load with E202 on the trailing-space route.
         assert_eq!(
             p_val
                 .pointer("/errors/1/code")
                 .and_then(serde_json::Value::as_str),
             Some("E202")
         );
+        // The configuration now fails to load on `site[0].route[1].fastcgi-pass`.
         assert_eq!(
             p_val
                 .pointer("/errors/1/path")
                 .and_then(serde_json::Value::as_str),
             Some("site[0].route[1].fastcgi-pass")
         );
+        // The configuration now fails to load naming `/trail/*` and its trailing space.
         assert_eq!(
             p_val
                 .pointer("/errors/1/message")

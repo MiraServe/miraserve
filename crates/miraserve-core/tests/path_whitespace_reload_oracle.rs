@@ -374,7 +374,8 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
         }
     }
 
-    // Candidate A2: string reload of the same padded candidate is likewise refused.
+    // Candidate A2: string reload of the same padded candidate is likewise refused with the exact
+    // same two E202 diagnostics, and ConfigStore reloads return ConfigError::Validation directly.
     match server.reload_from_str("candidate-padded.kdl", &padded_cand_kdl) {
         Ok(gen_id) => {
             server.shutdown().await;
@@ -389,11 +390,66 @@ async fn security_failed_padded_reload_keeps_old_generation_http_cert_and_publis
                 return Err(format!("expected 2 E202 errors: {errors:#?}").into());
             };
             assert_eq!(a0.code, "E202");
+            assert_eq!(a0.path.as_deref(), Some("site[0].root"));
+            assert_eq!(
+                a0.message,
+                "site 'root' path on site 'static.example' ends with whitespace (U+0020)"
+            );
+            assert_eq!(a0.help.as_deref(), Some(EXPECTED_HELP));
+            assert_eq!(a0.location.map(|l| l.line), Some(9));
             assert_eq!(a1.code, "E202");
+            assert_eq!(a1.path.as_deref(), Some("site[1].ai-publish.storage"));
+            assert_eq!(
+                a1.message,
+                "ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)"
+            );
+            assert_eq!(a1.help.as_deref(), Some(EXPECTED_HELP));
+            assert_eq!(a1.location.map(|l| l.line), Some(13));
         }
         Err(other) => {
             server.shutdown().await;
             return Err(format!("expected CoreError::Config(Validation), got: {other:?}").into());
+        }
+    }
+    match server
+        .config_store()
+        .reload_from_str("candidate-padded.kdl", &padded_cand_kdl)
+    {
+        Err(ConfigError::Validation { errors, .. }) => {
+            let [s0, s1] = errors.as_slice() else {
+                server.shutdown().await;
+                return Err(format!("expected 2 ConfigStore E202 errors: {errors:#?}").into());
+            };
+            assert_eq!(s0.code, "E202");
+            assert_eq!(s0.path.as_deref(), Some("site[0].root"));
+            assert_eq!(s1.code, "E202");
+            assert_eq!(s1.path.as_deref(), Some("site[1].ai-publish.storage"));
+        }
+        other => {
+            server.shutdown().await;
+            return Err(format!(
+                "expected ConfigError::Validation from ConfigStore, got: {other:?}"
+            )
+            .into());
+        }
+    }
+    match server.config_store().reload_from_file(&padded_cand_path) {
+        Err(ConfigError::Validation { errors, .. }) => {
+            let [f0, f1] = errors.as_slice() else {
+                server.shutdown().await;
+                return Err(format!("expected 2 ConfigStore file E202 errors: {errors:#?}").into());
+            };
+            assert_eq!(f0.code, "E202");
+            assert_eq!(f0.path.as_deref(), Some("site[0].root"));
+            assert_eq!(f1.code, "E202");
+            assert_eq!(f1.path.as_deref(), Some("site[1].ai-publish.storage"));
+        }
+        other => {
+            server.shutdown().await;
+            return Err(format!(
+                "expected ConfigError::Validation from ConfigStore file reload, got: {other:?}"
+            )
+            .into());
         }
     }
 

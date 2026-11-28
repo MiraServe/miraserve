@@ -77,59 +77,122 @@ fn expect_validation_errors(
     }
 }
 
-fn assert_exact_issues(errors: &[ConfigIssue], expected: &[(&str, Option<&str>, &str)]) {
+fn offset_for_line_col(source: &str, target_line: usize, target_col: usize) -> Option<usize> {
+    let mut line = 1_usize;
+    let mut col = 1_usize;
+    for (idx, ch) in source.char_indices() {
+        if line == target_line && col == target_col {
+            return Some(idx);
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    if line == target_line && col == target_col {
+        Some(source.len())
+    } else {
+        None
+    }
+}
+
+fn assert_exact_location(
+    source: &str,
+    issue: &ConfigIssue,
+    expected: Option<(usize, usize, &str)>,
+) -> TestResult {
+    match expected {
+        None => {
+            assert_eq!(
+                issue.location, None,
+                "expected no source location on issue: {issue:#?}"
+            );
+        }
+        Some((exp_line, exp_col, exp_slice)) => {
+            let loc = issue
+                .location
+                .ok_or_else(|| format!("expected real source location on issue: {issue:#?}"))?;
+            let exp_offset = offset_for_line_col(source, exp_line, exp_col).ok_or_else(|| {
+                format!("invalid expected line/col ({exp_line}, {exp_col}) for source")
+            })?;
+            assert_eq!(
+                (loc.line, loc.column, loc.offset, loc.length),
+                (exp_line, exp_col, exp_offset, exp_slice.len()),
+                "source location mismatch for issue: {issue:#?}\nactual slice={:?}\nexpected slice={exp_slice:?}",
+                source.get(loc.offset..loc.offset.saturating_add(loc.length)),
+            );
+            assert_eq!(
+                source.get(loc.offset..loc.offset + loc.length),
+                Some(exp_slice),
+                "source slice mismatch for issue: {issue:#?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+type ExpectedIssue<'a> = (
+    &'a str,
+    Option<&'a str>,
+    &'a str,
+    Option<(usize, usize, &'a str)>,
+);
+
+fn assert_exact_issues(
+    source: &str,
+    errors: &[ConfigIssue],
+    expected: &[ExpectedIssue<'_>],
+) -> TestResult {
     let actual: Vec<(&str, Option<&str>, &str)> = errors
         .iter()
         .map(|e| (e.code.as_str(), e.path.as_deref(), e.message.as_str()))
         .collect();
+    let expected_meta: Vec<(&str, Option<&str>, &str)> = expected
+        .iter()
+        .map(|&(code, path, msg, _)| (code, path, msg))
+        .collect();
     assert_eq!(
-        actual, expected,
+        actual, expected_meta,
         "diagnostic list mismatch\nactual={errors:#?}"
     );
-    for issue in errors {
-        let expects_location = issue
-            .path
-            .as_deref()
-            .is_none_or(|p| !p.starts_with("sites."));
-        if expects_location {
-            assert!(
-                issue.location.is_some(),
-                "expected real source location on issue: {issue:#?}"
-            );
-        }
+    for (issue, &(_, _, _, exp_loc)) in errors.iter().zip(expected.iter()) {
+        assert_exact_location(source, issue, exp_loc)?;
     }
+    Ok(())
 }
 
-fn find_single_e202<'a>(
-    errors: &'a [ConfigIssue],
-    expected_path: &str,
-    expected_message: &str,
-    expected_help: &str,
-) -> Result<&'a ConfigIssue, Box<dyn std::error::Error>> {
-    let matching: Vec<&ConfigIssue> = errors
+type ExpectedE202<'a> = (&'a str, &'a str, &'a str, (usize, usize, &'a str));
+
+fn assert_exact_e202s(
+    source: &str,
+    errors: &[ConfigIssue],
+    expected: &[ExpectedE202<'_>],
+) -> TestResult {
+    let actual: Vec<(&str, Option<&str>, &str, Option<&str>)> = errors
         .iter()
-        .filter(|e| e.code == "E202" && e.path.as_deref() == Some(expected_path))
+        .map(|e| {
+            (
+                e.code.as_str(),
+                e.path.as_deref(),
+                e.message.as_str(),
+                e.help.as_deref(),
+            )
+        })
         .collect();
-    let [issue] = matching.as_slice() else {
-        return Err(format!(
-            "expected exactly 1 E202 at '{expected_path}', got errors: {errors:#?}"
-        )
-        .into());
-    };
+    let expected_meta: Vec<(&str, Option<&str>, &str, Option<&str>)> = expected
+        .iter()
+        .map(|&(path, msg, help, _)| ("E202", Some(path), msg, Some(help)))
+        .collect();
     assert_eq!(
-        issue.message, expected_message,
-        "unexpected message for '{expected_path}': {issue:#?}"
+        actual, expected_meta,
+        "ordered E202 list mismatch\nactual={errors:#?}"
     );
-    assert_eq!(
-        issue.help.as_deref(),
-        Some(expected_help),
-        "unexpected help for '{expected_path}': {issue:#?}"
-    );
-    assert!(
-        issue.location.is_some(),
-        "expected a real source location for '{expected_path}': {issue:#?}"
-    );
-    Ok(issue)
+    for (issue, &(_, _, _, exp_loc)) in errors.iter().zip(expected.iter()) {
+        assert_exact_location(source, issue, Some(exp_loc))?;
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -235,7 +298,8 @@ site "publish.example" {{
 
     // Clean absolute path `storage "<dir>/app /."` has no edge whitespace and is NOT rewritten.
     let tmp = TempDir::new("abs-dot")?;
-    let abs_dot_storage = format!("{}/app /.", kdl_escape_path(&tmp.path));
+    let abs_dot_expected = format!("{}/app /.", tmp.path.to_string_lossy());
+    let abs_dot_kdl = format!("{}/app /.", kdl_escape_path(&tmp.path));
     let abs_dot_cfg = tmp.path.join("abs-dot.kdl");
     fs::write(
         &abs_dot_cfg,
@@ -246,7 +310,7 @@ site "publish.example" {{
              }}\n\
              site \"abs-dot.example\" {{\n\
                  ai-publish {{\n\
-                     storage \"{abs_dot_storage}\"\n\
+                     storage \"{abs_dot_kdl}\"\n\
                      require-signature \"ed25519:/etc/miraserve/deploy.pub\"\n\
                  }}\n\
              }}\n"
@@ -260,7 +324,7 @@ site "publish.example" {{
             .first()
             .and_then(|s| s.ai_publish.as_ref())
             .map(|p| p.storage.as_str()),
-        Some(abs_dot_storage.as_str())
+        Some(abs_dot_expected.as_str())
     );
 
     // Windows drive paths with internal spaces (both forward and backslash separators).
@@ -400,25 +464,29 @@ site "pub.example" {
     // 4. Stdin / string parse (no base dir) rejects relative dirs with E202.
     let stdin_errs = expect_validation_errors(parse_kdl_detailed("<stdin>", kdl))?;
     assert_exact_issues(
+        kdl,
         &stdin_errs,
         &[
             (
                 "E202",
                 Some("site[0].root"),
                 "site root path 'public' must be an absolute path",
+                Some((7, 5, "root \"public\"")),
             ),
             (
                 "E202",
                 Some("site[0].route[0].root"),
                 "route root path 'sub dir/assets' must be an absolute path",
+                Some((9, 9, "root \"sub dir/assets\"")),
             ),
             (
                 "E202",
                 Some("site[1].ai-publish.storage"),
                 "ai-publish storage path 'releases' must be an absolute path",
+                Some((15, 9, "storage \"releases\"")),
             ),
         ],
-    );
+    )?;
     Ok(())
 }
 
@@ -509,14 +577,19 @@ site "rba.example" {{
 "#
         );
         let errs = expect_validation_errors(parse_kdl_detailed("rba.kdl", &kdl))?;
+        let route_slice = format!(
+            "route \"/admin/*\" {{\n        basic-auth \"{users_file}\"\n        static {{}}\n    }}"
+        );
         assert_exact_issues(
+            &kdl,
             &errs,
             &[(
                 "E311",
                 Some("site[0].route[0]"),
                 "route '/admin/*' on site 'rba.example': `access` and `basic-auth` are available for a whole site only; move them to the site block",
+                Some((8, 5, route_slice.as_str())),
             )],
-        );
+        )?;
     }
 
     // 1b. Exempt route basic-auth overlapping `acme-webroot` keeps EXACTLY the 441a58d overlap
@@ -540,20 +613,31 @@ site "rba-overlap.example" {
         let overlap_errs =
             expect_validation_errors(parse_kdl_detailed("rba-overlap.kdl", overlap_kdl))?;
         assert_exact_issues(
+            overlap_kdl,
             &overlap_errs,
             &[
                 (
                     "E202",
                     Some("site[0].route[0].basic-auth"),
                     "credential file '/srv/acme/.well-known/acme-challenge/token ' is inside the challenge directory of server.acme-webroot '/srv/acme', whose files are served before any site check; keep credentials elsewhere",
+                    Some((
+                        10,
+                        9,
+                        "basic-auth \"/srv/acme/.well-known/acme-challenge/token \"",
+                    )),
                 ),
                 (
                     "E311",
                     Some("site[0].route[0]"),
                     "route '/admin/*' on site 'rba-overlap.example': `access` and `basic-auth` are available for a whole site only; move them to the site block",
+                    Some((
+                        9,
+                        5,
+                        "route \"/admin/*\" {\n        basic-auth \"/srv/acme/.well-known/acme-challenge/token \"\n        static {}\n    }",
+                    )),
                 ),
             ],
-        );
+        )?;
     }
 
     // 2. Empty values keep their exact full ordered error list (every code, path, message, location).
@@ -605,103 +689,145 @@ site "empty-pub.example" {
 "#;
     let errs = expect_validation_errors(parse_kdl_detailed("empty.kdl", empty_kdl))?;
     assert_exact_issues(
+        empty_kdl,
         &errs,
         &[
-            ("E301", None, "owner-dir '' must be an absolute path"),
+            (
+                "E301",
+                None,
+                "owner-dir '' must be an absolute path",
+                Some((17, 5, "owner-dir \"\"")),
+            ),
             (
                 "E311",
                 None,
                 "basic-auth users file '' must be an absolute path",
+                Some((18, 5, "basic-auth \"\"")),
             ),
-            ("E304", None, "FastCGI Unix socket path must not be empty"),
-            ("E302", None, "route '*.php' does not configure a handler"),
+            (
+                "E304",
+                None,
+                "FastCGI Unix socket path must not be empty",
+                Some((23, 9, "fastcgi-pass \"unix:\"")),
+            ),
+            (
+                "E302",
+                None,
+                "route '*.php' does not configure a handler",
+                Some((
+                    22,
+                    5,
+                    "route \"*.php\" {\n        fastcgi-pass \"unix:\"\n    }",
+                )),
+            ),
             (
                 "E401",
                 None,
                 "require-signature public key path must not be empty",
+                Some((40, 9, "require-signature \"ed25519:\"")),
             ),
             (
                 "E202",
                 Some("server.tls.cert"),
                 "TLS certificate path must not be empty",
+                Some((7, 9, "cert \"\"")),
             ),
             (
                 "E202",
                 Some("server.tls.key"),
                 "TLS private key path must not be empty",
+                Some((8, 9, "key \"\"")),
             ),
             (
                 "E202",
                 Some("server.tls.client-ca"),
                 "mTLS client CA bundle path must not be empty",
+                Some((9, 9, "client-ca \"\"")),
             ),
             (
                 "E202",
                 Some("server.sandbox.read-tree"),
                 "sandbox 'read-tree' path '' is not allowed: it must be an absolute path",
+                Some((12, 9, "read-tree \"\"")),
             ),
             (
                 "E202",
                 Some("server.sandbox.socket-tree"),
                 "sandbox 'socket-tree' path '' is not allowed: it must be an absolute path",
+                Some((13, 9, "socket-tree \"\"")),
             ),
             (
                 "E202",
                 Some("server.allow-docroot[0]"),
                 "server.allow-docroot path must not be empty",
+                Some((5, 5, "allow-docroot \"\"")),
             ),
             (
                 "E202",
                 Some("server.acme-webroot"),
                 "server.acme-webroot path must not be empty",
+                Some((4, 5, "acme-webroot \"\"")),
             ),
             (
                 "E202",
                 Some("site[0].root"),
                 "site root path must not be empty",
+                Some((19, 5, "root \"\"")),
             ),
             (
                 "E202",
                 Some("site[0].bot-auth.agent-keys-file"),
                 "bot-auth agent-keys-file path must not be empty",
+                Some((20, 16, "agent-keys-file \"\" ")),
             ),
             (
                 "E202",
                 Some("site[0].error-pages.page.404"),
                 "error page path must not be empty",
+                Some((21, 19, "page 404 \"\" ")),
             ),
             (
                 "E202",
                 Some("site[0].route[0].wasm-plugin"),
                 "wasm-plugin module path must not be empty",
+                Some((26, 9, "wasm-plugin \"\"")),
             ),
             (
                 "E202",
                 Some("site[0].route[1].mcp-gateway.jwt-public-key"),
                 "mcp-gateway JWT public key path must not be empty",
+                Some((30, 13, "jwt-public-key \"ed25519:\"")),
             ),
             (
                 "E202",
                 Some("site[1].ai-publish.storage"),
                 "ai-publish storage path must not be empty",
+                Some((39, 9, "storage \"\"")),
             ),
             (
                 "E202",
                 Some("site[1].ai-publish.jwt-public-key"),
                 "ai-publish JWT public key path must not be empty",
+                Some((41, 9, "jwt-public-key \"ed25519:\"")),
             ),
             (
                 "E401",
                 Some("site[1].ai-publish.mcp-endpoint"),
                 "ai-publish mcp-endpoint with auth=\"oauth-jwt\" on site 'empty-pub.example' requires 'require-signature' to prevent unsigned bundle deploys",
+                Some((
+                    43,
+                    9,
+                    "mcp-endpoint \"/_miraserve/publish\" auth=\"oauth-jwt\"",
+                )),
             ),
             (
                 "E202",
                 Some("sites.0.root"),
                 "site root '' overlaps ai-publish.storage '' and would expose publish metadata/releases",
+                None,
             ),
         ],
-    );
+    )?;
 
     // 3. Invalid schemes keep their exact full ordered E401 / E403 error list.
     let bad_scheme_kdl = r#"
@@ -729,26 +855,39 @@ site "scheme.example" {
 "#;
     let scheme_errs = expect_validation_errors(parse_kdl_detailed("scheme.kdl", bad_scheme_kdl))?;
     assert_exact_issues(
+        bad_scheme_kdl,
         &scheme_errs,
         &[
-            ("E401", None, "unsupported signature algorithm 'rsa'"),
+            (
+                "E401",
+                None,
+                "unsupported signature algorithm 'rsa'",
+                Some((9, 9, "require-signature \"rsa:/etc/miraserve/deploy.pub \"")),
+            ),
             (
                 "E401",
                 Some("site[0].ai-publish.jwt-public-key"),
                 "invalid ai-publish 'jwt-public-key' format 'rsa:/etc/miraserve/jwt.pub '",
+                Some((10, 9, "jwt-public-key \"rsa:/etc/miraserve/jwt.pub \"")),
             ),
             (
                 "E401",
                 Some("site[0].ai-publish.mcp-endpoint"),
                 "ai-publish mcp-endpoint with auth=\"oauth-jwt\" on site 'scheme.example' requires 'require-signature' to prevent unsigned bundle deploys",
+                Some((
+                    12,
+                    9,
+                    "mcp-endpoint \"/_miraserve/publish\" auth=\"oauth-jwt\"",
+                )),
             ),
             (
                 "E403",
                 Some("site[0].route[0].mcp-gateway.jwt-public-key"),
                 "invalid mcp-gateway 'jwt-public-key' format 'rsa:/etc/miraserve/mcp.pub '",
+                Some((16, 13, "jwt-public-key \"rsa:/etc/miraserve/mcp.pub \"")),
             ),
         ],
-    );
+    )?;
 
     // 4. Keyd TCP grammar and FastCGI TCP keep their exact full ordered error list.
     let keyd_tcp_space = r#"
@@ -770,21 +909,33 @@ site "tcp.example" {
 "#;
     let tcp_errs = expect_validation_errors(parse_kdl_detailed("tcp.kdl", keyd_tcp_space))?;
     assert_exact_issues(
+        keyd_tcp_space,
         &tcp_errs,
         &[
             (
                 "E304",
                 None,
                 "invalid FastCGI port in 'tcp://127.0.0.1:9000 '",
+                Some((14, 9, "fastcgi-pass \"tcp://127.0.0.1:9000 \"")),
             ),
-            ("E302", None, "route '*.php' does not configure a handler"),
+            (
+                "E302",
+                None,
+                "route '*.php' does not configure a handler",
+                Some((
+                    13,
+                    5,
+                    "route \"*.php\" {\n        fastcgi-pass \"tcp://127.0.0.1:9000 \"\n    }",
+                )),
+            ),
             (
                 "E105",
                 Some("server.tls.keyd-socket"),
                 "invalid 'keyd-socket' TCP address 'tcp:// 127.0.0.1:9444'",
+                Some((6, 9, "keyd-socket \"tcp:// 127.0.0.1:9444\"")),
             ),
         ],
-    );
+    )?;
 
     // 5. Keyd non-loopback and zero-port TCP checks unchanged.
     for (bad_tcp, expected_msg) in [
@@ -812,10 +963,17 @@ site "loopback.example" {{ root "/srv/www/lb" }}
 "#
         );
         let errs = expect_validation_errors(parse_kdl_detailed("lb.kdl", &kdl))?;
+        let slice = format!("keyd-socket \"{bad_tcp}\"");
         assert_exact_issues(
+            &kdl,
             &errs,
-            &[("E105", Some("server.tls.keyd-socket"), expected_msg)],
-        );
+            &[(
+                "E105",
+                Some("server.tls.keyd-socket"),
+                expected_msg,
+                Some((6, 9, slice.as_str())),
+            )],
+        )?;
     }
 
     // 6. Missing cert/key pairs keep exact ordered E105 codes, paths, messages, and locations.
@@ -837,25 +995,33 @@ site "pair.example" {
 "#;
     let pair_errs = expect_validation_errors(parse_kdl_detailed("pair.kdl", pair_kdl))?;
     assert_exact_issues(
+        pair_kdl,
         &pair_errs,
         &[
             (
                 "E105",
                 Some("server.tls"),
                 "TLS certificate configured without a matching private key",
+                Some((4, 5, "tls { cert \"/etc/miraserve/a.crt\" }")),
             ),
             (
                 "E105",
                 Some("site[0].tls"),
                 "TLS private key configured without a matching certificate",
+                Some((8, 5, "tls { key \"/etc/miraserve/s.key\" }")),
             ),
             (
                 "E105",
                 Some("site[0].route[0].reverse-proxy.upstream-tls"),
                 "TLS certificate configured without a matching private key",
+                Some((
+                    12,
+                    13,
+                    "upstream-tls { client-cert \"/etc/miraserve/c.crt\" }",
+                )),
             ),
         ],
-    );
+    )?;
     Ok(())
 }
 
@@ -947,154 +1113,170 @@ site \"pub.example\" {{\n\
 
     let errs = expect_validation_errors(parse_kdl_detailed("matrix.kdl", &kdl))?;
 
-    let expected: &[(&str, &str)] = &[
+    let owner_dir_lit = format!("\"{owner_dir}\"");
+    let basic_auth_lit = format!("\"{basic_auth}\"");
+    let expected: &[ExpectedE202<'_>] = &[
         (
             "server.acme-webroot",
             "server.acme-webroot path ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (3, 14, "\"/srv/acme \""),
         ),
         (
             "server.allow-docroot[1]",
             "server.allow-docroot path starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (4, 29, "\" /var/lib/bad\""),
         ),
         (
             "server.tls.keyd-socket",
             "server.tls 'keyd-socket' path ends with whitespace (U+0009)",
+            EXPECTED_HELP,
+            (7, 13, "\"/run/miraserve-keyd/keyd.sock\\t\""),
         ),
         (
             "server.tls.cert",
             "server.tls 'cert' path starts with whitespace (U+00A0)",
+            EXPECTED_HELP,
+            (8, 6, "\"\\u{00A0}/etc/miraserve/server.crt\""),
         ),
         (
             "server.tls.key",
             "server.tls 'key' path ends with whitespace (U+3000)",
+            EXPECTED_HELP,
+            (9, 5, "\"/etc/miraserve/server.key\\u{3000}\""),
         ),
         (
             "server.tls.client-ca",
             "server.tls 'client-ca' path starts and ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (10, 11, "\" /etc/miraserve/ca.pem \""),
         ),
         (
             "server.sandbox.read-tree",
             "sandbox 'read-tree' path ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (13, 19, "\"/var/www \""),
         ),
         (
             "server.sandbox.socket-tree",
             "sandbox 'socket-tree' path ends with whitespace (U+00A0)",
+            EXPECTED_HELP,
+            (14, 24, "\"/run/php-bad\\u{00A0}\""),
         ),
         (
             "site[0].owner-dir",
             "'owner-dir' path on site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (18, 11, owner_dir_lit.as_str()),
         ),
         (
             "site[0].basic-auth",
             "'basic-auth' path on site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (19, 12, basic_auth_lit.as_str()),
         ),
         (
             "site[0].root",
             "site 'root' path on site 'full.example' ends with whitespace (U+000A)",
+            EXPECTED_HELP,
+            (20, 6, "\"/srv/www/site\\n\""),
         ),
         (
             "site[0].tls.cert",
             "site.tls 'cert' path on site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (22, 6, "\"/etc/miraserve/site.crt \""),
         ),
         (
             "site[0].tls.key",
             "site.tls 'key' path on site 'full.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (23, 5, "\" /etc/miraserve/site.key\""),
         ),
         (
             "site[0].tls.client-ca",
             "site.tls 'client-ca' path on site 'full.example' ends with whitespace (U+000D)",
+            EXPECTED_HELP,
+            (24, 11, "\"/etc/miraserve/site-ca.pem\\r\""),
         ),
         (
             "site[0].bot-auth.agent-keys-file",
             "bot-auth 'agent-keys-file' path on site 'full.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (27, 17, "\" /etc/miraserve/agents.json\""),
         ),
         (
             "site[0].error-pages.page.404",
             "error-pages 'page' 404 path on site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (30, 10, "\"errors/404.html \""),
         ),
         (
             "site[0].route[1].root",
             "route 'root' path on route '/bad/*' of site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (36, 6, "\"/srv/www/route \""),
         ),
         (
             "site[0].route[1].fastcgi-pass",
             "'fastcgi-pass' path on route '/bad/*' of site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (37, 14, "\"unix:/run/php/fpm.sock \""),
         ),
         (
             "site[0].route[2].wasm-plugin",
             "'wasm-plugin' path on route '/wasm/*' of site 'full.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (40, 13, "\" /opt/plugins/app.wasm\""),
         ),
         (
             "site[0].route[3].mcp-gateway.jwt-public-key",
             "mcp-gateway 'jwt-public-key' path on route '/mcp/*' of site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (44, 16, "\"ed25519:/etc/miraserve/mcp.pub \""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.ca-cert",
             "upstream-tls 'ca-cert' path on route '/proxy/*' of site 'full.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (54, 9, "\" /etc/miraserve/up-ca.pem\""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.client-cert",
             "upstream-tls 'client-cert' path on route '/proxy/*' of site 'full.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (55, 13, "\"/etc/miraserve/up-cert.pem \""),
         ),
         (
             "site[0].route[4].reverse-proxy.upstream-tls.client-key",
             "upstream-tls 'client-key' path on route '/proxy/*' of site 'full.example' ends with whitespace (U+00A0)",
+            EXPECTED_HELP,
+            (56, 12, "\"/etc/miraserve/up-key.pem\\u{00A0}\""),
         ),
         (
             "site[1].ai-publish.storage",
             "ai-publish 'storage' path on site 'pub.example' ends with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (63, 9, "#\"/srv/publish/app \"#"),
         ),
         (
             "site[1].ai-publish.require-signature",
             "ai-publish 'require-signature' path on site 'pub.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (64, 19, "\"ed25519: /etc/miraserve/deploy.pub\""),
         ),
         (
             "site[1].ai-publish.jwt-public-key",
             "ai-publish 'jwt-public-key' path on site 'pub.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (65, 16, "\"ed25519: /etc/miraserve/jwt.pub\""),
         ),
     ];
 
-    assert_eq!(
-        errs.len(),
-        expected.len(),
-        "expected ONLY the {} E202 errors with zero secondary/spurious errors, got {} errors:\n{errs:#?}",
-        expected.len(),
-        errs.len()
-    );
-
-    for &(path, msg) in expected {
-        let issue = find_single_e202(&errs, path, msg, EXPECTED_HELP)?;
-        // Specifically assert that list-valued directives locate the 2nd (offending) argument,
-        // not column 5/9 of the directive name.
-        if path == "server.allow-docroot[1]" {
-            let loc = issue.location.ok_or("missing location")?;
-            assert_eq!(loc.line, 4);
-            assert_eq!(
-                loc.column, 29,
-                "allow-docroot[1] must point to 2nd arg: {loc:?}"
-            );
-            assert_eq!(
-                kdl.get(loc.offset..loc.offset + loc.length),
-                Some("\" /var/lib/bad\"")
-            );
-        } else if path == "server.sandbox.read-tree" {
-            let loc = issue.location.ok_or("missing location")?;
-            assert_eq!(loc.line, 13);
-            assert_eq!(loc.column, 19, "read-tree must point to 2nd arg: {loc:?}");
-            assert_eq!(
-                kdl.get(loc.offset..loc.offset + loc.length),
-                Some("\"/var/www \"")
-            );
-        } else if path == "server.sandbox.socket-tree" {
-            let loc = issue.location.ok_or("missing location")?;
-            assert_eq!(loc.line, 14);
-            assert_eq!(loc.column, 24, "socket-tree must point to 2nd arg: {loc:?}");
-            assert_eq!(
-                kdl.get(loc.offset..loc.offset + loc.length),
-                Some("\"/run/php-bad\\u{00A0}\"")
-            );
-        }
-    }
+    // Pin exact emission order, code, path, message, help, and exact (line, col, offset, length)
+    // across all 26 host-filesystem directives.
+    assert_exact_e202s(&kdl, &errs, expected)?;
 
     // 2. Additional prefixed-form variants:
     //    - keyd-socket spellings that were accepted on 441a58d emit a single E202.
@@ -1125,10 +1307,17 @@ site \"pub.example\" {{\n\
              site \"k.example\" {{ root \"/srv/www/k\" }}\n"
         );
         let e = expect_validation_errors(parse_kdl_detailed("keyd.kdl", &k))?;
+        let lit = format!("\"{val}\"");
         assert_exact_issues(
+            &k,
             &e,
-            &[("E202", Some("server.tls.keyd-socket"), expected_msg)],
-        );
+            &[(
+                "E202",
+                Some("server.tls.keyd-socket"),
+                expected_msg,
+                Some((5, 13, lit.as_str())),
+            )],
+        )?;
     }
 
     //    - fastcgi-pass unix: inner leading space after unix: emits a single E202.
@@ -1143,13 +1332,15 @@ site \"pub.example\" {{\n\
              }\n";
         let e = expect_validation_errors(parse_kdl_detailed("fcgi.kdl", k))?;
         assert_exact_issues(
+            k,
             &e,
             &[(
                 "E202",
                 Some("site[0].route[0].fastcgi-pass"),
                 "'fastcgi-pass' path on route '*.php' of site 'f.example' starts with whitespace (U+0020)",
+                Some((7, 30, "\"unix: /run/php/fpm.sock\"")),
             )],
-        );
+        )?;
     }
 
     //    - require-signature & jwt-public-key trailing / inner space after ed25519:.
@@ -1169,20 +1360,23 @@ site \"pub.example\" {{\n\
              }\n";
         let e = expect_validation_errors(parse_kdl_detailed("pub-tags.kdl", k))?;
         assert_exact_issues(
+            k,
             &e,
             &[
                 (
                     "E202",
                     Some("site[0].ai-publish.require-signature"),
                     "ai-publish 'require-signature' path on site 'p.example' ends with whitespace (U+0020)",
+                    Some((8, 19, "\"ed25519:/etc/miraserve/d.pub \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].ai-publish.jwt-public-key"),
                     "ai-publish 'jwt-public-key' path on site 'p.example' ends with whitespace (U+0020)",
+                    Some((9, 16, "\"ed25519:/etc/miraserve/j.pub \"")),
                 ),
             ],
-        );
+        )?;
     }
 
     //    - mcp-gateway jwt-public-key inner space after ed25519:.
@@ -1203,16 +1397,21 @@ site \"pub.example\" {{\n\
              }\n";
         let e = expect_validation_errors(parse_kdl_detailed("mcp-tag.kdl", k))?;
         assert_exact_issues(
+            k,
             &e,
             &[(
                 "E202",
                 Some("site[0].route[0].mcp-gateway.jwt-public-key"),
                 "mcp-gateway 'jwt-public-key' path on route '/mcp/*' of site 'm.example' starts with whitespace (U+0020)",
+                Some((8, 16, "\"ed25519: /etc/miraserve/m.pub\"")),
             )],
-        );
+        )?;
     }
 
-    // 3. All 6 representative Unicode whitespace classes at leading, trailing, and both edges.
+    // 3. All 6 representative Unicode whitespace classes at leading, trailing, and both edges,
+    //    exercised across all 5 distinct parser helper families (single-string `site.root`,
+    //    list `server.allow-docroot`, `server.tls.keyd-socket`, `ed25519:` `require-signature`,
+    //    and `unix:` `fastcgi-pass`).
     for (kdl_ws, codepoint) in [
         (" ", "U+0020"),
         ("\\t", "U+0009"),
@@ -1221,30 +1420,94 @@ site \"pub.example\" {{\n\
         ("\\u{00A0}", "U+00A0"),
         ("\\u{3000}", "U+3000"),
     ] {
-        for (val, expected_reason) in [
+        for (lead, trail, expected_reason) in [
+            (kdl_ws, "", format!("starts with whitespace ({codepoint})")),
+            ("", kdl_ws, format!("ends with whitespace ({codepoint})")),
             (
-                format!("{kdl_ws}/srv/www/ws"),
-                format!("starts with whitespace ({codepoint})"),
-            ),
-            (
-                format!("/srv/www/ws{kdl_ws}"),
-                format!("ends with whitespace ({codepoint})"),
-            ),
-            (
-                format!("{kdl_ws}/srv/www/ws{kdl_ws}"),
+                kdl_ws,
+                kdl_ws,
                 format!("starts and ends with whitespace ({codepoint})"),
             ),
         ] {
+            let root_val = format!("{lead}/srv/www/ws{trail}");
+            let allow_val = format!("{lead}/var/lib/ws{trail}");
+            let keyd_val = format!("{lead}/run/miraserve-keyd/ws.sock{trail}");
+            let sig_val = format!("ed25519:{lead}/etc/miraserve/ws.pub{trail}");
+            let fcgi_val = format!("unix:{lead}/run/php/ws.sock{trail}");
+
             let k = format!(
                 "server {{\n\
-                     listen \":443\"\n\
-                     tls {{ cert \"/etc/miraserve/a.crt\"; key \"/etc/miraserve/a.key\" }}\n\
+                 listen \":443\"\n\
+                 allow-docroot \"/var/lib/ok\" \"{allow_val}\"\n\
+                 tls {{\n\
+                 key-isolation \"split-daemon\"\n\
+                 keyd-socket \"{keyd_val}\"\n\
+                 cert \"/etc/miraserve/a.crt\"\n\
+                 key \"/etc/miraserve/a.key\"\n\
                  }}\n\
-                 site \"ws.example\" {{ root \"{val}\" }}\n"
+                 }}\n\
+                 site \"ws.example\" {{\n\
+                 root \"{root_val}\"\n\
+                 route \"*.php\" {{ fastcgi-pass \"{fcgi_val}\" }}\n\
+                 }}\n\
+                 site \"wspub.example\" {{\n\
+                 ai-publish {{\n\
+                 storage \"/srv/publish/ws\"\n\
+                 require-signature \"{sig_val}\"\n\
+                 }}\n\
+                 }}\n"
             );
-            let e = expect_validation_errors(parse_kdl_detailed("ws.kdl", &k))?;
-            let expected_msg = format!("site 'root' path on site 'ws.example' {expected_reason}");
-            assert_exact_issues(&e, &[("E202", Some("site[0].root"), &expected_msg)]);
+            let e = expect_validation_errors(parse_kdl_detailed("ws-all-helpers.kdl", &k))?;
+            let allow_lit = format!("\"{allow_val}\"");
+            let keyd_lit = format!("\"{keyd_val}\"");
+            let root_lit = format!("\"{root_val}\"");
+            let fcgi_lit = format!("\"{fcgi_val}\"");
+            let sig_lit = format!("\"{sig_val}\"");
+            let allow_msg = format!("server.allow-docroot path {expected_reason}");
+            let keyd_msg = format!("server.tls 'keyd-socket' path {expected_reason}");
+            let root_msg = format!("site 'root' path on site 'ws.example' {expected_reason}");
+            let fcgi_msg = format!(
+                "'fastcgi-pass' path on route '*.php' of site 'ws.example' {expected_reason}"
+            );
+            let sig_msg = format!(
+                "ai-publish 'require-signature' path on site 'wspub.example' {expected_reason}"
+            );
+            assert_exact_e202s(
+                &k,
+                &e,
+                &[
+                    (
+                        "server.allow-docroot[1]",
+                        &allow_msg,
+                        EXPECTED_HELP,
+                        (3, 29, allow_lit.as_str()),
+                    ),
+                    (
+                        "server.tls.keyd-socket",
+                        &keyd_msg,
+                        EXPECTED_HELP,
+                        (6, 13, keyd_lit.as_str()),
+                    ),
+                    (
+                        "site[0].root",
+                        &root_msg,
+                        EXPECTED_HELP,
+                        (12, 6, root_lit.as_str()),
+                    ),
+                    (
+                        "site[0].route[0].fastcgi-pass",
+                        &fcgi_msg,
+                        EXPECTED_HELP,
+                        (13, 30, fcgi_lit.as_str()),
+                    ),
+                    (
+                        "site[1].ai-publish.require-signature",
+                        &sig_msg,
+                        EXPECTED_HELP,
+                        (18, 19, sig_lit.as_str()),
+                    ),
+                ],
+            )?;
         }
     }
     // Distinct leading and trailing whitespace code points.
@@ -1256,13 +1519,15 @@ site \"pub.example\" {{\n\
              site \"ws.example\" { root \"\\t/srv/www/ws\\u{00A0}\" }\n";
         let e = expect_validation_errors(parse_kdl_detailed("ws-both.kdl", k))?;
         assert_exact_issues(
+            k,
             &e,
             &[(
                 "E202",
                 Some("site[0].root"),
                 "site 'root' path on site 'ws.example' starts with whitespace (U+0009) and ends with whitespace (U+00A0)",
+                Some((5, 26, "\"\\t/srv/www/ws\\u{00A0}\"")),
             )],
-        );
+        )?;
     }
 
     // 4. KDL v2 multiline string with trailing whitespace on path value.
@@ -1277,13 +1542,15 @@ site \"ml.example\" {\n\
 }\n";
     let ml_errs = expect_validation_errors(parse_kdl_detailed("ml.kdl", multiline_kdl))?;
     assert_exact_issues(
+        multiline_kdl,
         &ml_errs,
         &[(
             "E202",
             Some("site[0].root"),
             "site 'root' path on site 'ml.example' ends with whitespace (U+0020)",
+            Some((6, 6, "\"\"\"\n/srv/www/ml \n\"\"\"")),
         )],
-    );
+    )?;
 
     Ok(())
 }
@@ -1319,25 +1586,29 @@ site "padded-pub.example" {
     fs::write(&padded_cfg, padded_rel_kdl)?;
     let padded_errs = expect_validation_errors(load_file_detailed(&padded_cfg))?;
     assert_exact_issues(
+        padded_rel_kdl,
         &padded_errs,
         &[
             (
                 "E202",
                 Some("site[0].root"),
                 "site 'root' path on site 'padded-rel.example' starts and ends with whitespace (U+0020)",
+                Some((7, 10, "\" public \"")),
             ),
             (
                 "E202",
                 Some("site[0].route[0].root"),
                 "route 'root' path on route '/sub/*' of site 'padded-rel.example' starts with whitespace (U+0020)",
+                Some((9, 14, "\" sub\"")),
             ),
             (
                 "E202",
                 Some("site[1].ai-publish.storage"),
                 "ai-publish 'storage' path on site 'padded-pub.example' starts and ends with whitespace (U+0020)",
+                Some((15, 17, "\" releases \"")),
             ),
         ],
-    );
+    )?;
 
     // 2. Resolved-directory check: source strings have NO edge whitespace, but dropping trailing
     //    `.` / `/` / `\` exposes terminal whitespace in the resolved directory name, with
@@ -1368,34 +1639,35 @@ site \"res-nbsp.example\" {\n\
     let res_cfg = base_dir.join("resolved-ws.kdl");
     fs::write(&res_cfg, resolved_ws_kdl)?;
     let res_errs = expect_validation_errors(load_file_detailed(&res_cfg))?;
-    assert_eq!(
-        res_errs.len(),
-        4,
-        "expected 4 resolved-dir E202s with zero secondary errors: {res_errs:#?}"
-    );
-    find_single_e202(
+    assert_exact_e202s(
+        resolved_ws_kdl,
         &res_errs,
-        "site[0].root",
-        "site 'root' resolved directory name on site 'res-root.example' ends with whitespace (U+0020)",
-        EXPECTED_RESOLVED_HELP,
-    )?;
-    find_single_e202(
-        &res_errs,
-        "site[0].route[0].root",
-        "route 'root' resolved directory name on route '/sub/*' of site 'res-root.example' ends with whitespace (U+0020)",
-        EXPECTED_RESOLVED_HELP,
-    )?;
-    find_single_e202(
-        &res_errs,
-        "site[1].ai-publish.storage",
-        "ai-publish 'storage' resolved directory name on site 'res-pub.example' ends with whitespace (U+0020)",
-        EXPECTED_RESOLVED_HELP,
-    )?;
-    find_single_e202(
-        &res_errs,
-        "site[2].ai-publish.storage",
-        "ai-publish 'storage' resolved directory name on site 'res-nbsp.example' ends with whitespace (U+00A0)",
-        EXPECTED_RESOLVED_HELP,
+        &[
+            (
+                "site[0].root",
+                "site 'root' resolved directory name on site 'res-root.example' ends with whitespace (U+0020)",
+                EXPECTED_RESOLVED_HELP,
+                (6, 1, "root \"pub /.\""),
+            ),
+            (
+                "site[0].route[0].root",
+                "route 'root' resolved directory name on route '/sub/*' of site 'res-root.example' ends with whitespace (U+0020)",
+                EXPECTED_RESOLVED_HELP,
+                (8, 1, "root \"sub /\""),
+            ),
+            (
+                "site[1].ai-publish.storage",
+                "ai-publish 'storage' resolved directory name on site 'res-pub.example' ends with whitespace (U+0020)",
+                EXPECTED_RESOLVED_HELP,
+                (14, 1, "storage \"app /.\""),
+            ),
+            (
+                "site[2].ai-publish.storage",
+                "ai-publish 'storage' resolved directory name on site 'res-nbsp.example' ends with whitespace (U+00A0)",
+                EXPECTED_RESOLVED_HELP,
+                (20, 1, "storage \"app2\\u{00A0}/.\""),
+            ),
+        ],
     )?;
 
     // 3. Windows backslash separator exposing terminal whitespace against explicit Windows base.
@@ -1413,15 +1685,19 @@ site "win-res.example" {
         win_res_kdl,
         Some(Path::new(r"C:\srv\app")),
     ))?;
-    assert_eq!(win_res_errs.len(), 1, "expected 1 E202: {win_res_errs:#?}");
-    find_single_e202(
+    assert_exact_e202s(
+        win_res_kdl,
         &win_res_errs,
-        "site[0].root",
-        "site 'root' resolved directory name on site 'win-res.example' ends with whitespace (U+0020)",
-        EXPECTED_RESOLVED_HELP,
+        &[(
+            "site[0].root",
+            "site 'root' resolved directory name on site 'win-res.example' ends with whitespace (U+0020)",
+            EXPECTED_RESOLVED_HELP,
+            (7, 5, "root \"pub \\\\\""),
+        )],
     )?;
 
     // 4. File-backed absolute path with leading whitespace is rejected with E202.
+    let lead_tmp_esc = kdl_escape_path(&tmp.path);
     let lead_abs_kdl = format!(
         "server {{\n\
              listen \":443\"\n\
@@ -1429,21 +1705,24 @@ site "win-res.example" {
          }}\n\
          site \"lead.example\" {{\n\
              ai-publish {{\n\
-                 storage \" {}/releases/app\"\n\
+                 storage \" {lead_tmp_esc}/releases/app\"\n\
                  require-signature \"ed25519:/etc/miraserve/deploy.pub\"\n\
              }}\n\
-         }}\n",
-        kdl_escape_path(&tmp.path)
+         }}\n"
     );
     let lead_cfg = base_dir.join("lead-abs.kdl");
-    fs::write(&lead_cfg, lead_abs_kdl)?;
+    fs::write(&lead_cfg, &lead_abs_kdl)?;
     let lead_errs = expect_validation_errors(load_file_detailed(&lead_cfg))?;
-    assert_eq!(lead_errs.len(), 1, "expected 1 E202: {lead_errs:#?}");
-    find_single_e202(
+    let lead_lit = format!("\" {lead_tmp_esc}/releases/app\"");
+    assert_exact_e202s(
+        &lead_abs_kdl,
         &lead_errs,
-        "site[0].ai-publish.storage",
-        "ai-publish 'storage' path on site 'lead.example' starts with whitespace (U+0020)",
-        EXPECTED_HELP,
+        &[(
+            "site[0].ai-publish.storage",
+            "ai-publish 'storage' path on site 'lead.example' starts with whitespace (U+0020)",
+            EXPECTED_HELP,
+            (7, 9, lead_lit.as_str()),
+        )],
     )?;
 
     Ok(())
@@ -1462,20 +1741,23 @@ site "pair-ws.example" {
 "#;
     let errs = expect_validation_errors(parse_kdl_detailed("pair-ws.kdl", kdl))?;
     assert_exact_issues(
+        kdl,
         &errs,
         &[
             (
                 "E202",
                 Some("server.tls.cert"),
                 "server.tls 'cert' path ends with whitespace (U+0020)",
+                Some((4, 16, "\"/etc/miraserve/a.crt \"")),
             ),
             (
                 "E105",
                 Some("server.tls"),
                 "TLS certificate configured without a matching private key",
+                Some((4, 5, "tls { cert \"/etc/miraserve/a.crt \" }")),
             ),
         ],
-    );
+    )?;
     Ok(())
 }
 
@@ -1485,6 +1767,7 @@ fn reject_no_early_return_preserves_all_existing_diagnostics_across_all_families
     // 1. Audit P1 #2 literal example 1: padded site `basic-auth` with empty `realm=""` must emit
     //    the new E202 AND preserve the existing E311 for the empty realm.
     let users_padded = format!("{} ", native_abs("/srv/auth/users"));
+    let users_padded_lit = format!("\"{users_padded}\"");
     {
         let kdl = format!(
             r#"
@@ -1499,21 +1782,25 @@ site "auth-realm.example" {{
 "#
         );
         let errs = expect_validation_errors(parse_kdl_detailed("auth-realm.kdl", &kdl))?;
+        let realm_col = 16 + users_padded_lit.len() + 1;
         assert_exact_issues(
+            &kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].basic-auth"),
                     "'basic-auth' path on site 'auth-realm.example' ends with whitespace (U+0020)",
+                    Some((8, 16, users_padded_lit.as_str())),
                 ),
                 (
                     "E311",
                     None,
                     "basic-auth realm must be 1-128 characters without quotes, backslashes or control characters",
+                    Some((8, realm_col, "realm=\"\"")),
                 ),
             ],
-        );
+        )?;
     }
 
     // 2. Audit P1 #2 literal example 2: padded site `basic-auth` with unknown property `typo="x"`
@@ -1532,17 +1819,25 @@ site "auth-prop.example" {{
 "#
         );
         let errs = expect_validation_errors(parse_kdl_detailed("auth-prop.kdl", &kdl))?;
+        let prop_col = 16 + users_padded_lit.len() + 1;
         assert_exact_issues(
+            &kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].basic-auth"),
                     "'basic-auth' path on site 'auth-prop.example' ends with whitespace (U+0020)",
+                    Some((8, 16, users_padded_lit.as_str())),
                 ),
-                ("E003", None, "unknown property 'typo' on 'basic-auth'"),
+                (
+                    "E003",
+                    None,
+                    "unknown property 'typo' on 'basic-auth'",
+                    Some((8, prop_col, "typo=\"x\"")),
+                ),
             ],
-        );
+        )?;
     }
 
     // 3. Multi-error test per server directive family:
@@ -1573,82 +1868,111 @@ site "srv-multi.example" {
 "#;
         let errs = expect_validation_errors(parse_kdl_detailed("srv-multi.kdl", kdl))?;
         assert_exact_issues(
+            kdl,
             &errs,
             &[
                 (
                     "E003",
                     None,
                     "unexpected property 'extra' on 'acme-webroot'",
+                    Some((4, 26, "extra=\"x\"")),
                 ),
                 (
                     "E202",
                     Some("server.acme-webroot"),
                     "server.acme-webroot path ends with whitespace (U+0020)",
+                    Some((4, 18, "\"/etc \"")),
                 ),
                 (
                     "E003",
                     None,
                     "unexpected property 'extra' on 'allow-docroot'",
+                    Some((5, 27, "extra=\"y\"")),
                 ),
                 (
                     "E202",
                     Some("server.allow-docroot[0]"),
                     "server.allow-docroot path ends with whitespace (U+0020)",
+                    Some((5, 19, "\"/etc \"")),
                 ),
                 (
                     "E202",
                     Some("server.tls.keyd-socket"),
                     "server.tls 'keyd-socket' path ends with whitespace (U+0020)",
+                    Some((8, 21, "\"tcp://127.0.0.1:9444 \"")),
                 ),
-                ("E003", None, "unexpected property 'extra' on 'cert'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'cert'",
+                    Some((9, 38, "extra=\"z\"")),
+                ),
                 (
                     "E202",
                     Some("server.tls.cert"),
                     "server.tls 'cert' path ends with whitespace (U+0020)",
+                    Some((9, 14, "\"/etc/miraserve/a.crt \"")),
                 ),
-                ("E003", None, "unexpected property 'extra' on 'read-tree'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'read-tree'",
+                    Some((12, 31, "extra=\"r\"")),
+                ),
                 (
                     "E202",
                     Some("server.sandbox.read-tree"),
                     "sandbox 'read-tree' path starts with whitespace (U+0020)",
+                    Some((12, 19, "\" /var/www\"")),
                 ),
                 (
                     "E202",
                     Some("server.sandbox.socket-tree"),
                     "sandbox 'socket-tree' path ends with whitespace (U+0020)",
+                    Some((13, 21, "\"/etc/foo \"")),
                 ),
                 (
                     "E105",
                     Some("server.tls"),
                     "TLS certificate configured without a matching private key",
+                    Some((
+                        6,
+                        5,
+                        "tls {\n        key-isolation \"split-daemon\"\n        keyd-socket \"tcp://127.0.0.1:9444 \"\n        cert \"/etc/miraserve/a.crt \" extra=\"z\"\n    }",
+                    )),
                 ),
                 (
                     "E105",
                     Some("server.tls.keyd-socket"),
                     "invalid 'keyd-socket' TCP address 'tcp://127.0.0.1:9444 '",
+                    Some((8, 9, "keyd-socket \"tcp://127.0.0.1:9444 \"")),
                 ),
                 (
                     "E202",
                     Some("server.sandbox.read-tree"),
                     "sandbox 'read-tree' path ' /var/www' is not allowed: it must be an absolute path",
+                    Some((12, 9, "read-tree \" /var/www\" extra=\"r\"")),
                 ),
                 (
                     "E202",
                     Some("server.sandbox.socket-tree"),
                     "sandbox 'socket-tree' path '/etc/foo ' is not allowed: it is inside a system, secret or MiraServe state directory",
+                    Some((13, 9, "socket-tree \"/etc/foo \"")),
                 ),
                 (
                     "E202",
                     Some("server.allow-docroot[0]"),
                     "server.allow-docroot '/etc ' points to an unconditionally forbidden OS or MiraServe directory and cannot be exempted",
+                    Some((5, 5, "allow-docroot \"/etc \" extra=\"y\"")),
                 ),
                 (
                     "E202",
                     Some("server.acme-webroot"),
                     "server.acme-webroot '/etc ' points to a forbidden OS or MiraServe directory",
+                    Some((4, 5, "acme-webroot \"/etc \" extra=\"x\"")),
                 ),
             ],
-        );
+        )?;
     }
 
     // 4. Multi-error test per site directive family:
@@ -1675,77 +1999,105 @@ site "site-multi.example" {
 "#;
         let errs = expect_validation_errors(parse_kdl_detailed("site-multi.kdl", kdl))?;
         assert_exact_issues(
+            kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].owner-dir"),
                     "'owner-dir' path on site 'site-multi.example' starts with whitespace (U+0020)",
+                    Some((7, 15, "\" /srv/tenants/alice\"")),
                 ),
                 (
                     "E301",
                     None,
                     "owner-dir ' /srv/tenants/alice' must be an absolute path",
+                    Some((7, 5, "owner-dir \" /srv/tenants/alice\"")),
                 ),
                 (
                     "E202",
                     Some("site[0].basic-auth"),
                     "'basic-auth' path on site 'site-multi.example' starts with whitespace (U+0020)",
+                    Some((8, 16, "\" /srv/auth/users\"")),
                 ),
                 (
                     "E311",
                     None,
                     "basic-auth users file ' /srv/auth/users' must be an absolute path",
+                    Some((8, 5, "basic-auth \" /srv/auth/users\"")),
                 ),
-                ("E003", None, "unexpected property 'extra' on 'root'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'root'",
+                    Some((9, 18, "extra=\"r\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].root"),
                     "site 'root' path on site 'site-multi.example' ends with whitespace (U+0020)",
+                    Some((9, 10, "\"/etc \"")),
                 ),
-                ("E003", None, "unexpected property 'extra' on 'key'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'key'",
+                    Some((10, 39, "extra=\"k\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].tls.key"),
                     "site.tls 'key' path on site 'site-multi.example' ends with whitespace (U+0020)",
+                    Some((10, 15, "\"/etc/miraserve/s.key \"")),
                 ),
                 (
                     "E003",
                     None,
                     "unexpected property 'extra' on 'agent-keys-file'",
+                    Some((11, 55, "extra=\"b\"")),
                 ),
                 (
                     "E202",
                     Some("site[0].bot-auth.agent-keys-file"),
                     "bot-auth 'agent-keys-file' path on site 'site-multi.example' ends with whitespace (U+0020)",
+                    Some((11, 32, "\"/etc/../agents.json \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].error-pages.page.200"),
                     "error-pages 'page' 200 path on site 'site-multi.example' ends with whitespace (U+0020)",
+                    Some((12, 28, "\"errors/200.html \"")),
                 ),
                 (
                     "E105",
                     Some("site[0].tls"),
                     "TLS private key configured without a matching certificate",
+                    Some((10, 5, "tls { key \"/etc/miraserve/s.key \" extra=\"k\" }")),
                 ),
                 (
                     "E202",
                     Some("site[0].root"),
                     "site root path '/etc ' points to a sensitive or overly broad system directory",
+                    Some((9, 5, "root \"/etc \" extra=\"r\"")),
                 ),
                 (
                     "E202",
                     Some("site[0].bot-auth.agent-keys-file"),
                     "bot-auth agent-keys-file path '/etc/../agents.json ' contains forbidden '..' parent traversal segment",
+                    Some((
+                        11,
+                        16,
+                        "agent-keys-file \"/etc/../agents.json \" extra=\"b\" ",
+                    )),
                 ),
                 (
                     "E203",
                     Some("site[0].error-pages.page.200"),
                     "error page status '200' must be between 400 and 599",
+                    Some((12, 19, "page 200 \"errors/200.html \" ")),
                 ),
             ],
-        );
+        )?;
     }
 
     // 5. Multi-error test for site `ai-publish` family (`storage`, `require-signature`,
@@ -1768,41 +2120,57 @@ site "pub-multi.example" {
 "#;
         let errs = expect_validation_errors(parse_kdl_detailed("pub-multi.kdl", kdl))?;
         assert_exact_issues(
+            kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].ai-publish.storage"),
                     "ai-publish 'storage' path on site 'pub-multi.example' ends with whitespace (U+0020)",
+                    Some((8, 17, "\"/etc \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].ai-publish.require-signature"),
                     "ai-publish 'require-signature' path on site 'pub-multi.example' starts with whitespace (U+0020)",
+                    Some((9, 27, "\" ed25519:/etc/miraserve/d.pub\"")),
                 ),
-                ("E401", None, "unsupported signature algorithm ' ed25519'"),
+                (
+                    "E401",
+                    None,
+                    "unsupported signature algorithm ' ed25519'",
+                    Some((9, 9, "require-signature \" ed25519:/etc/miraserve/d.pub\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].ai-publish.jwt-public-key"),
                     "ai-publish 'jwt-public-key' path on site 'pub-multi.example' starts with whitespace (U+0020)",
+                    Some((10, 24, "\" ed25519:/etc/miraserve/j.pub\"")),
                 ),
                 (
                     "E202",
                     Some("site[0].ai-publish.storage"),
                     "ai-publish storage path '/etc ' points to a sensitive or overly broad system directory",
+                    Some((8, 9, "storage \"/etc \"")),
                 ),
                 (
                     "E401",
                     Some("site[0].ai-publish.jwt-public-key"),
                     "invalid ai-publish 'jwt-public-key' format ' ed25519:/etc/miraserve/j.pub'",
+                    Some((10, 9, "jwt-public-key \" ed25519:/etc/miraserve/j.pub\"")),
                 ),
                 (
                     "E401",
                     Some("site[0].ai-publish.mcp-endpoint"),
                     "ai-publish mcp-endpoint with auth=\"oauth-jwt\" on site 'pub-multi.example' requires 'require-signature' to prevent unsigned bundle deploys",
+                    Some((
+                        12,
+                        9,
+                        "mcp-endpoint \"/_miraserve/publish\" auth=\"oauth-jwt\"",
+                    )),
                 ),
             ],
-        );
+        )?;
     }
 
     // 6. Multi-error test per route directive family:
@@ -1852,89 +2220,138 @@ site "route-multi.example" {
 "#;
         let errs = expect_validation_errors(parse_kdl_detailed("route-multi.kdl", kdl))?;
         assert_exact_issues(
+            kdl,
             &errs,
             &[
-                ("E003", None, "unexpected property 'extra' on 'root'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'root'",
+                    Some((9, 22, "extra=\"r\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].route[0].root"),
                     "route 'root' path on route '/r/*' of site 'route-multi.example' ends with whitespace (U+0020)",
+                    Some((9, 14, "\"/etc \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].route[1].fastcgi-pass"),
                     "'fastcgi-pass' path on route '/f1/*' of site 'route-multi.example' ends with whitespace (U+0020)",
+                    Some((13, 22, "\"unix:/run/php/fpm.sock \"")),
                 ),
                 (
                     "E304",
                     None,
                     "invalid fastcgi-pass timeout 'bad': invalid numeric value in 'bad'",
+                    Some((13, 48, "timeout=\"bad\"")),
                 ),
-                ("E003", None, "unknown property 'typo' on 'fastcgi-pass'"),
+                (
+                    "E003",
+                    None,
+                    "unknown property 'typo' on 'fastcgi-pass'",
+                    Some((13, 62, "typo=\"x\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].route[2].fastcgi-pass"),
                     "'fastcgi-pass' path on route '/f2/*' of site 'route-multi.example' starts with whitespace (U+0020)",
+                    Some((16, 22, "\" unix:/run/php/fpm.sock\"")),
                 ),
                 (
                     "E304",
                     None,
                     "invalid FastCGI port in ' unix:/run/php/fpm.sock'",
+                    Some((16, 9, "fastcgi-pass \" unix:/run/php/fpm.sock\"")),
                 ),
-                ("E302", None, "route '/f2/*' does not configure a handler"),
+                (
+                    "E302",
+                    None,
+                    "route '/f2/*' does not configure a handler",
+                    Some((
+                        15,
+                        5,
+                        "route \"/f2/*\" {\n        fastcgi-pass \" unix:/run/php/fpm.sock\"\n    }",
+                    )),
+                ),
                 (
                     "E202",
                     Some("site[0].route[2].wasm-plugin"),
                     "'wasm-plugin' path on route '/w/*' of site 'route-multi.example' starts with whitespace (U+0020)",
+                    Some((19, 21, "\" /opt/plugins/app.wasm\"")),
                 ),
-                ("E003", None, "unknown property 'typo' on 'wasm-plugin'"),
+                (
+                    "E003",
+                    None,
+                    "unknown property 'typo' on 'wasm-plugin'",
+                    Some((19, 46, "typo=\"w\"")),
+                ),
                 (
                     "E003",
                     None,
                     "unexpected property 'extra' on 'jwt-public-key'",
+                    Some((23, 62, "extra=\"m\"")),
                 ),
                 (
                     "E202",
                     Some("site[0].route[3].mcp-gateway.jwt-public-key"),
                     "mcp-gateway 'jwt-public-key' path on route '/m/*' of site 'route-multi.example' starts with whitespace (U+0020)",
+                    Some((23, 28, "\" ed25519:/etc/miraserve/mcp.pub\"")),
                 ),
-                ("E003", None, "unexpected property 'extra' on 'client-cert'"),
+                (
+                    "E003",
+                    None,
+                    "unexpected property 'extra' on 'client-cert'",
+                    Some((33, 53, "extra=\"u\"")),
+                ),
                 (
                     "E202",
                     Some("site[0].route[4].reverse-proxy.upstream-tls.client-cert"),
                     "upstream-tls 'client-cert' path on route '/p/*' of site 'route-multi.example' ends with whitespace (U+0020)",
+                    Some((33, 29, "\"/etc/miraserve/c.crt \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].route[0].root"),
                     "route root path '/etc ' points to a sensitive or overly broad system directory",
+                    Some((9, 9, "root \"/etc \" extra=\"r\"")),
                 ),
                 (
                     "E501",
                     Some("site[0].route[2].wasm-plugin.max-fuel"),
                     "wasm-plugin 'max-fuel' must be between 1 and 50000000",
+                    Some((19, 55, "max-fuel=0")),
                 ),
                 (
                     "E403",
                     Some("site[0].route[3].mcp-gateway.jwt-public-key"),
                     "invalid mcp-gateway 'jwt-public-key' format ' ed25519:/etc/miraserve/mcp.pub'",
+                    Some((
+                        23,
+                        13,
+                        "jwt-public-key \" ed25519:/etc/miraserve/mcp.pub\" extra=\"m\"",
+                    )),
                 ),
                 (
                     "E105",
                     Some("site[0].route[4].reverse-proxy.upstream-tls"),
                     "TLS certificate configured without a matching private key",
+                    Some((
+                        32,
+                        13,
+                        "upstream-tls {\n                client-cert \"/etc/miraserve/c.crt \" extra=\"u\"\n            }",
+                    )),
                 ),
             ],
-        );
+        )?;
     }
 
     // 7. Resolved-directory multi-error: `storage "app /."` plus `keep-versions 0`.
     {
         let tmp = TempDir::new("res-multi")?;
         let cfg = tmp.path.join("res-multi.kdl");
-        fs::write(
-            &cfg,
-            "server {\n\
+        let res_multi_kdl = "server {\n\
                  listen \":443\"\n\
                  tls { cert \"/etc/miraserve/a.crt\"; key \"/etc/miraserve/a.key\" }\n\
              }\n\
@@ -1944,38 +2361,39 @@ site "route-multi.example" {
                      keep-versions 0\n\
                      require-signature \"ed25519:/etc/miraserve/deploy.pub\"\n\
                  }\n\
-             }\n",
-        )?;
+             }\n";
+        fs::write(&cfg, res_multi_kdl)?;
         let errs = expect_validation_errors(load_file_detailed(&cfg))?;
         assert_exact_issues(
+            res_multi_kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].ai-publish.storage"),
                     "ai-publish 'storage' resolved directory name on site 'res-multi.example' ends with whitespace (U+0020)",
+                    Some((7, 1, "storage \"app /.\"")),
                 ),
                 (
                     "E401",
                     Some("site[0].ai-publish.keep-versions"),
                     "ai-publish 'keep-versions' must be between 1 and 1000, found 0",
+                    Some((8, 1, "keep-versions 0")),
                 ),
             ],
-        );
+        )?;
     }
 
     // 8. Collector preservation for padded in-scope values:
     //    - `validate_acme_webroot_credentials` (site basic-auth inside acme-webroot)
-    //    - `publish_stores` overlap (root vs padded storage)
+    //    - `publish_stores` overlap (c2 overlaps clean c1 store; c3 root overlaps ONLY padded c3 store)
     //    - `seen_publish_storages` duplicate (clean storage vs padded storage)
     //    - `docroot_contains_config_dir` (file-backed padded `root " . "`)
     #[cfg(unix)]
     {
         let tmp = TempDir::new("collectors")?;
         let cfg = tmp.path.join("collectors.kdl");
-        fs::write(
-            &cfg,
-            "server {\n\
+        let collectors_kdl = "server {\n\
                  listen \":443\"\n\
                  acme-webroot \"/srv/acme\"\n\
                  tls { cert \"/etc/miraserve/a.crt\"; key \"/etc/miraserve/a.key\" }\n\
@@ -1994,8 +2412,15 @@ site "route-multi.example" {
                      storage \"/srv/publish/shared \"\n\
                      require-signature \"ed25519:/etc/miraserve/deploy.pub\"\n\
                  }\n\
-             }\n",
-        )?;
+             }\n\
+             site \"c3.example\" {\n\
+                 root \"/srv/publish/only-padded\"\n\
+                 ai-publish {\n\
+                     storage \"/srv/publish/only-padded \"\n\
+                     require-signature \"ed25519:/etc/miraserve/deploy.pub\"\n\
+                 }\n\
+             }\n";
+        fs::write(&cfg, collectors_kdl)?;
         let errs = expect_validation_errors(load_file_detailed(&cfg))?;
         let canon_cfg_dir = fs::canonicalize(&tmp.path)?;
         let expected_cfg_msg = format!(
@@ -2004,41 +2429,69 @@ site "route-multi.example" {
             canon_cfg_dir.display()
         );
         assert_exact_issues(
+            collectors_kdl,
             &errs,
             &[
                 (
                     "E202",
                     Some("site[0].basic-auth"),
                     "'basic-auth' path on site 'c1.example' ends with whitespace (U+0020)",
+                    Some((7, 12, "\"/srv/acme/.well-known/acme-challenge/token \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].root"),
                     "site 'root' path on site 'c1.example' starts and ends with whitespace (U+0020)",
+                    Some((8, 6, "\" . \"")),
                 ),
                 (
                     "E202",
                     Some("site[1].ai-publish.storage"),
                     "ai-publish 'storage' path on site 'c2.example' ends with whitespace (U+0020)",
+                    Some((17, 9, "\"/srv/publish/shared \"")),
+                ),
+                (
+                    "E202",
+                    Some("site[2].ai-publish.storage"),
+                    "ai-publish 'storage' path on site 'c3.example' ends with whitespace (U+0020)",
+                    Some((24, 9, "\"/srv/publish/only-padded \"")),
                 ),
                 (
                     "E202",
                     Some("site[0].basic-auth"),
                     "credential file '/srv/acme/.well-known/acme-challenge/token ' is inside the challenge directory of server.acme-webroot '/srv/acme', whose files are served before any site check; keep credentials elsewhere",
+                    Some((
+                        7,
+                        1,
+                        "basic-auth \"/srv/acme/.well-known/acme-challenge/token \"",
+                    )),
                 ),
                 (
                     "E401",
                     Some("site[1].ai-publish.storage"),
                     "duplicate ai-publish storage directory '/srv/publish/shared ' overlaps site 'c1.example' storage '/srv/publish/shared'",
+                    Some((17, 1, "storage \"/srv/publish/shared \"")),
                 ),
-                ("E202", Some("site[0].root"), &expected_cfg_msg),
+                (
+                    "E202",
+                    Some("site[0].root"),
+                    &expected_cfg_msg,
+                    Some((8, 1, "root \" . \"")),
+                ),
                 (
                     "E202",
                     Some("sites.1.root"),
                     "site root '/srv/publish/shared' overlaps ai-publish.storage '/srv/publish/shared' and would expose publish metadata/releases",
+                    None,
+                ),
+                (
+                    "E202",
+                    Some("sites.2.root"),
+                    "site root '/srv/publish/only-padded' overlaps ai-publish.storage '/srv/publish/only-padded ' and would expose publish metadata/releases",
+                    None,
                 ),
             ],
-        );
+        )?;
     }
 
     Ok(())

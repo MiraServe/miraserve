@@ -58,6 +58,17 @@ fn baseline_bin() -> Option<PathBuf> {
     std::env::var_os("MIRASERVE_BASELINE_BIN").map(PathBuf::from)
 }
 
+fn strip_windows_verbatim_prefix(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        stripped.to_owned()
+    } else {
+        raw.into_owned()
+    }
+}
+
 #[cfg(unix)]
 fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -161,6 +172,7 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
     let link_dir = base.join("conf link");
     let rel_pub = conf_dir.join("public");
     let rel_store = conf_dir.join("releases");
+    #[cfg(unix)]
     let sock_dir = base.join("php socks");
     let acme_dir = base.join("acme state");
     for d in [
@@ -170,11 +182,15 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
         &link_dir,
         &rel_pub,
         &rel_store,
-        &sock_dir,
         &acme_dir,
     ] {
         fs::create_dir_all(d)?;
         set_mode(d, 0o750)?;
+    }
+    #[cfg(unix)]
+    {
+        fs::create_dir_all(&sock_dir)?;
+        set_mode(&sock_dir, 0o750)?;
     }
     set_mode(&acme_dir, 0o700)?;
     fs::write(root_spaces.join(" index.html"), b"padded-index-ok")?;
@@ -214,7 +230,12 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
     let key_esc = kdl_escape_path(&key_path);
     let pub_esc = kdl_escape_path(&pub_key);
     let root_esc = kdl_escape_path(&root_spaces);
-    let sock_esc = kdl_escape_path(&sock_dir);
+    // `sandbox.socket-tree` requires a leading `/` and forbids backslashes (`sandbox_tree_rejection`),
+    // so use the temp socket dir on Unix and a clean POSIX path with an internal space on Windows.
+    #[cfg(unix)]
+    let socket_tree_kdl = kdl_escape_path(&sock_dir);
+    #[cfg(not(unix))]
+    let socket_tree_kdl = "/run/php pools".to_owned();
 
     // File-backed config with internal spaces, relative root/storage, padded index basename,
     // and a clean warning (`min-version "1.2"` -> W002) to exercise `--strict` & `--allow-warning`.
@@ -228,7 +249,7 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                  key \"{key_esc}\"\n\
              }}\n\
              sandbox {{\n\
-                 socket-tree \"{sock_esc}\"\n\
+                 socket-tree \"{socket_tree_kdl}\"\n\
              }}\n\
          }}\n\
          site \"clean.example\" {{\n\
@@ -389,28 +410,128 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
     .chain(unix_cases)
     .collect();
 
+    let canon_conf_dir = fs::canonicalize(&conf_dir)?;
+    let expected_conf_base = PathBuf::from(strip_windows_verbatim_prefix(&canon_conf_dir));
+    let expected_rel_pub = expected_conf_base
+        .join("public")
+        .to_string_lossy()
+        .into_owned();
+    let expected_rel_store = expected_conf_base
+        .join("releases")
+        .to_string_lossy()
+        .into_owned();
+    let expected_root_spaces = root_spaces.to_string_lossy().into_owned();
+
     let baseline = baseline_bin();
+    let mut dump_norm_json: Option<serde_json::Value> = None;
+    let mut fs_json_has_w035: Option<bool> = None;
     for (name, args, stdin_data) in &invocations {
         let (code, stdout, stderr) = run_bin(&bin, base, args, *stdin_data)?;
 
         // Always assert clean semantic invariants for every invocation (no wildcard fallthrough;
-        // must pass on BOTH 441a58d and the 0.1.8 branch).
+        // must pass on BOTH 441a58d and the 0.1.8 branch without assuming a Landlock-capable host).
         match *name {
-            "check"
-            | "check_allow_w002"
-            | "check_dump_norm"
-            | "check_symlink_dump"
-            | "service_generate_systemd" => {
+            "check" | "check_allow_w002" => {
                 assert_eq!(
                     code,
                     Some(0),
                     "case '{name}' failed unexpectedly: stderr={}",
                     String::from_utf8_lossy(&stderr)
                 );
+                let out_text = String::from_utf8_lossy(&stdout);
                 assert!(
-                    !stdout.is_empty(),
-                    "case '{name}' produced unexpectedly empty stdout"
+                    out_text.contains("OK:") && out_text.contains("2 site(s)"),
+                    "case '{name}' stdout must contain OK summary for 2 sites: {out_text}"
                 );
+                assert!(
+                    String::from_utf8_lossy(&stderr).contains("W002"),
+                    "case '{name}' stderr must mention W002: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            }
+            "check_dump_norm" | "check_symlink_dump" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                let out_text = String::from_utf8_lossy(&stdout);
+                assert!(
+                    out_text.contains("OK:") && out_text.contains("2 site(s)"),
+                    "case '{name}' stdout must contain OK summary: {out_text}"
+                );
+                let json_start = out_text
+                    .find('{')
+                    .ok_or_else(|| format!("case '{name}' missing normalized JSON: {out_text}"))?;
+                let cfg_val: serde_json::Value = serde_json::from_str(&out_text[json_start..])?;
+                assert_eq!(
+                    cfg_val
+                        .get("sites")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(2),
+                    "case '{name}' must dump 2 sites: {cfg_val}"
+                );
+                assert_eq!(
+                    cfg_val
+                        .pointer("/sites/0/root")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected_root_spaces.as_str()),
+                    "case '{name}' must preserve internal-space site[0].root: {cfg_val}"
+                );
+                assert_eq!(
+                    cfg_val.pointer("/sites/0/index"),
+                    Some(&serde_json::json!([" index.html", "index.html"])),
+                    "case '{name}' must preserve padded site[0].index: {cfg_val}"
+                );
+                assert_eq!(
+                    cfg_val
+                        .pointer("/sites/1/root")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected_rel_pub.as_str()),
+                    "case '{name}' must resolve relative site[1].root against canonical config dir: {cfg_val}"
+                );
+                assert_eq!(
+                    cfg_val
+                        .pointer("/sites/1/ai_publish/storage")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected_rel_store.as_str()),
+                    "case '{name}' must resolve relative site[1].ai_publish.storage against canonical config dir: {cfg_val}"
+                );
+                if *name == "check_dump_norm" {
+                    dump_norm_json = Some(cfg_val);
+                } else {
+                    assert_eq!(
+                        Some(&cfg_val),
+                        dump_norm_json.as_ref(),
+                        "symlinked config dump must match real config dump"
+                    );
+                }
+            }
+            "service_generate_systemd" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stderr={}",
+                    String::from_utf8_lossy(&stderr)
+                );
+                let unit = String::from_utf8_lossy(&stdout);
+                for required in [
+                    "[Unit]",
+                    "[Service]",
+                    "ExecStart=",
+                    "clean.kdl",
+                    "acme state",
+                    "TimeoutStopSec=45",
+                    "ProtectHome=",
+                    "ReadWritePaths=",
+                ] {
+                    assert!(
+                        unit.contains(required),
+                        "service_generate_systemd missing '{required}' in unit:\n{unit}"
+                    );
+                }
             }
             "check_strict" => {
                 // W002 causes --strict to fail with exit 1.
@@ -453,12 +574,19 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                         .map(Vec::len),
                     Some(0)
                 );
-                assert!(
-                    val.get("config").is_some_and(serde_json::Value::is_object),
-                    "check_stdin_json must include normalized config object: {val}"
+                assert_eq!(
+                    val.pointer("/config/sites/0/root")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected_root_spaces.as_str()),
+                    "check_stdin_json must include normalized site[0].root: {val}"
+                );
+                assert_eq!(
+                    val.pointer("/config/sites/0/index"),
+                    Some(&serde_json::json!([" index.html"])),
+                    "check_stdin_json must preserve padded index basename: {val}"
                 );
             }
-            "check_fs" | "check_fs_trusted_paths" => {
+            "check_fs" => {
                 assert_eq!(
                     code,
                     Some(0),
@@ -468,11 +596,95 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                 );
                 let out_text = String::from_utf8_lossy(&stdout);
                 assert!(
-                    out_text.contains("OK:"),
-                    "case '{name}' stdout must contain OK summary: {out_text}"
+                    out_text.contains("OK:") && out_text.contains("2 site(s)"),
+                    "case '{name}' stdout must contain OK summary for 2 sites: {out_text}"
                 );
             }
-            "check_fs_json" | "check_fs_trusted_paths_json" => {
+            "check_fs_trusted_paths" => {
+                assert_eq!(
+                    code,
+                    Some(0),
+                    "case '{name}' failed unexpectedly: stdout={}, stderr={}",
+                    String::from_utf8_lossy(&stdout),
+                    String::from_utf8_lossy(&stderr)
+                );
+                let out_text = String::from_utf8_lossy(&stdout);
+                assert!(
+                    out_text.contains("OK:") && out_text.contains("2 site(s)"),
+                    "case '{name}' stdout must contain OK summary for 2 sites: {out_text}"
+                );
+                #[cfg(target_os = "linux")]
+                assert!(
+                    out_text.contains("note: trusted-paths:")
+                        && out_text.contains("note: trusted-paths (narrowed):"),
+                    "case '{name}' on Linux must emit trusted-paths notes: {out_text}"
+                );
+                #[cfg(not(target_os = "linux"))]
+                assert!(
+                    out_text
+                        .contains("note: --trusted-paths is Linux-only; no paths were verified"),
+                    "case '{name}' on non-Linux must emit Linux-only trusted-paths note: {out_text}"
+                );
+            }
+            "check_fs_json" => {
+                let val: serde_json::Value = serde_json::from_slice(&stdout)?;
+                assert_eq!(
+                    val.get("errors")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len),
+                    Some(0),
+                    "case '{name}' must report zero errors: {val}"
+                );
+                let warnings = val
+                    .get("warnings")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or("check_fs_json missing warnings array")?;
+                let codes: Vec<&str> = warnings
+                    .iter()
+                    .filter_map(|w| w.get("code").and_then(serde_json::Value::as_str))
+                    .collect();
+                assert!(
+                    codes.contains(&"W002"),
+                    "case '{name}' must retain W002 warning: {val}"
+                );
+                let has_w035 = codes.contains(&"W035");
+                fs_json_has_w035 = Some(has_w035);
+                assert!(
+                    codes
+                        .iter()
+                        .all(|&c| c == "W002" || (cfg!(target_os = "linux") && c == "W035")),
+                    "case '{name}' had unexpected warnings {codes:?}: {val}"
+                );
+                // Do not assume a Landlock-capable Linux host: when the sandbox probe emits W035,
+                // `--strict --allow-warning W002` rejects with exit 1 and valid=false on BOTH 441a58d
+                // and the branch; otherwise it exits 0 with valid=true.
+                if cfg!(target_os = "linux") && has_w035 {
+                    assert_eq!(
+                        code,
+                        Some(1),
+                        "case '{name}' with W035 under --strict must exit 1: {val}"
+                    );
+                    assert_eq!(
+                        val.get("valid").and_then(serde_json::Value::as_bool),
+                        Some(false),
+                        "case '{name}' with W035 under --strict must report valid=false: {val}"
+                    );
+                } else {
+                    assert_eq!(
+                        code,
+                        Some(0),
+                        "case '{name}' failed unexpectedly: stdout={}, stderr={}",
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                    assert_eq!(
+                        val.get("valid").and_then(serde_json::Value::as_bool),
+                        Some(true),
+                        "case '{name}' must report valid=true: {val}"
+                    );
+                }
+            }
+            "check_fs_trusted_paths_json" => {
                 assert_eq!(
                     code,
                     Some(0),
@@ -493,15 +705,42 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                     Some(0),
                     "case '{name}' must report zero errors: {val}"
                 );
-                let has_w002 = val
+                let warnings = val
                     .get("warnings")
                     .and_then(serde_json::Value::as_array)
-                    .is_some_and(|ws| {
-                        ws.iter().any(|w| {
-                            w.get("code").and_then(serde_json::Value::as_str) == Some("W002")
-                        })
-                    });
-                assert!(has_w002, "case '{name}' must retain W002 warning: {val}");
+                    .ok_or("check_fs_trusted_paths_json missing warnings array")?;
+                let codes: Vec<&str> = warnings
+                    .iter()
+                    .filter_map(|w| w.get("code").and_then(serde_json::Value::as_str))
+                    .collect();
+                assert!(
+                    codes.contains(&"W002"),
+                    "case '{name}' must retain W002 warning: {val}"
+                );
+                assert_eq!(
+                    codes.contains(&"W035"),
+                    fs_json_has_w035.unwrap_or(false),
+                    "case '{name}' W035 presence must match check_fs_json on the same host: {val}"
+                );
+                let notes = val
+                    .get("notes")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or("check_fs_trusted_paths_json missing notes array")?;
+                let note_strs: Vec<&str> =
+                    notes.iter().filter_map(serde_json::Value::as_str).collect();
+                #[cfg(target_os = "linux")]
+                assert!(
+                    note_strs.iter().any(|n| n.starts_with("trusted-paths:"))
+                        && note_strs
+                            .iter()
+                            .any(|n| n.starts_with("trusted-paths (narrowed):")),
+                    "case '{name}' on Linux must include trusted-paths notes: {note_strs:?}"
+                );
+                #[cfg(not(target_os = "linux"))]
+                assert!(
+                    note_strs.contains(&"--trusted-paths is Linux-only; no paths were verified"),
+                    "case '{name}' on non-Linux must include Linux-only trusted-paths note: {note_strs:?}"
+                );
             }
             "check_writable_set" => {
                 assert_eq!(
@@ -512,11 +751,20 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                 );
                 let ws_text = String::from_utf8_lossy(&stdout);
                 #[cfg(target_os = "linux")]
-                assert!(
-                    ws_text.trim() == "landlock unavailable"
-                        || (ws_text.contains("releases") && ws_text.contains("acme state")),
-                    "writable-set on Linux must list publish store and acme state dir (or 'landlock unavailable' without kernel Landlock): {ws_text}"
-                );
+                if fs_json_has_w035 == Some(false) {
+                    assert!(
+                        ws_text.contains("releases") && ws_text.contains("acme state"),
+                        "writable-set on Landlock-capable Linux must list publish store and acme state dir: {ws_text}"
+                    );
+                } else {
+                    assert!(
+                        ws_text.trim() == "landlock unavailable"
+                            || (ws_text.starts_with("landlock partial abi=")
+                                && ws_text.contains("releases")
+                                && ws_text.contains("acme state")),
+                        "writable-set on Linux with W035 must report landlock unavailable or partial ABI grants: {ws_text}"
+                    );
+                }
                 #[cfg(not(target_os = "linux"))]
                 assert_eq!(
                     ws_text.as_ref(),
