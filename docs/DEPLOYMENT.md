@@ -401,9 +401,9 @@ sudo miraserve reload --pid-file /run/miraserve/miraserve.pid --config /etc/mira
 
 **Configuration load errors during reload vs. cold start (hosting panels):** Because a KDL load error (including `E202` for leading or trailing path whitespace) runs before tenant isolation and before applying any change, one invalid path rejects the entire candidate configuration:
 
-- **Refused candidate:** `miraserve check`, `miraserve reload --config` (preflight, before signaling `SIGHUP`), and direct `SIGHUP` file reload reject the candidate with `E202` and exit non-zero without provisioning or opening any candidate path.
-- **Still-serving old generation:** On a failed live reload (`reload --config` or direct `SIGHUP`), the running process leaves its previous configuration generation, HTTP content, TLS certificates, and active publish state serving unchanged.
-- **Failed cold start:** Stopping the old process before validating (or restarting onto an unvalidated configuration after upgrading to 0.1.8) fails startup for every site until the path is fixed. Panels should run `miraserve check --fs` with the target version before replacing the active config or restarting, and keep the last accepted configuration on disk.
+- **Refused candidate:** `miraserve check` and `miraserve reload --config` (preflight, before signaling `SIGHUP`) refuse the candidate, display `E202` naming the directive and site or route, and exit non-zero before runtime provisioning or activation.
+- **Still-serving old generation:** On a failed live reload (`reload --config` preflight or direct `SIGHUP`), the running server logs the refusal on `SIGHUP` and keeps serving its previous configuration generation, HTTP content, TLS certificates, and active publish state unchanged.
+- **Failed cold start:** Stopping the old process before validating (or restarting onto an unvalidated configuration after upgrading to 0.1.8) causes `miraserve run` to fail startup with `E202` for every site until the path is fixed. Panels should run `miraserve check --fs` with the target version before replacing the active config or restarting, and keep the last accepted configuration on disk.
 
 ### 2.4a What changed in 0.1.1 (after the security audit of 0.1.0)
 
