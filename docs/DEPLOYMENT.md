@@ -388,6 +388,7 @@ credential or key reference, publishing or MCP verification keys on tenant sites
 - **The release store directory is trusted.** Published files are served from it as they are on disk; there is no per-request integrity check. Anyone who can write that directory can change what the site serves. Keep it writable by the MiraServe service user only, never by site owners or other services.
 - **Startup and reload use the same strict rule.** A stored release is served only if its signature verifies and it passes the checks configured NOW. There is no exception for a release that "was verified before": after an upgrade that tightens the scanner, or after adding a `preflight-checks` entry, a release that no longer passes is not served. The newest older release that passes is served in its place; if none passes, the site answers 503 until a corrected release is published. The log names the release and the reason (`active ai-publish release failed verification with the current checks and is NOT served`).
 - **Before upgrading a server with live AI-published sites**, check the releases against the new version on a copy of the store, and republish any that fail.
+- **Padded filesystem paths (0.1.8):** Configuration load rejects leading or trailing Unicode whitespace in host-filesystem path directives (and file-relative `root` or `ai-publish.storage` values such as `"app /."` whose resolved directory name ends in whitespace) with `E202`. If an existing 0.1.7 installation has a padded path (for example `storage "/srv/publish/app "`), **do not** edit the directive or unconditionally rename directories before inspecting disk: identify which directory (padded or unpadded sibling) holds the live releases and `active.json`, stop or coordinate publishers writing to that store, and reconcile or move the live store cleanly before removing the whitespace from the configuration. A one-line path edit or unconditional rename is insufficient when both siblings exist.
 
 ### 2.4 Zero-Downtime Hot Reload
 
@@ -397,6 +398,12 @@ sudo systemctl reload miraserve.service
 # Or invoke directly:
 sudo miraserve reload --pid-file /run/miraserve/miraserve.pid --config /etc/miraserve/conf/miraserve.kdl
 ```
+
+**Configuration load errors during reload vs. cold start (hosting panels):** Because a KDL load error (including `E202` for leading or trailing path whitespace) runs before tenant isolation and before applying any change, one invalid path rejects the entire candidate configuration:
+
+- **Refused candidate:** `miraserve check`, `miraserve reload --config` (preflight, before signaling `SIGHUP`), and direct `SIGHUP` file reload reject the candidate with `E202` and exit non-zero without provisioning or opening any candidate path.
+- **Still-serving old generation:** On a failed live reload (`reload --config` or direct `SIGHUP`), the running process leaves its previous configuration generation, HTTP content, TLS certificates, and active publish state serving unchanged.
+- **Failed cold start:** Stopping the old process before validating (or restarting onto an unvalidated configuration after upgrading to 0.1.8) fails startup for every site until the path is fixed. Panels should run `miraserve check --fs` with the target version before replacing the active config or restarting, and keep the last accepted configuration on disk.
 
 ### 2.4a What changed in 0.1.1 (after the security audit of 0.1.0)
 
