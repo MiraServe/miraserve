@@ -62,10 +62,10 @@ Downloads and checksums: <https://miraserve.org/download/> (same files on the Gi
 Always verify the download against `SHA256SUMS` from the same folder before installing:
 
 ```sh
-V=0.1.7
+V=0.1.8
 curl -fLO https://miraserve.org/dl/v$V/miraserve_${V}_amd64.deb
 curl -fLO https://miraserve.org/dl/v$V/SHA256SUMS
-sha256sum --ignore-missing -c SHA256SUMS      # must print: miraserve_0.1.7_amd64.deb: OK
+sha256sum --ignore-missing -c SHA256SUMS      # must print: miraserve_0.1.8_amd64.deb: OK
 sudo dpkg -i miraserve_${V}_amd64.deb
 ```
 
@@ -439,7 +439,7 @@ user's explicit decision. Rules in `.htaccess` files are never imported.
   To run as a service, generate a unit: `miraserve service generate --target systemd --config <file>`
   (also `launchd` on macOS). Create the service account and folders the unit names.
 - **Container:** Throw-away demo (state is lost when the container stops; for real use mount volumes as in
-  `docs/DEPLOYMENT.md`): `docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve/miraserve:0.1.7`
+  `docs/DEPLOYMENT.md`): `docker run --rm -p 8443:8443/tcp -p 8443:8443/udp -p 8080:8080/tcp miraserve/miraserve:0.1.8`
   serves a starter page on <https://localhost:8443/>. Its configuration is `/etc/miraserve/miraserve.kdl`
   and its site folder `/var/www/html`; mount your own over them, read-only
   (`-v ./site.kdl:/etc/miraserve/miraserve.kdl:ro -v ./public:/var/www/html:ro`; tested with 0.1.5:
@@ -475,7 +475,7 @@ user's explicit decision. Rules in `.htaccess` files are never imported.
 | `openat2 is refused in this process` at start (`INFO`, or `WARN` with enabled `file-cache` / non-`"shared"` `workers`) | Usually caused by the default unit's `RestrictSUIDSGID=yes`, an outer seccomp filter, or a kernel older than Linux 5.6 behind an outer filter; a kernel older than Linux 5.6 without an outer filter prints a different message, `openat2 is not supported by this kernel` (neither appears when nothing configured depends on `openat2`). Logged at `WARN` only when a site `file-cache` is enabled with a non-zero `file-cache-bytes` budget or `workers` is not `"shared"`, and at `INFO` otherwise; not an error unless you rely on those features. |
 | `miraserve check` passes from a root shell but the service fails | Check as the service account (section 4); the unit also hides `/home` and makes most of the system read-only. |
 
-Logs: `journalctl -u miraserve`. Version and build features: `miraserve version` (0.1.7 prints `features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless`).
+Logs: `journalctl -u miraserve`. Version and build features: `miraserve version` (0.1.8 prints `features: precompressed, header-rule-status, service-allow-openat2, writable-set, try-files-extensionless`).
 
 ## 10. Before you say it is done
 

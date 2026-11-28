@@ -1,6 +1,6 @@
 # nFPM v2 package definition for Linux .deb (Debian/Ubuntu) and .rpm (RHEL/Fedora/Alma/Rocky)
 # Render placeholders before invoking nfpm (nfpm v2.41 does not expand ${VAR} inside contents[].src):
-#   sed -e "s|\${MIRASERVE_VERSION}|0.1.7|g" \
+#   sed -e "s|\${MIRASERVE_VERSION}|0.1.8|g" \
 #       -e "s|\${MIRASERVE_ARCH}|amd64|g" \
 #       -e "s|\${MIRASERVE_BIN}|dist/bin/miraserve-x86_64-unknown-linux-gnu|g" \
 #       packaging/nfpm/nfpm.yaml > /tmp/nfpm-rendered.yaml && \
