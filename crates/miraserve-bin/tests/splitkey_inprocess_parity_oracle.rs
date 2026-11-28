@@ -442,6 +442,18 @@ site "sym.inproc.test" {{
             raw_base.as_str(),
         ),
         (
+            "valid_check_strict_fs_allow_w003",
+            vec![
+                "check",
+                "--strict",
+                "--fs",
+                "--allow-warning",
+                "W003",
+                &valid_s,
+            ],
+            raw_base.as_str(),
+        ),
+        (
             "valid_dump_normalized",
             vec!["check", "--dump-normalized", &valid_s],
             raw_base.as_str(),
