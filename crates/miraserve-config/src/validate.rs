@@ -52,7 +52,6 @@ pub(crate) fn validate_config(
     if let Some(cfg_dir) = config_base_dir {
         for (site_idx, site) in config.sites.iter().enumerate() {
             if let Some(root) = &site.root
-                && root == root.trim()
                 && docroot_contains_config_dir(root, cfg_dir)
             {
                 let key = format!("site[{site_idx}].root");
@@ -70,7 +69,6 @@ pub(crate) fn validate_config(
             }
             for (route_idx, route) in site.routes.iter().enumerate() {
                 if let Some(root) = &route.root
-                    && root == root.trim()
                     && docroot_contains_config_dir(root, cfg_dir)
                 {
                     let key = format!("site[{site_idx}].route[{route_idx}].root");
@@ -228,7 +226,6 @@ pub(crate) fn validate_config(
         .sites
         .iter()
         .filter_map(|s| s.ai_publish.as_ref())
-        .filter(|p| p.storage == p.storage.trim())
         .flat_map(|p| {
             [
                 (p.storage.clone(), lexical_path_key(&p.storage)),
@@ -239,9 +236,7 @@ pub(crate) fn validate_config(
     if !publish_stores.is_empty() {
         for (site_idx, site) in config.sites.iter().enumerate() {
             let prefix = format!("sites.{site_idx}");
-            if let Some(root) = &site.root
-                && root == root.trim()
-            {
+            if let Some(root) = &site.root {
                 let root_key = lexical_path_key(root);
                 if let Some((store_raw, _)) = publish_stores
                     .iter()
@@ -260,9 +255,7 @@ pub(crate) fn validate_config(
                 }
             }
             for (r_idx, route) in site.routes.iter().enumerate() {
-                if let Some(r_root) = &route.root
-                    && r_root == r_root.trim()
-                {
+                if let Some(r_root) = &route.root {
                     let root_key = lexical_path_key(r_root);
                     if let Some((store_raw, _)) = publish_stores
                         .iter()
@@ -338,9 +331,6 @@ impl ValidatorCtx<'_> {
         let Some(webroot) = config.server.acme_webroot.as_deref() else {
             return;
         };
-        if webroot != webroot.trim() {
-            return;
-        }
         // Only the challenge directory is ever answered: credentials elsewhere under the
         // webroot are not reachable through it.
         let root_key = lexical_path_key(&format!(
@@ -393,7 +383,7 @@ impl ValidatorCtx<'_> {
             }
         }
         for (key_path, file) in credentials {
-            if file == file.trim() && inside(file) {
+            if inside(file) {
                 self.error(
                     "E202",
                     format!(
@@ -411,9 +401,6 @@ impl ValidatorCtx<'_> {
     /// `acme-webroot`: an absolute, ordinary directory path (never `/` or a forbidden tree).
     fn validate_acme_webroot(&mut self, raw: &str) {
         let key = "server.acme-webroot";
-        if raw != raw.trim() {
-            return;
-        }
         self.validate_safe_file_path(raw, key, "server.acme-webroot");
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed.contains('\0') || has_parent_traversal(trimmed) {
@@ -447,9 +434,6 @@ impl ValidatorCtx<'_> {
 
     fn validate_allow_docroots(&mut self, allow_docroots: &[String]) {
         for (i, raw) in allow_docroots.iter().enumerate() {
-            if raw != raw.trim() {
-                continue;
-            }
             let key = format!("server.allow-docroot[{i}]");
             self.validate_safe_file_path(raw, &key, "server.allow-docroot");
             let trimmed = raw.trim();
@@ -582,9 +566,7 @@ impl ValidatorCtx<'_> {
                     Some("set 'key-isolation \"split-daemon\"' or remove 'keyd-socket'"),
                 );
             }
-            if crate::parser::keyd_socket_whitespace_reason(sock).is_some() {
-                // Already rejected with E202 at parse time.
-            } else if let Some(tcp_target) = sock.strip_prefix("tcp://") {
+            if let Some(tcp_target) = sock.strip_prefix("tcp://") {
                 match std::net::SocketAddr::from_str(tcp_target) {
                     Ok(addr) if addr.ip().is_loopback() && addr.port() > 0 => {}
                     Ok(_) => {
@@ -1164,9 +1146,6 @@ impl ValidatorCtx<'_> {
                         Some("assign a unique `site-id` to every ai-publish site so signed bundles and JWT audiences remain isolated (R5-PUB-5)"),
                     );
                 }
-                if publish.storage != publish.storage.trim() {
-                    continue;
-                }
                 let norm_storage = normalize_storage_path_key(&publish.storage);
                 if let Some((prev_norm, prev_raw, prev_site)) = seen_publish_storages
                     .iter()
@@ -1492,7 +1471,7 @@ impl ValidatorCtx<'_> {
                 );
             }
             self.validate_safe_file_path(path, &span_key, "error page");
-            if path == path.trim() && !std::path::Path::new(path).is_absolute() && !has_site_root {
+            if !std::path::Path::new(path).is_absolute() && !has_site_root {
                 self.error(
                     "E202",
                     format!("relative error page path '{path}' requires a site 'root' directory"),
@@ -1567,9 +1546,7 @@ impl ValidatorCtx<'_> {
                     &format!("{prefix}.ai-publish.jwt-public-key"),
                     "ai-publish JWT public key",
                 );
-            } else if crate::parser::tagged_path_whitespace_reason(pk, "ed25519:").is_none()
-                && (!pk.starts_with("miraserve-ed25519-pub:") || pk.trim().len() <= 24)
-            {
+            } else if !pk.starts_with("miraserve-ed25519-pub:") || pk.trim().len() <= 24 {
                 self.error(
                     "E401",
                     format!("invalid ai-publish 'jwt-public-key' format '{pk}'"),
@@ -2199,9 +2176,7 @@ impl ValidatorCtx<'_> {
                     &format!("{r_prefix}.mcp-gateway.jwt-public-key"),
                     "mcp-gateway JWT public key",
                 );
-            } else if crate::parser::tagged_path_whitespace_reason(pk, "ed25519:").is_none()
-                && (!pk.starts_with("miraserve-ed25519-pub:") || pk.trim().len() <= 24)
-            {
+            } else if !pk.starts_with("miraserve-ed25519-pub:") || pk.trim().len() <= 24 {
                 self.error(
                     "E403",
                     format!("invalid mcp-gateway 'jwt-public-key' format '{pk}'"),
@@ -2663,9 +2638,6 @@ impl ValidatorCtx<'_> {
 
     fn validate_safe_file_path(&mut self, path: &str, span_key: &str, label: &str) {
         let trimmed = path.trim();
-        if path != trimmed {
-            return;
-        }
         if trimmed.is_empty() {
             self.error(
                 "E202",
@@ -2695,11 +2667,8 @@ impl ValidatorCtx<'_> {
     }
 
     fn validate_safe_dir_path(&mut self, path: &str, span_key: &str, label: &str) {
-        let trimmed = path.trim();
-        if path != trimmed {
-            return;
-        }
         self.validate_safe_file_path(path, span_key, label);
+        let trimmed = path.trim();
         if trimmed.is_empty() || trimmed.contains('\0') || has_parent_traversal(trimmed) {
             return;
         }

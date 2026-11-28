@@ -145,6 +145,7 @@ struct ParserCtx<'a> {
     source: &'a str,
     spans: SpanMap,
     errors: Vec<ConfigIssue>,
+    path_scope: String,
 }
 
 impl<'a> ParserCtx<'a> {
@@ -153,6 +154,7 @@ impl<'a> ParserCtx<'a> {
             source,
             spans: SpanMap::new(),
             errors: Vec::new(),
+            path_scope: String::new(),
         }
     }
 
@@ -161,7 +163,7 @@ impl<'a> ParserCtx<'a> {
     }
 
     fn push_path_ws_error(&mut self, key: &str, label: &str, reason: &str, span: SourceSpan) {
-        let msg = format!("{label} path {reason}");
+        let msg = format!("{label} path{} {reason}", self.path_scope);
         self.errors.push(
             ConfigIssue::error("E202", msg, self.source, Some(span))
                 .with_path(key)
@@ -169,11 +171,10 @@ impl<'a> ParserCtx<'a> {
         );
     }
 
-    fn check_path_ws(&mut self, raw: &str, key: &str, label: &str, span: SourceSpan) -> bool {
-        edge_whitespace_reason(raw).is_some_and(|r| {
+    fn check_path_ws(&mut self, raw: &str, key: &str, label: &str, span: SourceSpan) {
+        if let Some(r) = edge_whitespace_reason(raw) {
             self.push_path_ws_error(key, label, &r, span);
-            true
-        })
+        }
     }
 
     fn path_node(&mut self, child: &KdlNode, key: &str, label: &str) -> Option<String> {
@@ -190,13 +191,10 @@ impl<'a> ParserCtx<'a> {
         );
         self.record_span(&key, child.span());
         let items = self.string_list_with_spans(child, name)?;
-        Some(
-            items
-                .into_iter()
-                .filter(|(s, sp)| !self.check_path_ws(s, &key, &label, *sp))
-                .map(|(s, _)| s)
-                .collect(),
-        )
+        for (s, sp) in &items {
+            self.check_path_ws(s, &key, &label, *sp);
+        }
+        Some(items.into_iter().map(|(s, _)| s).collect())
     }
 
     fn tagged_path(
@@ -519,7 +517,7 @@ impl<'a> ParserCtx<'a> {
                         if let Some(reason) = keyd_socket_whitespace_reason(val) {
                             self.push_path_ws_error(
                                 "server.tls.keyd-socket",
-                                "keyd-socket",
+                                "server.tls 'keyd-socket'",
                                 &reason,
                                 span,
                             );
@@ -555,11 +553,11 @@ impl<'a> ParserCtx<'a> {
                         }
                     }
                 }
-                "cert" => cfg.cert = self.path_node(child, "server.tls.cert", "TLS certificate"),
-                "key" => cfg.key = self.path_node(child, "server.tls.key", "TLS private key"),
+                "cert" => cfg.cert = self.path_node(child, "server.tls.cert", "server.tls 'cert'"),
+                "key" => cfg.key = self.path_node(child, "server.tls.key", "server.tls 'key'"),
                 "client-ca" => {
                     cfg.client_ca =
-                        self.path_node(child, "server.tls.client-ca", "mTLS client CA bundle");
+                        self.path_node(child, "server.tls.client-ca", "server.tls 'client-ca'");
                 }
                 "acme" => {
                     self.record_span("server.tls.acme", child.span());
@@ -1113,7 +1111,7 @@ impl<'a> ParserCtx<'a> {
         self.check_path_ws(
             &module_path,
             &format!("{route_prefix}.wasm-plugin"),
-            "wasm-plugin module",
+            "'wasm-plugin'",
             path_entry.span(),
         );
 
@@ -1231,6 +1229,8 @@ impl<'a> ParserCtx<'a> {
 
         let children = self.expect_children(node, "site")?;
         let prefix = format!("site[{site_idx}]");
+        let primary_host = hosts.first().map_or("<unnamed>", String::as_str);
+        self.path_scope = format!(" on site '{primary_host}'");
 
         let mut preset: Option<SitePreset> = None;
         let mut security_headers = SecurityHeadersPolicy::Strict;
@@ -1304,7 +1304,7 @@ impl<'a> ParserCtx<'a> {
                     self.record_span(format!("{prefix}.tls"), child.span());
                     tls = Some(self.parse_site_tls(child, &prefix));
                 }
-                "root" => root = self.path_node(child, &format!("{prefix}.root"), "site root"),
+                "root" => root = self.path_node(child, &format!("{prefix}.root"), "site 'root'"),
                 "index" => {
                     self.record_span(format!("{prefix}.index"), child.span());
                     if let Some(items) = self.parse_string_list_node(child, "index") {
@@ -1338,8 +1338,8 @@ impl<'a> ParserCtx<'a> {
                         self.expect_exact_arg_count(&args, 1, "owner-dir", child.span())
                         && let Some(arg) = args.first().copied()
                         && let Some(dir) = self.expect_string(arg, "owner-dir").map(str::to_owned)
-                        && !self.check_path_ws(&dir, &key, "owner-dir", arg.span())
                     {
+                        self.check_path_ws(&dir, &key, "'owner-dir'", arg.span());
                         if !std::path::Path::new(&dir).is_absolute() {
                             self.push_error(
                                 "E301",
@@ -1425,6 +1425,7 @@ impl<'a> ParserCtx<'a> {
             }
         }
 
+        self.path_scope.clear();
         Some(SiteConfig {
             hosts,
             preset,
@@ -1603,10 +1604,8 @@ impl<'a> ParserCtx<'a> {
         self.expect_exact_arg_count(&args, 1, "basic-auth", node.span())?;
         let arg = *args.first()?;
         let users_file = self.expect_string(arg, "basic-auth users file")?.to_owned();
-        if let Some(key) = site_path
-            && self.check_path_ws(&users_file, key, "basic-auth users file", arg.span())
-        {
-            return None;
+        if let Some(key) = site_path {
+            self.check_path_ws(&users_file, key, "'basic-auth'", arg.span());
         }
         if !std::path::Path::new(&users_file).is_absolute() {
             self.push_error(
@@ -1916,7 +1915,12 @@ impl<'a> ParserCtx<'a> {
                         );
                         continue;
                     }
-                    self.check_path_ws(path, &span_key, "error page", path_entry.span());
+                    self.check_path_ws(
+                        path,
+                        &span_key,
+                        &format!("error-pages 'page' {status_u16}"),
+                        path_entry.span(),
+                    );
                     cfg.pages.insert(status_u16, path.to_owned());
                 }
                 other => {
@@ -2104,18 +2108,18 @@ impl<'a> ParserCtx<'a> {
                     cfg.cert = self.path_node(
                         child,
                         &format!("{site_prefix}.tls.cert"),
-                        "TLS certificate",
+                        "site.tls 'cert'",
                     );
                 }
                 "key" => {
                     cfg.key =
-                        self.path_node(child, &format!("{site_prefix}.tls.key"), "TLS private key");
+                        self.path_node(child, &format!("{site_prefix}.tls.key"), "site.tls 'key'");
                 }
                 "client-ca" => {
                     cfg.client_ca = self.path_node(
                         child,
                         &format!("{site_prefix}.tls.client-ca"),
-                        "site mTLS client CA bundle",
+                        "site.tls 'client-ca'",
                     );
                 }
                 other => {
@@ -2280,7 +2284,7 @@ impl<'a> ParserCtx<'a> {
                     cfg.agent_keys_file = self.path_node(
                         child,
                         &format!("{site_prefix}.bot-auth.agent-keys-file"),
-                        "bot-auth agent-keys-file",
+                        "bot-auth 'agent-keys-file'",
                     );
                 }
                 "on-unverified-ai-ua" => {
@@ -2351,7 +2355,7 @@ impl<'a> ParserCtx<'a> {
                     storage = self.path_node(
                         child,
                         &format!("{site_prefix}.ai-publish.storage"),
-                        "ai-publish storage",
+                        "ai-publish 'storage'",
                     );
                 }
                 "site-id" => {
@@ -2365,7 +2369,7 @@ impl<'a> ParserCtx<'a> {
                         child,
                         &format!("{site_prefix}.ai-publish.jwt-public-key"),
                         "ed25519:",
-                        "ai-publish JWT public key",
+                        "ai-publish 'jwt-public-key'",
                     );
                 }
                 "jwt-issuer" => {
@@ -2419,18 +2423,12 @@ impl<'a> ParserCtx<'a> {
                         if let Some(reason) = tagged_path_whitespace_reason(val, "ed25519:") {
                             self.push_path_ws_error(
                                 &key,
-                                "require-signature public key",
+                                "ai-publish 'require-signature'",
                                 &reason,
                                 span,
                             );
-                            require_signature = Some(SignatureRequirement {
-                                algorithm: SignatureAlgorithm::Ed25519,
-                                public_key_path: val
-                                    .strip_prefix("ed25519:")
-                                    .unwrap_or(val)
-                                    .to_owned(),
-                            });
-                        } else if let Some((algo_raw, key_path)) = val.split_once(':') {
+                        }
+                        if let Some((algo_raw, key_path)) = val.split_once(':') {
                             match algo_raw {
                                 "ed25519" => {
                                     if key_path.trim().is_empty() {
@@ -2696,6 +2694,11 @@ impl<'a> ParserCtx<'a> {
         let mut access: Vec<AccessRule> = Vec::new();
         let mut basic_auth: Option<BasicAuthConfig> = None;
         let mut seen_meta = HashSet::new();
+        let route_scope = format!(
+            " on route '{pattern}'{}",
+            self.path_scope.replacen(" on site ", " of site ", 1)
+        );
+        let prev_scope = std::mem::replace(&mut self.path_scope, route_scope);
 
         for child in children.nodes() {
             let name = child.name().value();
@@ -2710,7 +2713,7 @@ impl<'a> ParserCtx<'a> {
                         );
                         continue;
                     }
-                    root = self.path_node(child, &format!("{route_prefix}.root"), "route root");
+                    root = self.path_node(child, &format!("{route_prefix}.root"), "route 'root'");
                 }
                 "basic-auth" => {
                     self.record_span(format!("{route_prefix}.basic-auth"), child.span());
@@ -2890,6 +2893,8 @@ impl<'a> ParserCtx<'a> {
             }
         }
 
+        self.path_scope = prev_scope;
+
         let Some(handler) = handler else {
             self.push_error(
                 "E302",
@@ -2963,6 +2968,14 @@ impl<'a> ParserCtx<'a> {
         self.expect_exact_arg_count(&args, 1, "fastcgi-pass", node.span())?;
         let arg = *args.first()?;
         let raw = self.expect_string(arg, "fastcgi-pass endpoint")?;
+        if let Some(reason) = tagged_path_whitespace_reason(raw, "unix:") {
+            self.push_path_ws_error(
+                &format!("{route_prefix}.fastcgi-pass"),
+                "'fastcgi-pass'",
+                &reason,
+                arg.span(),
+            );
+        }
 
         let mut timeout = Duration::from_secs(30);
         let mut replay_safe_methods = false;
@@ -3015,17 +3028,7 @@ impl<'a> ParserCtx<'a> {
             }
         }
 
-        let target = if let Some(reason) = tagged_path_whitespace_reason(raw, "unix:") {
-            self.push_path_ws_error(
-                &format!("{route_prefix}.fastcgi-pass"),
-                "FastCGI Unix socket",
-                &reason,
-                arg.span(),
-            );
-            FastCgiTarget::Unix {
-                path: raw.strip_prefix("unix:").unwrap_or(raw).to_owned(),
-            }
-        } else if let Some(sock_path) = raw.strip_prefix("unix:") {
+        let target = if let Some(sock_path) = raw.strip_prefix("unix:") {
             if sock_path.trim().is_empty() {
                 self.push_error(
                     "E304",
@@ -3163,7 +3166,7 @@ impl<'a> ParserCtx<'a> {
                             child,
                             &format!("{route_prefix}.mcp-gateway.jwt-public-key"),
                             "ed25519:",
-                            "mcp-gateway JWT public key",
+                            "mcp-gateway 'jwt-public-key'",
                         );
                     }
                     "jwks-url" => {
@@ -3657,21 +3660,24 @@ impl<'a> ParserCtx<'a> {
             }
             match name {
                 "ca-cert" => {
-                    ca_cert =
-                        self.path_node(child, &format!("{prefix}.ca-cert"), "upstream-tls ca-cert");
+                    ca_cert = self.path_node(
+                        child,
+                        &format!("{prefix}.ca-cert"),
+                        "upstream-tls 'ca-cert'",
+                    );
                 }
                 "client-cert" => {
                     client_cert = self.path_node(
                         child,
                         &format!("{prefix}.client-cert"),
-                        "upstream-tls client-cert",
+                        "upstream-tls 'client-cert'",
                     );
                 }
                 "client-key" => {
                     client_key = self.path_node(
                         child,
                         &format!("{prefix}.client-key"),
-                        "upstream-tls client-key",
+                        "upstream-tls 'client-key'",
                     );
                 }
                 other => {

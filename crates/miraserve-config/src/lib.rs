@@ -193,62 +193,73 @@ pub fn parse_kdl_detailed_with_base_dir(
     })
 }
 
+const RESOLVED_DIR_EDGE_WHITESPACE_HELP: &str = "verify which directory or file currently holds live data before editing the path; remove trailing whitespace from the final directory component before any trailing slash or '.'";
+
 /// Resolves relative directory paths (`site.root`, `route.root`, `ai-publish.storage`) against
 /// the config file's absolute parent directory while leaving traversal (`..`), empty, null-byte,
-/// edge-whitespace, or already-absolute paths untouched so validator diagnostics stay exact
-/// (`R6-CFG-1`), and rejects any resolved directory name ending in Unicode whitespace.
+/// or already-absolute paths untouched so validator diagnostics stay exact (`R6-CFG-1`), and
+/// rejects any relative value whose resolved directory name ends in Unicode whitespace.
 fn resolve_relative_dir_paths(parsed: &mut parser::ParsedDocument, source: &str, base_dir: &Path) {
     let base_str = strip_windows_verbatim_prefix(base_dir);
     if !validate::is_absolute_config_path(&base_str) {
         return;
     }
     let clean_base = PathBuf::from(&base_str);
-    let mut check_dir = |raw: &mut String, key: String, label: &str| {
-        if resolve_single_relative_dir(raw, &clean_base)
-            && let Some(reason) = parser::edge_whitespace_reason(raw)
-        {
-            let msg = format!("{label} resolved directory name {reason}");
+    let mut check_dir = |raw: &mut String, key: String, label: &str, scope: &str| {
+        let had_source_ws = raw.as_str() != raw.trim();
+        resolve_single_relative_dir(raw, &clean_base);
+        if !had_source_ws && let Some(reason) = parser::edge_whitespace_reason(raw) {
+            let msg = format!("{label} resolved directory name{scope} {reason}");
             let span = parsed.spans.get(&key).copied();
             parsed.errors.push(
                 ConfigIssue::error("E202", msg, source, span)
                     .with_path(key)
-                    .with_help(parser::PATH_EDGE_WHITESPACE_HELP),
+                    .with_help(RESOLVED_DIR_EDGE_WHITESPACE_HELP),
             );
         }
     };
 
     for (site_idx, site) in parsed.config.sites.iter_mut().enumerate() {
+        let primary_host = site.hosts.first().map_or("<unnamed>", String::as_str);
+        let site_scope = format!(" on site '{primary_host}'");
         if let Some(root) = &mut site.root {
-            check_dir(root, format!("site[{site_idx}].root"), "site root");
+            check_dir(
+                root,
+                format!("site[{site_idx}].root"),
+                "site 'root'",
+                &site_scope,
+            );
         }
         if let Some(publish) = &mut site.ai_publish {
             check_dir(
                 &mut publish.storage,
                 format!("site[{site_idx}].ai-publish.storage"),
-                "ai-publish storage",
+                "ai-publish 'storage'",
+                &site_scope,
             );
         }
         for (route_idx, route) in site.routes.iter_mut().enumerate() {
             if let Some(root) = &mut route.root {
+                let route_scope = format!(" on route '{}' of site '{primary_host}'", route.pattern);
                 check_dir(
                     root,
                     format!("site[{site_idx}].route[{route_idx}].root"),
-                    "route root",
+                    "route 'root'",
+                    &route_scope,
                 );
             }
         }
     }
 }
 
-fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) -> bool {
+fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) {
     let trimmed = raw.trim();
-    if raw.as_str() != trimmed
-        || trimmed.is_empty()
+    if trimmed.is_empty()
         || trimmed.contains('\0')
         || validate::has_parent_traversal(trimmed)
         || validate::is_absolute_config_path(trimmed)
     {
-        return false;
+        return;
     }
 
     let mut joined = base_dir.to_path_buf();
@@ -259,7 +270,6 @@ fn resolve_single_relative_dir(raw: &mut String, base_dir: &Path) -> bool {
         joined.push(seg);
     }
     *raw = normalize_abs_path_string(&joined);
-    true
 }
 
 fn normalize_abs_path_string(path: &Path) -> String {
