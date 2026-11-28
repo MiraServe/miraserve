@@ -274,6 +274,7 @@ fn assert_fixture_byte_parity(
 
 struct FlagOffLiteralInputs<'a> {
     cfg_s: &'a str,
+    cfg_kdl: &'a str,
     miss_s: &'a str,
     padded_s: &'a str,
     miss_kdl: &'a str,
@@ -436,6 +437,48 @@ fn assert_flag_off_exact_literals(
         "reload_dry_run_rejected exact JSON literal mismatch"
     );
 
+    let w002_needle = "min-version \"1.2\"";
+    let (w_line, w_col, w_off, w_len) = loc_parts_of_occurrence(inputs.cfg_kdl, w002_needle, 0)?;
+    assert_eq!((w_line, w_col, w_off, w_len), (3, 7, 29, 17));
+    let cfg_lines: Vec<&str> = inputs.cfg_kdl.lines().collect();
+    let line_2 = *cfg_lines
+        .get(w_line - 2)
+        .ok_or("missing W002 context line before")?;
+    let line_3 = *cfg_lines
+        .get(w_line - 1)
+        .ok_or("missing W002 highlighted line")?;
+    let line_4 = *cfg_lines
+        .get(w_line)
+        .ok_or("missing W002 context line after")?;
+    assert_eq!(line_2, "listen \":443\"");
+    assert_eq!(line_4, "}");
+
+    // Complete shared W002 stderr rendered by `GraphicalReportHandler::new_themed(
+    // GraphicalTheme::unicode_nocolor())` (fixed termwidth 200, context_lines 1, BlankHighlighter,
+    // monochrome Unicode theme) plus `writeln!(stderr, "{buf}")` (or
+    // `SanitizingLineWriter::write_multiline(&buf)` for `--writable-set`).
+    // Constructed verbatim from the test input with zero path-separator or line-ending
+    // normalization (matching `check_parity_v016.rs`, which normalizes only `<TMPDIR>`/`<REPO>`):
+    // `inputs.cfg_s` carries native separators (`/` on Unix, `\` on Windows), `line_3` is taken
+    // verbatim from `pub.kdl` (carrying `kdl_escape_path` `\\` on Windows and never wrapped by
+    // miette's `render_line_text`), and both `pub.kdl` and Rust stderr writes emit LF (`\n`).
+    let expected_w002_stderr = [
+        "miraserve::W002",
+        "",
+        "  ⚠ global TLS min-version is downgraded to 1.2",
+        &format!("   ╭─[{}:{w_line}:{w_col}]", inputs.cfg_s),
+        &format!(" 2 │ {line_2}"),
+        &format!(" 3 │ {line_3}"),
+        "   ·       ────────┬────────",
+        "   ·               ╰── here",
+        &format!(" 4 │ {line_4}"),
+        "   ╰────",
+        "  help: keep global min-version \"1.3\" and opt in per legacy site via 'tls { compat-tls-1-2 true }'",
+        "",
+        "",
+    ]
+    .join("\n");
+
     let expected_ok_stdout = format!(
         "OK: '{}' is valid (1 listener(s), 1 site(s), 0 route(s), TLS >= 1.2, PQC: X25519MLKEM768 enabled, 1 warning(s))\n",
         inputs.cfg_s
@@ -443,6 +486,12 @@ fn assert_flag_off_exact_literals(
     let check_text = get("check_text")?;
     assert_eq!(check_text.exit_code, Some(0));
     assert_eq!(check_text.stdout, expected_ok_stdout);
+    assert_eq!(
+        check_text.stderr.as_bytes(),
+        expected_w002_stderr.as_bytes(),
+        "check_text exact W002 stderr mismatch\n--- EXPECTED ---\n{expected_w002_stderr}\n--- ACTUAL ---\n{}",
+        check_text.stderr
+    );
     assert!(
         check_text.stderr.contains("miraserve::W002")
             && check_text
@@ -743,6 +792,7 @@ fn flag_off_bef6865_parity() -> TestResult {
         &raw_fixture,
         &FlagOffLiteralInputs {
             cfg_s,
+            cfg_kdl: &cfg_text,
             miss_s,
             padded_s,
             miss_kdl: &miss_kdl,
@@ -2044,6 +2094,7 @@ mod linux_storage_oracles {
             Some(1),
             "missing parent --fs error keeps exit 1: {mm_val}"
         );
+        let expected_mm_loc = loc_of_occurrence(&miss_mid_kdl, &miss_mid_node, 0)?;
         assert_eq!(
             mm_val
                 .get("errors")
@@ -2051,6 +2102,21 @@ mod linux_storage_oracles {
                 .map(Vec::len),
             Some(1),
             "expected 1 independent --fs error: {mm_val}"
+        );
+        let expected_mm_err = serde_json::json!({
+            "code": "E301",
+            "severity": "error",
+            "message": format!(
+                "site 'clean.example' ai-publish.storage directory '{}' does not exist and its parent is missing",
+                miss_mid.display()
+            ),
+            "path": "site[0].ai-publish.storage",
+            "location": expected_mm_loc,
+        });
+        assert_eq!(
+            mm_val.get("errors"),
+            Some(&serde_json::json!([expected_mm_err])),
+            "expected exact E301 missing-parent storage error: {mm_val}"
         );
         assert_eq!(
             notes_of(&mm_val),
@@ -2069,7 +2135,7 @@ mod linux_storage_oracles {
                 trusted.join("absent_mid").display(),
             ),
             HELP_GEN,
-            &loc_of_occurrence(&miss_mid_kdl, &miss_mid_node, 0)?,
+            &expected_mm_loc,
         );
 
         // (d)+(e)+(f)+(j)+(l)+(o): Single-site failure cases asserted with exact full JSON objects!
@@ -3187,27 +3253,25 @@ mod linux_storage_oracles {
             &loc_of_occurrence(&gw_kdl, &gw_node, 0)?,
         );
 
-        let root_ro_cfg = base.join("root_ro.kdl");
-        fs::write(
-            &root_ro_cfg,
-            format!(
-                "server {{\n\
-                     listen \":443\"\n\
-                     tls {{ cert \"{}\"; key \"{}\" }}\n\
-                     sandbox {{ user \"1000\" }}\n\
+        let root_ro_node = format!("storage \"{}\"", kdl_escape_path(&store_root));
+        let root_ro_kdl = format!(
+            "server {{\n\
+                 listen \":443\"\n\
+                 tls {{ cert \"{}\"; key \"{}\" }}\n\
+                 sandbox {{ user \"1000\" }}\n\
+             }}\n\
+             site \"pub.example\" {{\n\
+                 ai-publish {{\n\
+                     {root_ro_node}\n\
+                     require-signature \"ed25519:{}\"\n\
                  }}\n\
-                 site \"pub.example\" {{\n\
-                     ai-publish {{\n\
-                         storage \"{}\"\n\
-                         require-signature \"ed25519:{}\"\n\
-                     }}\n\
-                 }}\n",
-                kdl_escape_path(&cert),
-                kdl_escape_path(&key),
-                kdl_escape_path(&store_root),
-                kdl_escape_path(&pub_key),
-            ),
-        )?;
+             }}\n",
+            kdl_escape_path(&cert),
+            kdl_escape_path(&key),
+            kdl_escape_path(&pub_key),
+        );
+        let root_ro_cfg = base.join("root_ro.kdl");
+        fs::write(&root_ro_cfg, &root_ro_kdl)?;
         set_mode(&root_ro_cfg, 0o640)?;
         chown(&root_ro_cfg, u0, g1000)?;
         let (rro_c, rro_v) =
@@ -3224,6 +3288,39 @@ mod linux_storage_oracles {
                 .map(Vec::len),
             Some(1),
             "expected 1 --fs writable error: {rro_v}"
+        );
+        let rro_err = rro_v
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|arr| arr.first())
+            .ok_or("missing --fs writable error")?;
+        let rro_msg = rro_err
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("missing --fs writable error message")?;
+        let rro_msg_prefix = format!(
+            "site 'pub.example' ai-publish.storage directory '{}' is not writable by the current user: ",
+            store_root.display()
+        );
+        let rro_os_reason = rro_msg.strip_prefix(&rro_msg_prefix).ok_or_else(|| {
+            format!(
+                "unexpected --fs writable error message (expected prefix '{rro_msg_prefix}'): {rro_msg}"
+            )
+        })?;
+        assert!(
+            rro_os_reason.contains("os error 13"),
+            "expected EACCES (os error 13) in --fs writable error message: {rro_msg}"
+        );
+        let expected_rro_err = serde_json::json!({
+            "code": "E301",
+            "severity": "error",
+            "message": rro_msg,
+            "path": "site[0].ai-publish.storage",
+            "location": loc_of_occurrence(&root_ro_kdl, &root_ro_node, 0)?,
+        });
+        assert_eq!(
+            rro_err, &expected_rro_err,
+            "expected exact E301 not-writable storage error with no extra fields: {rro_v}"
         );
         assert!(
             w034s(&rro_v).is_empty(),
