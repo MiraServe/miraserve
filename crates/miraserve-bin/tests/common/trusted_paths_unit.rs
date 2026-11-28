@@ -464,3 +464,256 @@ fn walk_at_makes_zero_openat2_calls_under_seccomp_kill_thread() -> TestResult {
     let _ = fs::remove_dir_all(&root);
     Ok(())
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult {
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+        SeccompRule, TargetArch,
+    };
+    use std::collections::BTreeMap;
+
+    let tmpfs_root = make_tmpfs_root("storage-meta-tmpfs")?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let root = PathBuf::from(format!(
+        "/tmp/ms-tp-unit-storage-meta-{}-{nanos}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root)?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o750))?;
+
+    let tmp_ro = tmpfs_root.join("ro_store");
+    let tmp_wr = tmpfs_root.join("wr_store");
+    let tmp_ro_parent = tmpfs_root.join("ro_parent");
+    for d in [&tmp_ro, &tmp_wr, &tmp_ro_parent] {
+        fs::create_dir_all(d)?;
+        fs::set_permissions(d, fs::Permissions::from_mode(0o750))?;
+    }
+    fs::set_permissions(&tmp_ro, fs::Permissions::from_mode(0o550))?;
+    fs::set_permissions(&tmp_ro_parent, fs::Permissions::from_mode(0o550))?;
+    fs::set_permissions(&tmp_wr, fs::Permissions::from_mode(0o775))?;
+
+    let ro_store = root.join("ro_store");
+    let wr_store = root.join("wr_store");
+    let ro_parent = root.join("ro_parent");
+    let pub_key = root.join("deploy.pub");
+    for d in [&ro_store, &wr_store, &ro_parent] {
+        fs::create_dir_all(d)?;
+        fs::set_permissions(d, fs::Permissions::from_mode(0o750))?;
+    }
+    fs::write(&pub_key, b"0123456789abcdef0123456789abcdef\n")?;
+    fs::set_permissions(&pub_key, fs::Permissions::from_mode(0o640))?;
+    // Make `ro_store` and `ro_parent` read+search only (0550) and `wr_store` writable (0775).
+    fs::set_permissions(&ro_store, fs::Permissions::from_mode(0o550))?;
+    fs::set_permissions(&ro_parent, fs::Permissions::from_mode(0o550))?;
+    fs::set_permissions(&wr_store, fs::Permissions::from_mode(0o775))?;
+
+    let absent_leaf = ro_parent.join("absent_leaf");
+    let absent_mid = ro_parent.join("absent_mid").join("store");
+    let cfg_path = root.join("meta.kdl");
+    fs::write(
+        &cfg_path,
+        format!(
+            "server {{ listen \":443\" }}\n\
+             site \"s0.example\" {{\n\
+                 ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+             }}\n\
+             site \"s1.example\" {{\n\
+                 ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+             }}\n\
+             site \"s2.example\" {{\n\
+                 ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+             }}\n\
+             site \"s3.example\" {{\n\
+                 ai-publish {{ storage \"{}\"; require-signature \"ed25519:{}\" }}\n\
+             }}\n",
+            ro_store.display(),
+            pub_key.display(),
+            wr_store.display(),
+            pub_key.display(),
+            absent_leaf.display(),
+            pub_key.display(),
+            absent_mid.display(),
+            pub_key.display(),
+        ),
+    )?;
+    let loaded = miraserve_config::load_file_detailed(&cfg_path)?;
+
+    let stat_snap = |p: &Path| -> Result<(i64, i64, i64, i64, u64), std::io::Error> {
+        let fd = op(CWD, p, OFlags::DIRECTORY | OFlags::NOFOLLOW).map_err(std::io::Error::from)?;
+        let st = fstat(&fd).map_err(std::io::Error::from)?;
+        #[allow(clippy::cast_lossless)]
+        Ok((
+            st.st_mtime as i64,
+            st.st_mtime_nsec as i64,
+            st.st_ctime as i64,
+            st.st_ctime_nsec as i64,
+            st.st_nlink as u64,
+        ))
+    };
+    let ro_store_before = stat_snap(&ro_store)?;
+    let ro_parent_before = stat_snap(&ro_parent)?;
+
+    let root_fd = op(CWD, "/", OFlags::DIRECTORY)?;
+    let root_sf = fstatfs(&root_fd)?;
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let root_magic = root_sf.f_type as u32;
+
+    let arch = TargetArch::try_from(std::env::consts::ARCH)?;
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let (openat_nr, mutating_nrs): (i64, &[i64]) = match arch {
+        TargetArch::aarch64 | TargetArch::riscv64 => (56, &[34, 35, 38, 45, 46, 52, 53, 276, 437]),
+        TargetArch::x86_64 => (
+            257,
+            &[
+                2, 76, 77, 82, 83, 85, 87, 90, 91, 258, 263, 264, 268, 316, 437,
+            ],
+        ),
+    };
+    for &nr in mutating_nrs {
+        rules.insert(nr, Vec::new());
+        if arch == TargetArch::x86_64 {
+            rules.insert(nr | 0x4000_0000, Vec::new());
+        }
+    }
+    // Also kill on `openat` with O_WRONLY (1), O_RDWR (2), O_CREAT (0o100), or O_TRUNC (0o1000).
+    let openat_write_rules = vec![
+        SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0o3),
+            1,
+        )?])?,
+        SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0o3),
+            2,
+        )?])?,
+        SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0o100),
+            0o100,
+        )?])?,
+        SeccompRule::new(vec![SeccompCondition::new(
+            2,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::MaskedEq(0o1000),
+            0o1000,
+        )?])?,
+    ];
+    rules.insert(openat_nr, openat_write_rules.clone());
+    if arch == TargetArch::x86_64 {
+        rules.insert(openat_nr | 0x4000_0000, openat_write_rules);
+    }
+    let bpf: seccompiler::BpfProgram =
+        SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::KillThread, arch)?
+            .try_into()?;
+
+    let euid = rustix::process::geteuid().as_raw();
+    let tmpfs_c = tmpfs_root.clone();
+    let cfg_c = cfg_path.clone();
+    let handle = std::thread::spawn(move || -> Result<(Vec<ConfigIssue>, Vec<String>), String> {
+        seccompiler::apply_filter(&bpf).map_err(|e| e.to_string())?;
+        // 1. Direct `walk_at` on tmpfs root (works even when host `/` is overlayfs).
+        let ctx = Ctx(Some(euid), true, Some(65_534), true);
+        walk_at(&ctx, &tmpfs_c, Path::new("/ro_store"), 3).map_err(|f| f.2)?;
+        if walk_at(&ctx, &tmpfs_c, Path::new("/wr_store"), 3)
+            .err()
+            .is_none_or(|f| f.2 != "group or other writable")
+        {
+            return Err("expected group or other writable on /wr_store".to_owned());
+        }
+        if walk_at(&ctx, &tmpfs_c, Path::new("/ro_parent/absent_leaf"), 3)
+            .err()
+            .is_none_or(|f| !f.2.starts_with("not found; "))
+        {
+            return Err("expected not found on /ro_parent/absent_leaf".to_owned());
+        }
+        // 2. Direct `trusted_paths::check` (bypassing `check_writable_dir` probe!).
+        let args = CheckArgs {
+            config: cfg_c,
+            strict: false,
+            allow_warning: Vec::new(),
+            format: crate::check::OutputFormat::Text,
+            dump_normalized: false,
+            quiet: false,
+            dev_tls: false,
+            fs: true,
+            trusted_paths: true,
+            acme_dir: None,
+            keyd_auth_secret_file: None,
+            log_file: None,
+            access_log: None,
+            log_max_bytes: 0,
+            no_sandbox: false,
+            writable_set: false,
+        };
+        let mut issues = Vec::new();
+        let notes = check(&mut issues, &loaded, &args);
+        Ok((issues, notes))
+    });
+    let (issues, notes) = handle
+        .join()
+        .map_err(|_| "seccomp worker thread panicked or was killed by SIGSYS")?
+        .map_err(|e| format!("metadata-only storage check failed under seccomp: {e}"))?;
+
+    // Directory contents and timestamps/nlink must be completely untouched.
+    assert_eq!(fs::read_dir(&ro_store)?.count(), 0);
+    assert_eq!(fs::read_dir(&ro_parent)?.count(), 0);
+    assert_eq!(stat_snap(&ro_store)?, ro_store_before);
+    assert_eq!(stat_snap(&ro_parent)?, ro_parent_before);
+    assert_eq!(
+        notes.len(),
+        2,
+        "expected observer + narrowed notes only: {notes:?}"
+    );
+
+    // Assert the single exact deterministic result for the actual `/` filesystem.
+    if is_local_posix_fs(root_magic) {
+        let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                Some("site[1].ai-publish.storage"),
+                Some("site[2].ai-publish.storage"),
+                Some("site[3].ai-publish.storage"),
+            ],
+            "expected W034 on wr_store + absent_leaf + absent_mid (and 0 on 0550 ro_store): {issues:#?}"
+        );
+    } else {
+        let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                Some("site[0].ai-publish.storage"),
+                Some("site[1].ai-publish.storage"),
+                Some("site[2].ai-publish.storage"),
+                Some("site[3].ai-publish.storage"),
+            ],
+            "expected W034 for all 4 sites on unsupported root fs 0x{root_magic:x}: {issues:#?}"
+        );
+        let expected_fs_frag = format!("(filesystem 0x{root_magic:x})");
+        for issue in &issues {
+            assert!(
+                issue.message.contains(&expected_fs_frag),
+                "expected {expected_fs_frag} in {}",
+                issue.message
+            );
+        }
+    }
+
+    // Restore writable mode before cleanup.
+    let _ = fs::set_permissions(&ro_store, fs::Permissions::from_mode(0o750));
+    let _ = fs::set_permissions(&ro_parent, fs::Permissions::from_mode(0o750));
+    let _ = fs::set_permissions(&tmp_ro, fs::Permissions::from_mode(0o750));
+    let _ = fs::set_permissions(&tmp_ro_parent, fs::Permissions::from_mode(0o750));
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&tmpfs_root);
+    Ok(())
+}
