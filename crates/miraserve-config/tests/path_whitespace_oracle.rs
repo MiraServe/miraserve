@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::kdl_escape_path;
 use miraserve_config::{
-    ConfigError, ConfigIssue, load_file_detailed, parse_kdl_detailed,
+    ConfigError, ConfigIssue, Severity, load_file_detailed, parse_kdl_detailed,
     parse_kdl_detailed_with_base_dir,
 };
 
@@ -63,18 +63,26 @@ fn strip_windows_verbatim_prefix(path: &Path) -> String {
     }
 }
 
-fn expect_validation_errors(
+fn expect_validation_errors_and_warnings(
     res: Result<miraserve_config::LoadedConfig, ConfigError>,
-) -> Result<Vec<ConfigIssue>, Box<dyn std::error::Error>> {
+) -> Result<(Vec<ConfigIssue>, Vec<ConfigIssue>), Box<dyn std::error::Error>> {
     match res {
         Ok(loaded) => Err(format!(
             "expected ConfigError::Validation, but config loaded cleanly (sites={})",
             loaded.config.sites.len()
         )
         .into()),
-        Err(ConfigError::Validation { errors, .. }) => Ok(errors),
+        Err(ConfigError::Validation {
+            errors, warnings, ..
+        }) => Ok((errors, warnings)),
         Err(other) => Err(format!("expected ConfigError::Validation, got: {other}").into()),
     }
+}
+
+fn expect_validation_errors(
+    res: Result<miraserve_config::LoadedConfig, ConfigError>,
+) -> Result<Vec<ConfigIssue>, Box<dyn std::error::Error>> {
+    Ok(expect_validation_errors_and_warnings(res)?.0)
 }
 
 fn offset_for_line_col(source: &str, target_line: usize, target_col: usize) -> Option<usize> {
@@ -492,49 +500,78 @@ site "pub.example" {
 
 #[test]
 fn parity_excluded_grammars_index_try_files_and_inline_keys_unchanged() -> TestResult {
-    let kdl = r#"
-server {
+    let inline_clean = "miraserve-ed25519-pub:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    let inline_trailing_space =
+        "miraserve-ed25519-pub:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= ";
+    let kdl = format!(
+        r#"
+server {{
     listen ":443"
-    tls { cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }
-}
-site "excluded.example" {
+    tls {{ cert "/etc/miraserve/certs/a.crt"; key "/etc/miraserve/certs/a.key" }}
+}}
+site "excluded.example" {{
     root "/srv/www/excluded"
     index " index.html" "home.html "
-    route "/spa/*" {
-        try-files " {path}" "/index.html "
-    }
-    route "/st/*" {
-        static {
+    route "/spa/*" {{
+        try-files " {{path}}" "/index.html "
+    }}
+    route "/st/*" {{
+        static {{
             index " landing.html "
-        }
-    }
-    route "/mcp/*" {
-        mcp-gateway upstream="https://127.0.0.1:9001" {
-            jwt-public-key "miraserve-ed25519-pub:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        }}
+    }}
+    route "/mcp/*" {{
+        mcp-gateway upstream="https://127.0.0.1:9001" {{
+            jwt-public-key "{inline_clean}"
             jwt-issuer "https://auth.example"
             jwt-audience "https://excluded.example/mcp"
             allow-tools "docs_read"
-        }
-    }
-}
-site "pub-inline.example" {
-    ai-publish {
+        }}
+    }}
+    route "/mcp-padded/*" {{
+        mcp-gateway upstream="https://127.0.0.1:9001" {{
+            jwt-public-key "{inline_trailing_space}"
+            jwt-issuer "https://auth.example"
+            jwt-audience "https://excluded.example/mcp-padded"
+            allow-tools "docs_read"
+        }}
+    }}
+}}
+site "pub-inline.example" {{
+    ai-publish {{
         storage "/srv/publish/inline"
         require-signature "ed25519:/etc/miraserve/deploy.pub"
-        jwt-public-key "miraserve-ed25519-pub:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        jwt-public-key "{inline_clean}"
         jwt-issuer "https://auth.example"
         mcp-endpoint "/_miraserve/publish" auth="oauth-jwt"
-    }
-}
-"#;
-    let loaded = parse_kdl_detailed("excluded.kdl", kdl)?;
-    let site0 = loaded.config.sites.first().ok_or("expected site[0]")?;
+    }}
+}}
+site "pub-inline-padded.example" {{
+    ai-publish {{
+        storage "/srv/publish/inline-padded"
+        require-signature "ed25519:/etc/miraserve/deploy.pub"
+        jwt-public-key "{inline_trailing_space}"
+        jwt-issuer "https://auth.example"
+        mcp-endpoint "/_miraserve/publish" auth="oauth-jwt"
+    }}
+}}
+"#
+    );
+    let loaded = parse_kdl_detailed("excluded.kdl", &kdl)?;
+    assert!(
+        loaded.report.warnings.is_empty(),
+        "unexpected warnings on excluded-grammar parity config: {:?}",
+        loaded.report.warnings
+    );
+    let [site0, site1, site2] = loaded.config.sites.as_slice() else {
+        return Err("expected 3 sites".into());
+    };
     assert_eq!(
         site0.index,
         Some(vec![" index.html".to_owned(), "home.html ".to_owned()])
     );
-    let [r0, r1, _] = site0.routes.as_slice() else {
-        return Err("expected 3 routes".into());
+    let [r0, r1, r2, r3] = site0.routes.as_slice() else {
+        return Err("expected 4 routes".into());
     };
     match &r0.handler {
         miraserve_config::RouteHandler::TryFiles(tf) => {
@@ -551,6 +588,75 @@ site "pub-inline.example" {
         }
         other => return Err(format!("expected Static, got {other:?}").into()),
     }
+    match &r2.handler {
+        miraserve_config::RouteHandler::McpGateway(mcp) => {
+            assert_eq!(mcp.jwt_public_key.as_deref(), Some(inline_clean));
+        }
+        other => return Err(format!("expected McpGateway, got {other:?}").into()),
+    }
+    match &r3.handler {
+        miraserve_config::RouteHandler::McpGateway(mcp) => {
+            assert_eq!(mcp.jwt_public_key.as_deref(), Some(inline_trailing_space));
+        }
+        other => return Err(format!("expected McpGateway, got {other:?}").into()),
+    }
+    let pub1 = site1
+        .ai_publish
+        .as_ref()
+        .ok_or("expected site[1].ai_publish")?;
+    assert_eq!(pub1.jwt_public_key.as_deref(), Some(inline_clean));
+    let pub2 = site2
+        .ai_publish
+        .as_ref()
+        .ok_or("expected site[2].ai_publish")?;
+    assert_eq!(pub2.jwt_public_key.as_deref(), Some(inline_trailing_space));
+    Ok(())
+}
+
+#[test]
+fn parity_discarded_route_resolved_dir_padding_pins_e302_only() -> TestResult {
+    // Accepted behaviour by design under G2: E202 is emitted for a padded in-scope value when
+    // the value is read AND its enclosing site or route is retained by the loader; when the
+    // enclosing route is discarded for missing a handler (E302), only E302 is reported here and
+    // the resolved-directory padding on `root "app /."` is reported once the handler is added.
+    let tmp = TempDir::new("discarded-route")?;
+    let cfg = tmp.path.join("discarded-route.kdl");
+    let kdl = r#"server { listen ":443" }
+site "shop.example" {
+    root "/srv/www/shop"
+    route "/assets/*" {
+        root "app /."
+    }
+}
+"#;
+    fs::write(&cfg, kdl)?;
+    let (errs, warnings) = expect_validation_errors_and_warnings(load_file_detailed(&cfg))?;
+    assert!(errs.iter().all(|e| e.severity == Severity::Error));
+    assert!(warnings.iter().all(|w| w.severity == Severity::Warning));
+    assert_exact_issues(
+        kdl,
+        &errs,
+        &[(
+            "E302",
+            None,
+            "route '/assets/*' does not configure a handler",
+            Some((
+                4,
+                5,
+                "route \"/assets/*\" {\n        root \"app /.\"\n    }",
+            )),
+        )],
+    )?;
+    assert_exact_issues(
+        kdl,
+        &warnings,
+        &[(
+            "W015",
+            Some("server.tls"),
+            "no TLS certificate, ACME block, or split-daemon keyd is configured; `miraserve run` will fail unless started with `--dev-tls`",
+            None,
+        )],
+    )?;
     Ok(())
 }
 
@@ -1739,7 +1845,10 @@ site "pair-ws.example" {
     root "/srv/www/pair"
 }
 "#;
-    let errs = expect_validation_errors(parse_kdl_detailed("pair-ws.kdl", kdl))?;
+    let (errs, warnings) =
+        expect_validation_errors_and_warnings(parse_kdl_detailed("pair-ws.kdl", kdl))?;
+    assert!(errs.iter().all(|e| e.severity == Severity::Error));
+    assert!(warnings.iter().all(|w| w.severity == Severity::Warning));
     assert_exact_issues(
         kdl,
         &errs,
@@ -1757,6 +1866,16 @@ site "pair-ws.example" {
                 Some((4, 5, "tls { cert \"/etc/miraserve/a.crt \" }")),
             ),
         ],
+    )?;
+    assert_exact_issues(
+        kdl,
+        &warnings,
+        &[(
+            "W015",
+            Some("server.tls"),
+            "no TLS certificate, ACME block, or split-daemon keyd is configured; `miraserve run` will fail unless started with `--dev-tls`",
+            Some((4, 5, "tls { cert \"/etc/miraserve/a.crt \" }")),
+        )],
     )?;
     Ok(())
 }
@@ -2489,6 +2608,81 @@ site "route-multi.example" {
                     Some("sites.2.root"),
                     "site root '/srv/publish/only-padded' overlaps ai-publish.storage '/srv/publish/only-padded ' and would expose publish metadata/releases",
                     None,
+                ),
+            ],
+        )?;
+    }
+
+    // 9. Ordered load-time warning preservation alongside errors for a padded input:
+    //    pins both errors ([whitespace E202, forbidden-dir E202]) and the exact ordered
+    //    warning list ([W002, W001, W015, W031]) with real locations and severities.
+    {
+        let kdl = r#"
+server {
+    listen ":443"
+    tls {
+        min-version "1.2"
+        pqc-hybrid #false
+    }
+}
+site "warn-preserve.example" {
+    root "/etc "
+    http "serve"
+}
+"#;
+        let (errs, warnings) =
+            expect_validation_errors_and_warnings(parse_kdl_detailed("warn-preserve.kdl", kdl))?;
+        assert!(errs.iter().all(|e| e.severity == Severity::Error));
+        assert!(warnings.iter().all(|w| w.severity == Severity::Warning));
+        assert_exact_issues(
+            kdl,
+            &errs,
+            &[
+                (
+                    "E202",
+                    Some("site[0].root"),
+                    "site 'root' path on site 'warn-preserve.example' ends with whitespace (U+0020)",
+                    Some((10, 10, "\"/etc \"")),
+                ),
+                (
+                    "E202",
+                    Some("site[0].root"),
+                    "site root path '/etc ' points to a sensitive or overly broad system directory",
+                    Some((10, 5, "root \"/etc \"")),
+                ),
+            ],
+        )?;
+        assert_exact_issues(
+            kdl,
+            &warnings,
+            &[
+                (
+                    "W002",
+                    Some("server.tls.min-version"),
+                    "global TLS min-version is downgraded to 1.2",
+                    Some((5, 9, "min-version \"1.2\"")),
+                ),
+                (
+                    "W001",
+                    Some("server.tls.pqc-hybrid"),
+                    "post-quantum hybrid key exchange (X25519MLKEM768) is disabled globally",
+                    Some((6, 9, "pqc-hybrid #false")),
+                ),
+                (
+                    "W015",
+                    Some("server.tls"),
+                    "no TLS certificate, ACME block, or split-daemon keyd is configured; `miraserve run` will fail unless started with `--dev-tls`",
+                    Some((
+                        4,
+                        5,
+                        "tls {\n        min-version \"1.2\"\n        pqc-hybrid #false\n    }",
+                    )),
+                ),
+                (
+                    "W031",
+                    Some("site[0].http"),
+                    "site 'warn-preserve.example' sets `http \"serve\"`, but no listener has `redirect-https=#true`; the setting has no effect",
+                    Some((11, 5, "http \"serve\"")),
                 ),
             ],
         )?;

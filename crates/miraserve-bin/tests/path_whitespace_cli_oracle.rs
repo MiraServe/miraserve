@@ -1171,3 +1171,218 @@ fn security_rejected_padded_publish_and_root_siblings_neither_provisioned_grante
 
     Ok(())
 }
+
+#[test]
+fn parity_reload_dry_run_json_for_other_load_error_pins_empty_warnings() -> TestResult {
+    // Baseline behaviour at 441a58d: on ANY load failure (here unknown directive E002),
+    // `reload --dry-run --format json` prints an empty `warnings` array even when the loader
+    // produced load-time warnings (W002, W015), while `check --format json` shows them.
+    let bin = current_bin();
+    let tmp = TempDir::new("reload-other-err")?;
+    let cfg = tmp.path.join("other-err.kdl");
+    fs::write(
+        &cfg,
+        r#"server {
+    listen ":443"
+    tls { min-version "1.2" }
+    bogus "x"
+}
+site "shop.example" {
+    root "/srv/www/shop"
+}
+"#,
+    )?;
+    let cfg_str = cfg.to_str().ok_or("non-utf8 path")?;
+
+    let (rld_code, rld_stdout, rld_stderr) = run_bin(
+        &bin,
+        &tmp.path,
+        &[
+            "reload",
+            "--dry-run",
+            "--format",
+            "json",
+            "--config",
+            cfg_str,
+        ],
+        None,
+    )?;
+    assert_eq!(rld_code, Some(1));
+    assert_eq!(rld_stderr, b"");
+    let rld_json: serde_json::Value = serde_json::from_slice(&rld_stdout)?;
+    assert_eq!(rld_json.get("reloaded"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        rld_json.get("outcome").and_then(serde_json::Value::as_str),
+        Some("dry_run_refused")
+    );
+    assert_eq!(
+        rld_json
+            .get("quarantined_source")
+            .and_then(serde_json::Value::as_str),
+        Some("preflight")
+    );
+    assert_eq!(
+        rld_json.get("dry_run").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        rld_json.get("warnings"),
+        Some(&serde_json::json!([])),
+        "reload load-error JSON prints empty warnings for every load error: {rld_json}"
+    );
+    assert_eq!(rld_json.get("quarantined"), Some(&serde_json::json!([])));
+    assert_eq!(
+        rld_json.get("restart_required"),
+        Some(&serde_json::json!([]))
+    );
+    let expected_errors = vec![
+        format!(
+            "refusing to signal reload because '{}' is invalid: configuration validation failed with 1 error(s)",
+            cfg.display()
+        ),
+        "[E002] unknown directive 'bogus' inside 'server' (line 4, col 5)".to_owned(),
+    ];
+    let actual_errors: Vec<&str> = rld_json
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("expected errors array")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(actual_errors, expected_errors);
+
+    if let Some(base_bin) = baseline_bin() {
+        let (base_code, base_stdout, base_stderr) = run_bin(
+            &base_bin,
+            &tmp.path,
+            &[
+                "reload",
+                "--dry-run",
+                "--format",
+                "json",
+                "--config",
+                cfg_str,
+            ],
+            None,
+        )?;
+        assert_eq!(rld_code, base_code);
+        assert_eq!(rld_stdout, base_stdout);
+        assert_eq!(rld_stderr, base_stderr);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn security_reload_dry_run_json_for_padded_input_pins_errors_and_warnings() -> TestResult {
+    // Pins the exact `reload --dry-run --format json` output for a padded input that also carries
+    // load-time warnings (W002, W015). Under G2, each command shows warnings for a failed load
+    // exactly as it does for any other load error: `reload --dry-run --format json` emits an
+    // empty `warnings` array (pinned here so any later change is visible), while `check --format json`
+    // emits the load-time warnings alongside `E202`.
+    let bin = current_bin();
+    let tmp = TempDir::new("reload-padded-json")?;
+    let cfg = tmp.path.join("padded-w002.kdl");
+    fs::write(
+        &cfg,
+        r#"server {
+    listen ":443"
+    tls { min-version "1.2" }
+}
+site "shop.example" {
+    root "/srv/www/shop "
+}
+"#,
+    )?;
+    let cfg_str = cfg.to_str().ok_or("non-utf8 path")?;
+
+    let (rld_code, rld_stdout, _) = run_bin(
+        &bin,
+        &tmp.path,
+        &[
+            "reload",
+            "--dry-run",
+            "--format",
+            "json",
+            "--config",
+            cfg_str,
+        ],
+        None,
+    )?;
+    assert_eq!(rld_code, Some(1), "reload --dry-run must exit 1");
+    let rld_json: serde_json::Value = serde_json::from_slice(&rld_stdout)?;
+    assert_eq!(rld_json.get("reloaded"), Some(&serde_json::Value::Null));
+    assert_eq!(
+        rld_json.get("outcome").and_then(serde_json::Value::as_str),
+        Some("dry_run_refused")
+    );
+    assert_eq!(
+        rld_json
+            .get("quarantined_source")
+            .and_then(serde_json::Value::as_str),
+        Some("preflight")
+    );
+    assert_eq!(
+        rld_json.get("dry_run").and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        rld_json.get("warnings"),
+        Some(&serde_json::json!([])),
+        "reload load-error branch emits empty warnings for every load error (pinned): {rld_json}"
+    );
+    assert_eq!(rld_json.get("quarantined"), Some(&serde_json::json!([])));
+    assert_eq!(
+        rld_json.get("restart_required"),
+        Some(&serde_json::json!([]))
+    );
+    let expected_errors = vec![
+        format!(
+            "refusing to signal reload because '{}' is invalid: configuration validation failed with 1 error(s)",
+            cfg.display()
+        ),
+        "[E202] site 'root' path on site 'shop.example' ends with whitespace (U+0020) (line 6, col 10)"
+            .to_owned(),
+    ];
+    let actual_errors: Vec<&str> = rld_json
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("expected reload errors array")?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(actual_errors, expected_errors);
+
+    // Cross-check `check --format json` on the identical file: `E202` plus ordered load-time
+    // warnings [W002, W015] are preserved in `ConfigError::Validation`.
+    let (chk_code, chk_stdout, _) = run_bin(
+        &bin,
+        &tmp.path,
+        &["check", "--format", "json", cfg_str],
+        None,
+    )?;
+    assert_eq!(chk_code, Some(1));
+    let chk_json: serde_json::Value = serde_json::from_slice(&chk_stdout)?;
+    assert_eq!(
+        chk_json.get("valid").and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    let chk_err_codes: Vec<&str> = chk_json
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("expected check errors array")?
+        .iter()
+        .filter_map(|e| e.get("code").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(chk_err_codes, vec!["E202"]);
+    let chk_warn_codes: Vec<&str> = chk_json
+        .get("warnings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("expected check warnings array")?
+        .iter()
+        .filter_map(|w| w.get("code").and_then(serde_json::Value::as_str))
+        .collect();
+    assert_eq!(chk_warn_codes, vec!["W002", "W015"]);
+
+    Ok(())
+}
