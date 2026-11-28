@@ -802,7 +802,8 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                     const NEW_NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, mcp-gateway, wasm-plugin, or non-rotating log paths";
                     const HELP_GEN: &str = "keep every ancestor (and exclusive state directory) owned by root or the service account, not group/other-writable, on an ordinary local POSIX filesystem; use absolute paths";
 
-                    let acme_msg_prefix = format!("ACME directory '{acme_str}': ");
+                    let sock_msg_prefix =
+                        format!("server.sandbox socket-tree root '{}': ", sock_dir.display());
                     let storage_node = "storage \"releases\"";
                     let storage_offset = clean_kdl
                         .find(storage_node)
@@ -828,9 +829,11 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
 
                         // Read-only inspection of baseline JSON to learn whether the shared
                         // ancestor prefix up to `base` (e.g. overlayfs `/` or a writable non-sticky
-                        // `TMPDIR` ancestor) already triggered an ACME W034, and its warning count.
+                        // `TMPDIR` ancestor) already triggered a `server.sandbox.socket-tree` W034
+                        // (whose own leaf is 0750 owned by euid, so it only fails on a shared
+                        // ancestor — unlike ACME, which as root also flags unknown service uid).
                         let b_val: serde_json::Value = serde_json::from_str(&b_str)?;
-                        let acme_tail: Option<String> = b_val
+                        let shared_anc_tail: Option<String> = b_val
                             .get("warnings")
                             .and_then(serde_json::Value::as_array)
                             .and_then(|ws| {
@@ -838,14 +841,14 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                                     w.get("code").and_then(serde_json::Value::as_str)
                                         == Some("W034")
                                         && w.get("path").and_then(serde_json::Value::as_str)
-                                            == Some("server.tls.acme")
+                                            == Some("server.sandbox.socket-tree")
                                 })
                             })
                             .and_then(|w| w.get("message").and_then(serde_json::Value::as_str))
-                            .and_then(|m| m.strip_prefix(&acme_msg_prefix))
+                            .and_then(|m| m.strip_prefix(&sock_msg_prefix))
                             .map(str::to_owned);
 
-                        if let Some(failure_tail) = acme_tail {
+                        if let Some(failure_tail) = shared_anc_tail {
                             let b_warn_count = b_val
                                 .pointer("/summary/warnings")
                                 .and_then(serde_json::Value::as_u64)
@@ -900,12 +903,12 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
                         let mut expected_out = b_out.replacen(OLD_NARROWED, NEW_NARROWED, 1);
                         let mut expected_err = b_stderr.clone();
 
-                        let acme_warn_prefix = format!("warning[W034]: {acme_msg_prefix}");
-                        let acme_tail = b_err
+                        let sock_warn_prefix = format!("warning[W034]: {sock_msg_prefix}");
+                        let shared_anc_tail = b_err
                             .lines()
-                            .find_map(|line| line.strip_prefix(&acme_warn_prefix));
+                            .find_map(|line| line.strip_prefix(&sock_warn_prefix));
 
-                        if let Some(failure_tail) = acme_tail {
+                        if let Some(failure_tail) = shared_anc_tail {
                             let expected_extra_err = format!(
                                 "warning[W034]: site 'rel.example' ai-publish storage '{expected_rel_store}': {failure_tail}\n  help: {HELP_GEN}\n"
                             );
