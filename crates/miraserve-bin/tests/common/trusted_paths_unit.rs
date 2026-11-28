@@ -541,18 +541,23 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
             pub_key.display(),
         ),
     )?;
-    let loaded = miraserve_config::load_file_detailed(&cfg_path)?;
+    let mut loaded = miraserve_config::load_file_detailed(&cfg_path)?;
+    // Also append a synthetic 5th site duplicating site[1]'s exact `wr_store` path (bypassing
+    // `R5-PUB-5` load-time overlap rejection) to prove `trusted_paths::check` emits per-field
+    // without deduplicating repeated stores.
+    if let Some(dup_site) = loaded.config.sites.get(1).cloned() {
+        loaded.config.sites.push(dup_site);
+    }
 
-    let stat_snap = |p: &Path| -> Result<(i64, i64, i64, i64, u64), std::io::Error> {
+    let stat_snap = |p: &Path| -> Result<_, std::io::Error> {
         let fd = op(CWD, p, OFlags::DIRECTORY | OFlags::NOFOLLOW).map_err(std::io::Error::from)?;
         let st = fstat(&fd).map_err(std::io::Error::from)?;
-        #[allow(clippy::cast_lossless)]
         Ok((
-            st.st_mtime as i64,
-            st.st_mtime_nsec as i64,
-            st.st_ctime as i64,
-            st.st_ctime_nsec as i64,
-            st.st_nlink as u64,
+            st.st_mtime,
+            st.st_mtime_nsec,
+            st.st_ctime,
+            st.st_ctime_nsec,
+            st.st_nlink,
         ))
     };
     let ro_store_before = stat_snap(&ro_store)?;
@@ -683,8 +688,9 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
                 Some("site[1].ai-publish.storage"),
                 Some("site[2].ai-publish.storage"),
                 Some("site[3].ai-publish.storage"),
+                Some("site[4].ai-publish.storage"),
             ],
-            "expected W034 on wr_store + absent_leaf + absent_mid (and 0 on 0550 ro_store): {issues:#?}"
+            "expected W034 on wr_store + absent_leaf + absent_mid + dup wr_store (and 0 on 0550 ro_store): {issues:#?}"
         );
     } else {
         let paths: Vec<Option<&str>> = issues.iter().map(|i| i.path.as_deref()).collect();
@@ -695,8 +701,9 @@ fn ai_publish_storage_check_is_metadata_only_and_makes_no_writes() -> TestResult
                 Some("site[1].ai-publish.storage"),
                 Some("site[2].ai-publish.storage"),
                 Some("site[3].ai-publish.storage"),
+                Some("site[4].ai-publish.storage"),
             ],
-            "expected W034 for all 4 sites on unsupported root fs 0x{root_magic:x}: {issues:#?}"
+            "expected W034 for all 5 sites on unsupported root fs 0x{root_magic:x}: {issues:#?}"
         );
         let expected_fs_frag = format!("(filesystem 0x{root_magic:x})");
         for issue in &issues {

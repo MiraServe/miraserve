@@ -81,12 +81,16 @@ pub(crate) struct CheckArgs {
     /// notes. It does not change what the server does (without it, the processing of a
     /// configuration is the same as in 0.1.6 apart from the Linux `--fs` Landlock probe `W035`;
     /// with it, existing `--fs` probes still run). Walks the
-    /// directories on the way to five kinds of configured paths and stops at the first component it
+    /// directories on the way to covered configured paths and stops at the first component it
     /// reports or does not find: `socket-tree` roots, exact `fastcgi-pass` Unix sockets,
     /// `keyd-socket` (path of the endpoint the server connects to), ACME dir (`--acme-dir` or
     /// `.miraserve-acme`), and rotating log parents (`--log-file`/`--access-log` when
-    /// `--log-max-bytes > 0`); other configured paths, including `ai-publish` storage, are not
-    /// looked at yet. For each path it considers untrusted or cannot verify, it reports `W034`
+    /// `--log-max-bytes > 0`). Also inspects the configured `ai-publish.storage` directory for
+    /// each site that specifies one (using the loaded path; reports `W034` for a missing store,
+    /// ownership/mode problem, or unverified path; stops at the store directory—files and
+    /// directories below it, service write access, and the integrity of published content are
+    /// outside this check). Other configured paths are not looked at yet. For each path it
+    /// considers untrusted or cannot verify, it reports `W034`
     /// giving the component (when reported), its owner and mode (when known), and the reason. A
     /// warning means the check found something to fix on that path, or could not verify it; the
     /// reason in the warning says which, and the usual fixes are to correct the ownership, mode or

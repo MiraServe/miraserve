@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 const NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, \
     site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, \
-    basic-auth, bot-auth, ai-publish storage and keys, error-pages, upstream-tls, mcp-gateway, \
+    basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, mcp-gateway, \
     wasm-plugin, or non-rotating log paths";
 const HELP_GEN: &str = "keep every ancestor (and exclusive state directory) owned by root or the \
     service account, not group/other-writable, on an ordinary local POSIX filesystem; use absolute paths";
@@ -177,6 +177,14 @@ pub(crate) fn check(out: &mut Vec<ConfigIssue>, l: &LoadedConfig, a: &CheckArgs)
                 (true, None) => (p.as_path(), Err(fin(p, "log path has no parent directory"))),
             };
             chk(&key, &lb, t, false, r);
+        }
+    }
+    for (i, s) in cfg.sites.iter().enumerate() {
+        if let Some(pb) = &s.ai_publish {
+            let h = s.hosts.first().map_or("<site>", String::as_str);
+            let k = format!("site[{i}].ai-publish.storage");
+            let lb = format!("site '{h}' ai-publish storage");
+            chk(&k, &lb, Path::new(&pb.storage), true, Ok(3));
         }
     }
     notes

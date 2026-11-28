@@ -113,14 +113,16 @@ fn check_help_lists_trusted_paths_scope_assumptions_and_limits() -> TestResult {
         "W034",
         "Linux-only",
         "its only warning code is `W034`; it also prints notes",
-        "Walks the directories on the way to five kinds of configured paths and stops at the first component it reports or does not find:",
+        "Walks the directories on the way to covered configured paths and stops at the first component it reports or does not find:",
         "socket-tree",
         "fastcgi-pass",
         "keyd-socket",
         "path of the endpoint the server connects to",
         "ACME",
         "rotating log",
-        "other configured paths, including `ai-publish` storage, are not looked at yet",
+        "Also inspects the configured `ai-publish.storage` directory for each site that specifies one",
+        "stops at the store directory—files and directories below it, service write access, and the integrity of published content are outside this check",
+        "Other configured paths are not looked at yet.",
         "For each path it considers untrusted or cannot verify, it reports `W034` giving the component (when reported), its owner and mode (when known), and the reason.",
         "A warning means the check found something to fix on that path, or could not verify it; the reason in the warning says which, and the usual fixes are to correct the ownership, mode or type of the named component, or to move the path.",
         "No warning is not a guarantee.",
@@ -287,7 +289,7 @@ mod linux_tests {
 
     const NARROWED_NOTE_LITERAL: &str = "trusted-paths (narrowed): does not yet inspect config file, \
         read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, \
-        acme-webroot, basic-auth, bot-auth, ai-publish storage and keys, error-pages, \
+        acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, \
         upstream-tls, mcp-gateway, wasm-plugin, or non-rotating log paths";
 
     const TREE_WR_LITERAL: &str = "group or other writable (other accounts with search permission may be able to create or replace sockets)";

@@ -777,28 +777,193 @@ fn parity_clean_cli_modes_including_trusted_paths_and_service_generate() -> Test
             }
         }
 
-        // If MIRASERVE_BASELINE_BIN is provided (e.g. a 441a58d binary), assert exact
-        // byte-for-byte identity of exit code, stdout, and stderr!
+        // If MIRASERVE_BASELINE_BIN is provided (e.g. a 441a58d or bef6865 binary), assert exact
+        // byte-for-byte identity of exit code, stdout, and stderr for every flag-off case and
+        // non-Linux flag-on case; on Linux for the two `--trusted-paths` cases, allow ONLY the
+        // exact narrowed-note update and the single `site[1].ai-publish.storage` W034 delta.
         if let Some(base_bin) = &baseline {
             let (b_code, b_stdout, b_stderr) = run_bin(base_bin, base, args, *stdin_data)?;
             assert_eq!(
                 code, b_code,
-                "exit status mismatch vs 441a58d for case '{name}'"
+                "exit status mismatch vs baseline for case '{name}'"
             );
-            assert_eq!(
-                stdout,
-                b_stdout,
-                "stdout byte mismatch vs 441a58d for case '{name}'\n--- 441a58d ---\n{}\n--- BRANCH ---\n{}",
-                String::from_utf8_lossy(&b_stdout),
-                String::from_utf8_lossy(&stdout),
+            #[cfg(target_os = "linux")]
+            let handled_linux_tp = matches!(
+                *name,
+                "check_fs_trusted_paths" | "check_fs_trusted_paths_json"
             );
-            assert_eq!(
-                stderr,
-                b_stderr,
-                "stderr byte mismatch vs 441a58d for case '{name}'\n--- 441a58d ---\n{}\n--- BRANCH ---\n{}",
-                String::from_utf8_lossy(&b_stderr),
-                String::from_utf8_lossy(&stderr),
-            );
+            #[cfg(not(target_os = "linux"))]
+            let handled_linux_tp = false;
+
+            if handled_linux_tp {
+                #[cfg(target_os = "linux")]
+                {
+                    const OLD_NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, basic-auth, bot-auth, ai-publish storage and keys, error-pages, upstream-tls, mcp-gateway, wasm-plugin, or non-rotating log paths";
+                    const NEW_NARROWED: &str = "trusted-paths (narrowed): does not yet inspect config file, read-tree, site/route roots, owner-dir, TLS certs/keys/CAs, keyd-auth-secret-file, acme-webroot, basic-auth, bot-auth, ai-publish keys, error-pages, upstream-tls, mcp-gateway, wasm-plugin, or non-rotating log paths";
+
+                    let storage_prefix = format!(
+                        "site 'rel.example' ai-publish storage '{expected_rel_store}': first untrusted component '/' "
+                    );
+                    if *name == "check_fs_trusted_paths_json" {
+                        assert_eq!(stderr, b_stderr, "stderr mismatch on '{name}'");
+                        let b_str = String::from_utf8(b_stdout.clone())?;
+                        let c_str = String::from_utf8(stdout.clone())?;
+                        let mut b_val: serde_json::Value = serde_json::from_str(&b_str)?;
+                        let mut c_val: serde_json::Value = serde_json::from_str(&c_str)?;
+                        let b_has_root_w034 = b_val
+                            .get("warnings")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|ws| {
+                                ws.iter().any(|w| {
+                                    w.get("code").and_then(serde_json::Value::as_str)
+                                        == Some("W034")
+                                        && w.get("message")
+                                            .and_then(serde_json::Value::as_str)
+                                            .is_some_and(|m| {
+                                                m.contains("first untrusted component '/'")
+                                            })
+                                })
+                            });
+                        if b_has_root_w034 {
+                            let b_notes = b_val
+                                .get_mut("notes")
+                                .and_then(serde_json::Value::as_array_mut)
+                                .ok_or("baseline notes missing")?;
+                            let mut replaced = 0_usize;
+                            for n in b_notes.iter_mut() {
+                                if n.as_str() == Some(OLD_NARROWED) {
+                                    *n = serde_json::Value::String(NEW_NARROWED.to_owned());
+                                    replaced += 1;
+                                }
+                            }
+                            assert_eq!(replaced, 1, "expected 1 OLD_NARROWED in baseline notes");
+                            let c_warns = c_val
+                                .get_mut("warnings")
+                                .and_then(serde_json::Value::as_array_mut)
+                                .ok_or("candidate warnings missing")?;
+                            let extra = c_warns
+                                .pop()
+                                .ok_or("expected trailing storage W034 on unsupported root fs")?;
+                            assert_eq!(
+                                extra.get("code").and_then(serde_json::Value::as_str),
+                                Some("W034")
+                            );
+                            assert_eq!(
+                                extra.get("severity").and_then(serde_json::Value::as_str),
+                                Some("warning")
+                            );
+                            assert_eq!(
+                                extra.get("path").and_then(serde_json::Value::as_str),
+                                Some("site[1].ai-publish.storage")
+                            );
+                            assert!(
+                                extra
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|m| m.starts_with(&storage_prefix)),
+                                "unexpected extra W034 message: {extra}"
+                            );
+                            assert!(extra.get("location").is_some(), "missing location: {extra}");
+                            if let Some(sw) = c_val
+                                .pointer_mut("/summary/warnings")
+                                .and_then(|v| v.as_u64().map(|n| (v, n)))
+                            {
+                                *sw.0 = serde_json::Value::from(sw.1.saturating_sub(1));
+                            }
+                            assert_eq!(
+                                c_val, b_val,
+                                "JSON mismatch vs baseline on '{name}' after allowed storage delta"
+                            );
+                        } else {
+                            assert!(
+                                b_str.contains(OLD_NARROWED),
+                                "baseline missing OLD_NARROWED"
+                            );
+                            assert_eq!(
+                                c_str,
+                                b_str.replacen(OLD_NARROWED, NEW_NARROWED, 1),
+                                "JSON stdout mismatch vs baseline on '{name}' modulo narrowed note"
+                            );
+                        }
+                    } else {
+                        let b_out = String::from_utf8(b_stdout.clone())?;
+                        let c_out = String::from_utf8(stdout.clone())?;
+                        let b_err = String::from_utf8(b_stderr.clone())?;
+                        let c_err = String::from_utf8(stderr.clone())?;
+                        if b_err.contains("first untrusted component '/'") {
+                            let extra_err = c_err.strip_prefix(&b_err).ok_or(
+                                "candidate stderr does not preserve baseline stderr prefix",
+                            )?;
+                            let extra_lines: Vec<&str> = extra_err.lines().collect();
+                            assert_eq!(
+                                extra_lines.len(),
+                                2,
+                                "expected exactly 2 extra stderr lines (W034 + help): {extra_lines:?}"
+                            );
+                            assert!(
+                                extra_lines.first().is_some_and(|l| {
+                                    l.starts_with(&format!("warning[W034]: {storage_prefix}"))
+                                }),
+                                "unexpected extra warning line: {extra_lines:?}"
+                            );
+                            assert!(
+                                extra_lines
+                                    .get(1)
+                                    .is_some_and(|l| l.starts_with("  help: keep every ancestor")),
+                                "unexpected extra help line: {extra_lines:?}"
+                            );
+                            let mut expected_out = b_out.replacen(OLD_NARROWED, NEW_NARROWED, 1);
+                            if let Some(pos) = expected_out.find(" warning(s)") {
+                                let before = &expected_out[..pos];
+                                if let Some(sp) = before.rfind(['(', ' ']) {
+                                    let num_str = &before[sp + 1..];
+                                    if let Ok(n) = num_str.parse::<usize>() {
+                                        expected_out = format!(
+                                            "{}{}{}",
+                                            &expected_out[..=sp],
+                                            n + 1,
+                                            &expected_out[pos..]
+                                        );
+                                    }
+                                }
+                            }
+                            assert_eq!(
+                                c_out, expected_out,
+                                "text stdout mismatch vs baseline on '{name}' after allowed storage delta"
+                            );
+                        } else {
+                            assert!(
+                                b_out.contains(OLD_NARROWED),
+                                "baseline missing OLD_NARROWED"
+                            );
+                            assert_eq!(
+                                c_out,
+                                b_out.replacen(OLD_NARROWED, NEW_NARROWED, 1),
+                                "text stdout mismatch vs baseline on '{name}' modulo narrowed note"
+                            );
+                            assert_eq!(
+                                c_err, b_err,
+                                "text stderr mismatch vs baseline on '{name}'"
+                            );
+                        }
+                    }
+                }
+            } else {
+                assert_eq!(
+                    stdout,
+                    b_stdout,
+                    "stdout byte mismatch vs baseline for case '{name}'\n--- BASELINE ---\n{}\n--- BRANCH ---\n{}",
+                    String::from_utf8_lossy(&b_stdout),
+                    String::from_utf8_lossy(&stdout),
+                );
+                assert_eq!(
+                    stderr,
+                    b_stderr,
+                    "stderr byte mismatch vs baseline for case '{name}'\n--- BASELINE ---\n{}\n--- BRANCH ---\n{}",
+                    String::from_utf8_lossy(&b_stderr),
+                    String::from_utf8_lossy(&stderr),
+                );
+            }
         }
     }
 

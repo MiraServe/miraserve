@@ -32,6 +32,7 @@ use kdl_test_util::kdl_escape_path;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 type RunOutput = (Option<i32>, Vec<u8>, Vec<u8>);
+type CliCase<'a> = (&'a str, Vec<&'a str>, Option<&'a [u8]>);
 
 fn miraserve_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_miraserve"))
@@ -239,7 +240,7 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
     let padded_s = padded_cfg.to_str().ok_or("non-utf8 padded cfg")?;
     let acme_s = acme.to_str().ok_or("non-utf8 acme")?;
 
-    let cases: [(&str, Vec<&str>, Option<&[u8]>); 13] = [
+    let extra_cases: [CliCase<'_>; 14] = [
         ("check_text", vec!["check", cfg_s], None),
         ("check_json", vec!["check", "--format", "json", cfg_s], None),
         ("check_quiet", vec!["check", "--quiet", cfg_s], None),
@@ -319,21 +320,19 @@ fn flag_off_bef6865_differential_parity() -> TestResult {
             vec!["reload", "--dry-run", "--format", "json", "--config", cfg_s],
             None,
         ),
+        (
+            "reload_dry_run_rejected",
+            vec![
+                "reload",
+                "--dry-run",
+                "--format",
+                "json",
+                "--config",
+                padded_s,
+            ],
+            None,
+        ),
     ];
-
-    let mut extra_cases: Vec<(&str, Vec<&str>, Option<&[u8]>)> = cases.into_iter().collect();
-    extra_cases.push((
-        "reload_dry_run_rejected",
-        vec![
-            "reload",
-            "--dry-run",
-            "--format",
-            "json",
-            "--config",
-            padded_s,
-        ],
-        None,
-    ));
 
     for (name, args, stdin_bytes) in &extra_cases {
         let (code, stdout, stderr) = run_bin(&bin, base, args, *stdin_bytes)?;
@@ -647,13 +646,14 @@ mod linux_storage_oracles {
         }
     }
 
+    type JsonRunOut = (Option<i32>, serde_json::Value, Vec<u8>, Vec<u8>);
+
     fn run_check_json(
         bin: &Path,
         cwd: &Path,
         args: &[&str],
         cfg: &Path,
-    ) -> Result<(Option<i32>, serde_json::Value, Vec<u8>, Vec<u8>), Box<dyn std::error::Error>>
-    {
+    ) -> Result<JsonRunOut, Box<dyn std::error::Error>> {
         let cfg_s = cfg.to_str().ok_or("non-utf8 cfg")?;
         let mut full = vec!["check"];
         full.extend_from_slice(args);
@@ -786,7 +786,7 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_flag_on_old_only_and_mixed_config_exact_parity() -> TestResult {
         if !require_local_root_fs("linux_flag_on_old_only_and_mixed_config_exact_parity")? {
             return Ok(());
@@ -1135,7 +1135,7 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_storage_diagnostics_full_json_matrix() -> TestResult {
         if !require_local_root_fs("linux_storage_diagnostics_full_json_matrix")? {
             return Ok(());
@@ -1624,7 +1624,12 @@ mod linux_storage_oracles {
             );
         }
 
-        // (m): Two sites sharing the exact same bad store -> 2 W034s in source order (no dedup!).
+        // (m): Two sites sharing a store:
+        //  - Identical literal storage paths are rejected at KDL load with `E401` (`R5-PUB-5`,
+        //    `crates/miraserve-config/src/validate.rs:1120-1158`) before `--trusted-paths` runs.
+        //  - Two symlinks aliasing the same absent store under `wr_parent` ARE accepted by
+        //    `R5-PUB-5` (the target does not exist yet so canonicalization does not merge them)
+        //    and MUST each emit a per-site W034 in source index order (no deduplication).
         let dup_node = format!("storage \"{}\"", kdl_escape_path(&wr_leaf));
         let dup_kdl = format!(
             "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
@@ -1651,37 +1656,96 @@ mod linux_storage_oracles {
         );
         let dup_cfg = base.join("dup.kdl");
         fs::write(&dup_cfg, &dup_kdl)?;
-        let (_dc, d_val, _, _) =
-            run_check_json(&bin, base, &["--fs", "--trusted-paths"], &dup_cfg)?;
-        let dw = w034s(&d_val);
+        let (dc, d_val, _, _) = run_check_json(&bin, base, &["--fs", "--trusted-paths"], &dup_cfg)?;
         assert_eq!(
-            dw.len(),
+            dc,
+            Some(1),
+            "R5-PUB-5 must reject literal duplicate storage: {d_val}"
+        );
+        assert_eq!(
+            d_val
+                .pointer("/errors/0/code")
+                .and_then(serde_json::Value::as_str),
+            Some("E401")
+        );
+        assert_eq!(
+            d_val
+                .pointer("/errors/0/path")
+                .and_then(serde_json::Value::as_str),
+            Some("site[1].ai-publish.storage")
+        );
+        assert!(
+            w034s(&d_val).is_empty(),
+            "E401 load error must not reach W034: {d_val}"
+        );
+
+        let shared_absent_target = wr_parent.join("shared_absent_store");
+        let sym_shared_a = trusted.join("sym_shared_a");
+        let sym_shared_b = trusted.join("sym_shared_b");
+        symlink(&shared_absent_target, &sym_shared_a)?;
+        symlink(&shared_absent_target, &sym_shared_b)?;
+        let sa_node = format!("storage \"{}\"", kdl_escape_path(&sym_shared_a));
+        let sb_node = format!("storage \"{}\"", kdl_escape_path(&sym_shared_b));
+        let shared_kdl = format!(
+            "server {{ listen \":443\"; tls {{ cert \"{}\"; key \"{}\" }} }}\n\
+             site \"a.example\" {{\n\
+                 root \"{}\"\n\
+                 ai-publish {{\n\
+                     {sa_node}\n\
+                     require-signature \"ed25519:{}\"\n\
+                 }}\n\
+             }}\n\
+             site \"b.example\" {{\n\
+                 root \"{}\"\n\
+                 ai-publish {{\n\
+                     {sb_node}\n\
+                     require-signature \"ed25519:{}\"\n\
+                 }}\n\
+             }}\n",
+            kdl_escape_path(&cert),
+            kdl_escape_path(&key),
+            kdl_escape_path(&docroot),
+            kdl_escape_path(&pub_key),
+            kdl_escape_path(&docroot),
+            kdl_escape_path(&pub_key),
+        );
+        let shared_cfg = base.join("shared_alias.kdl");
+        fs::write(&shared_cfg, &shared_kdl)?;
+        let (_sc, s_alias_val, _, _) =
+            run_check_json(&bin, base, &["--fs", "--trusted-paths"], &shared_cfg)?;
+        let saw = w034s(&s_alias_val);
+        assert_eq!(
+            saw.len(),
             2,
-            "two sites sharing store must emit 2 W034s: {d_val}"
+            "two sites aliasing the same store via symlinks must emit 2 W034s: {s_alias_val}"
         );
         assert_w034_full(
-            dw.first().copied().ok_or("missing dup[0]")?,
+            saw.first().copied().ok_or("missing shared[0]")?,
             "site[0].ai-publish.storage",
             &format!(
                 "site 'a.example' ai-publish storage '{}': first untrusted component '{}' \
-                 (uid {euid}, mode 0775): group or other writable",
-                wr_leaf.display(),
-                wr_leaf.display(),
+                 (uid {euid}, mode 0775): symbolic link whose own parent or target chain is \
+                 untrusted (via '{}': group or other writable)",
+                sym_shared_a.display(),
+                wr_parent.display(),
+                sym_shared_a.display(),
             ),
             HELP_GEN,
-            &loc_of_occurrence(&dup_kdl, &dup_node, 0)?,
+            &loc_of_occurrence(&shared_kdl, &sa_node, 0)?,
         )?;
         assert_w034_full(
-            dw.get(1).copied().ok_or("missing dup[1]")?,
+            saw.get(1).copied().ok_or("missing shared[1]")?,
             "site[1].ai-publish.storage",
             &format!(
                 "site 'b.example' ai-publish storage '{}': first untrusted component '{}' \
-                 (uid {euid}, mode 0775): group or other writable",
-                wr_leaf.display(),
-                wr_leaf.display(),
+                 (uid {euid}, mode 0775): symbolic link whose own parent or target chain is \
+                 untrusted (via '{}': group or other writable)",
+                sym_shared_b.display(),
+                wr_parent.display(),
+                sym_shared_b.display(),
             ),
             HELP_GEN,
-            &loc_of_occurrence(&dup_kdl, &dup_node, 1)?,
+            &loc_of_occurrence(&shared_kdl, &sb_node, 0)?,
         )?;
 
         // (n): Quarantined owner-dir site (missing/inaccessible docroot) STILL gets storage W034!
@@ -2118,7 +2182,7 @@ mod linux_storage_oracles {
     // -----------------------------------------------------------------------
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::similar_names)]
     fn linux_root_storage_multi_uid_service_uid_panel_and_supp_groups() -> TestResult {
         use rustix::fs::{Gid, Uid, chown};
 
